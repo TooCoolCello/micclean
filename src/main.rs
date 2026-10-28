@@ -1,0 +1,1070 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod appicon;
+mod audio;
+mod dsp;
+mod graphs;
+mod install;
+mod ui;
+mod update;
+
+use audio::{Devices, Engine, Shared};
+use dsp::{Band, BandKind, Kind, Meters, NoiseProfile, Params, Profiles, SPEC_BINS, SPEC_LO, SPEC_SPAN};
+use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText, Stroke, ViewportCommand};
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use ui::icon;
+
+// ponytail: a fixed localhost port is the single-instance lock; a named mutex if it ever collides.
+const INSTANCE_PORT: u16 = 47391;
+const HELLO: &[u8] = b"MICCLEAN\n";
+const RECORD_SECS: usize = 10;
+/// Set when a second launch or the tray asks for the window.
+static SHOW: AtomicBool = AtomicBool::new(false);
+static CTX: OnceLock<egui::Context> = OnceLock::new();
+
+fn main() -> eframe::Result {
+    // Settings -> Apps -> Uninstall runs this, before the single-instance check below.
+    if std::env::args().any(|a| a == "--uninstall") {
+        install::uninstall(std::env::args().any(|a| a == "--silent"));
+        return Ok(());
+    }
+    match TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT)) {
+        Ok(listener) => {
+            std::thread::spawn(move || {
+                for mut c in listener.incoming().flatten() {
+                    let _ = c.write_all(HELLO);
+                    SHOW.store(true, Ordering::Relaxed);
+                    if let Some(ctx) = CTX.get() {
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        }
+        Err(_) => {
+            // Already running: that copy shows its window, this one leaves. Two copies would
+            // both grab the mic and double the audio going to Discord.
+            let mut hello = [0u8; HELLO.len()];
+            let is_us = TcpStream::connect((Ipv4Addr::LOCALHOST, INSTANCE_PORT))
+                .and_then(|mut s| s.read_exact(&mut hello))
+                .is_ok_and(|_| hello == HELLO);
+            if is_us {
+                return Ok(());
+            }
+        }
+    }
+
+    let hidden = std::env::args().any(|a| a == "--minimized");
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([960.0, 720.0])
+            .with_min_inner_size([420.0, 420.0])
+            .with_title("MicClean")
+            .with_icon(Arc::new(egui::IconData { rgba: icon_rgba(true), width: ICON, height: ICON }))
+            .with_visible(!hidden),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "MicClean",
+        options,
+        Box::new(move |cc| {
+            let mut app = App::new(cc);
+            // eframe shows the window after its first paint whatever with_visible says,
+            // so a hidden start hides it again on frame 2. ponytail: costs a one-frame flash.
+            app.hide_in = if hidden { 2 } else { 0 };
+            Ok(Box::new(app))
+        }),
+    )
+}
+
+/// Everything that survives a restart (eframe stores it in %APPDATA%\MicClean).
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Saved {
+    devices: Devices,
+    params: Params,
+    profiles: Profiles,
+    /// Stored inverted so a save from before this existed (and Default) means "check".
+    update_check_off: bool,
+}
+
+/// The fixed 4-filter EQ that saves had before the parametric one.
+#[derive(Deserialize)]
+struct OldEq {
+    low_cut_hz: f32,
+    low_gain_db: f32,
+    mid_freq_hz: f32,
+    mid_gain_db: f32,
+    high_gain_db: f32,
+}
+
+#[derive(Deserialize)]
+struct OldSave {
+    params: OldEq,
+}
+
+/// Loads the settings, turning an old fixed EQ into the same filters as bands. The next save
+/// writes bands only, so this converts once.
+// ponytail: drop OldEq once nobody has a pre-parametric save left.
+fn load(storage: &dyn eframe::Storage) -> Saved {
+    let mut saved: Saved = eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
+    if let Some(OldSave { params: o }) = eframe::get_value(storage, eframe::APP_KEY) {
+        let band = |kind, freq, q, gain_db| Some(Band { kind, freq, gain_db, q, on: true });
+        let boost = |kind, freq, q, gain_db: f32| if gain_db != 0.0 { band(kind, freq, q, gain_db) } else { None };
+        saved.params.bands = [
+            band(BandKind::LowCut, o.low_cut_hz, 0.707, 0.0),
+            boost(BandKind::LowShelf, 200.0, 0.707, o.low_gain_db),
+            boost(BandKind::Bell, o.mid_freq_hz, 1.0, o.mid_gain_db),
+            boost(BandKind::HighShelf, 5000.0, 0.707, o.high_gain_db),
+            None,
+        ];
+    }
+    saved
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Home,
+    Devices,
+    Voice,
+    Teach,
+    Tone,
+    Test,
+    Settings,
+}
+
+const NAV: [(Page, &str, &str); 6] = [
+    (Page::Home, icon::HOME, "Home"),
+    (Page::Devices, icon::SPEAKERS, "Devices"),
+    (Page::Voice, icon::MIC, "Voice"),
+    (Page::Teach, icon::LEARN, "Teach it"),
+    (Page::Tone, icon::EQ, "Tone"),
+    (Page::Test, icon::RECORD, "Test recording"),
+];
+
+struct App {
+    saved: Saved,
+    shared: Arc<Mutex<Shared>>,
+    engine: Option<Engine>,
+    engine_devices: Devices,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    status: String,
+    glitches: (u32, String),
+    eq_ui: graphs::EqEditor,
+    learn_msg: String,
+    meters: Meters,
+    last_frames: u64,
+    last_beat: Instant,
+    next_check: Instant,
+    needs_restart: bool,
+    noise_name: String,
+    pending_noise_name: String,
+    clip: Option<Vec<f32>>,
+    record_progress: Option<f32>,
+    playback: Option<(cpal::Stream, Instant)>,
+    tray: Option<TrayIcon>,
+    tray_open: bool,
+    show_id: MenuId,
+    quit_id: MenuId,
+    quitting: bool,
+    autostart: bool,
+    updater: update::Updater,
+    /// Only the installed copy can replace itself, so only it checks.
+    installed: bool,
+    next_update_check: Instant,
+    /// Frames until a --minimized start hides the window.
+    hide_in: u8,
+    page: Page,
+    hwnd: Option<isize>,
+    title_dark: Option<bool>,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext) -> Self {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let _ = CTX.set(cc.egui_ctx.clone());
+        ui::install(&cc.egui_ctx);
+        let hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
+            RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+            _ => None,
+        });
+        let saved = cc.storage.map(load).unwrap_or_default();
+        let shared = Shared {
+            params: saved.params.clone(),
+            profiles: saved.profiles.clone(),
+            ..Default::default()
+        };
+
+        let show = MenuItem::new("Show MicClean", true, None);
+        let quit = MenuItem::new("Quit", true, None);
+        let menu = Menu::new();
+        let _ = menu.append(&show);
+        let _ = menu.append(&quit);
+        // No tray (e.g. no shell running) just means closing the window quits.
+        let tray = tray_icon::Icon::from_rgba(icon_rgba(false), ICON, ICON).ok().and_then(|icon| {
+            TrayIconBuilder::new()
+                .with_icon(icon)
+                .with_tooltip("MicClean")
+                .with_menu(Box::new(menu))
+                .with_menu_on_left_click(false)
+                .build()
+                .ok()
+        });
+
+        let now = Instant::now();
+        let mut app = Self {
+            saved,
+            shared: Arc::new(Mutex::new(shared)),
+            engine: None,
+            engine_devices: Devices::default(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            status: String::new(),
+            glitches: (0, String::new()),
+            eq_ui: Default::default(),
+            learn_msg: String::new(),
+            meters: Meters::default(),
+            last_frames: 0,
+            last_beat: now,
+            next_check: now,
+            needs_restart: false,
+            noise_name: String::new(),
+            pending_noise_name: String::new(),
+            clip: None,
+            record_progress: None,
+            playback: None,
+            tray,
+            tray_open: false,
+            show_id: show.id().clone(),
+            quit_id: quit.id().clone(),
+            quitting: false,
+            autostart: autostart::enabled(),
+            updater: Default::default(),
+            installed: install::is_installed_copy(),
+            next_update_check: now + Duration::from_secs(20), // after startup has settled
+            hide_in: 0,
+            page: Page::Home,
+            hwnd,
+            title_dark: None,
+        };
+        app.refresh_devices();
+        let d = &mut app.saved.devices;
+        if d.input.is_empty() {
+            d.input = app.inputs.first().cloned().unwrap_or_default();
+        }
+        if d.output.is_empty() {
+            // VB-Cable's playback side is what Discord then picks up as "CABLE Output".
+            d.output = app.outputs.iter().find(|n| n.contains("CABLE Input")).cloned().unwrap_or_default();
+        }
+        app.restart();
+        app
+    }
+
+    fn refresh_devices(&mut self) {
+        self.inputs = audio::device_names(true);
+        self.outputs = audio::device_names(false);
+    }
+
+    fn restart(&mut self) {
+        self.engine = None; // stop old streams before opening the devices again
+        self.engine_devices = self.saved.devices.clone();
+        self.last_beat = Instant::now();
+        self.needs_restart = false;
+        if self.saved.devices.input.is_empty() || self.saved.devices.output.is_empty() {
+            self.status = "Pick a microphone and where to send it on the Devices page.".into();
+            return;
+        }
+        match audio::start(&self.saved.devices, self.shared.clone()) {
+            Ok(e) => {
+                self.status = format!("{} → {} · {}", self.saved.devices.input, self.saved.devices.output, e.info);
+                self.engine = Some(e);
+            }
+            Err(e) => self.status = format!("{e} (retrying)"),
+        }
+    }
+
+    /// Restarts audio when the mic stream dies, a device errors, or a missing one comes back.
+    fn watchdog(&mut self) {
+        let now = Instant::now();
+        if self.meters.frames != self.last_frames {
+            self.last_frames = self.meters.frames;
+            self.last_beat = now;
+        }
+        if now < self.next_check || self.saved.devices.input.is_empty() || self.saved.devices.output.is_empty() {
+            return;
+        }
+        self.next_check = now + Duration::from_secs(3);
+        let stalled = self.engine.is_some() && now - self.last_beat > Duration::from_secs(2);
+        let waiting_for_device = self.engine.as_ref().is_none_or(|e| !e.missing.is_empty());
+        if waiting_for_device {
+            self.refresh_devices();
+        }
+        let came_back = self
+            .engine
+            .as_ref()
+            .is_some_and(|e| e.missing.iter().any(|m| self.outputs.contains(m)));
+        if self.engine.is_none() || stalled || came_back || self.needs_restart {
+            self.refresh_devices();
+            self.restart();
+        }
+    }
+
+    fn sync(&mut self) {
+        let mut sh = self.shared.lock().unwrap();
+        if sh.params != self.saved.params {
+            sh.params = self.saved.params.clone();
+            sh.params_ver += 1;
+        }
+        if let Some((kind, prof)) = sh.learned.take() {
+            match prof {
+                None => self.learn_msg = "That clip was too quiet, nothing saved.".into(),
+                Some(profile) if kind == Kind::Keep => {
+                    self.saved.profiles.keep = Some(profile);
+                    self.learn_msg = "Learned your voice.".into();
+                }
+                Some(profile) => {
+                    let name = std::mem::take(&mut self.pending_noise_name);
+                    self.learn_msg = format!("Learned \"{name}\".");
+                    let noises = &mut self.saved.profiles.noises;
+                    match noises.iter_mut().find(|n| n.name == name) {
+                        Some(n) => {
+                            n.profile = profile;
+                            n.enabled = true;
+                        }
+                        None => noises.push(NoiseProfile { name, enabled: true, profile }),
+                    }
+                }
+            }
+        }
+        if sh.profiles != self.saved.profiles {
+            sh.profiles = self.saved.profiles.clone();
+            sh.profiles_ver += 1;
+        }
+        if let Some(clip) = sh.recorded.take() {
+            self.clip = Some(clip);
+        }
+        self.record_progress = sh.record_progress;
+        if let Some(e) = sh.error.take() {
+            self.status = format!("Audio error: {e} (reconnecting)");
+            self.needs_restart = true;
+        }
+        if sh.glitches != self.glitches.0 {
+            self.glitches = (sh.glitches, sh.glitch_dev.clone());
+        }
+        self.meters = sh.meters.clone();
+    }
+
+    fn play(&mut self, processed: bool) {
+        self.stop_playback();
+        let Some(raw) = &self.clip else { return };
+        let clip = if processed {
+            dsp::render(raw, &self.saved.params, &self.saved.profiles)
+        } else {
+            raw.clone()
+        };
+        let end = Instant::now() + Duration::from_secs_f32(clip.len() as f32 / dsp::SR);
+        let monitor = self.saved.devices.monitor.clone();
+        match audio::play(monitor.as_deref(), clip) {
+            Ok(s) => {
+                self.shared.lock().unwrap().mute_monitor = true;
+                self.playback = Some((s, end));
+            }
+            Err(e) => self.status = format!("Playback failed: {e}"),
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        self.playback = None;
+        self.shared.lock().unwrap().mute_monitor = false;
+    }
+
+    fn learn(&mut self, kind: Kind, secs: f32) {
+        self.learn_msg.clear();
+        self.shared.lock().unwrap().learn = Some((kind, secs));
+    }
+}
+
+impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.sync();
+        self.watchdog();
+        let now = Instant::now();
+        if self.installed && !self.saved.update_check_off && now >= self.next_update_check {
+            self.next_update_check = now + Duration::from_secs(24 * 3600);
+            self.updater.check();
+        }
+        if self.saved.devices != self.engine_devices {
+            self.restart();
+        }
+
+        let dark = ctx.theme() == egui::Theme::Dark;
+        if self.title_dark != Some(dark) {
+            if let Some(h) = self.hwnd {
+                ui::title_bar(h, dark);
+            }
+            self.title_dark = Some(dark);
+        }
+
+        if self.hide_in > 0 {
+            self.hide_in -= 1;
+            if self.hide_in == 0 {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            }
+        }
+        let mut show = SHOW.swap(false, Ordering::Relaxed);
+        while let Ok(e) = TrayIconEvent::receiver().try_recv() {
+            show |= matches!(
+                e,
+                TrayIconEvent::DoubleClick { .. }
+                    | TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
+            );
+        }
+        while let Ok(e) = MenuEvent::receiver().try_recv() {
+            if e.id == self.show_id {
+                show = true;
+            } else if e.id == self.quit_id {
+                self.quitting = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+        if show {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+
+        // Tray dot: green while the gate lets you through to Discord.
+        if let Some(tray) = &self.tray
+            && self.meters.gate_open != self.tray_open
+        {
+            self.tray_open = self.meters.gate_open;
+            if let Ok(icon) = tray_icon::Icon::from_rgba(icon_rgba(self.tray_open), ICON, ICON) {
+                let _ = tray.set_icon(Some(icon));
+            }
+        }
+        if self.playback.as_ref().is_some_and(|(_, end)| Instant::now() >= *end) {
+            self.stop_playback();
+        }
+        ctx.request_repaint_after(Duration::from_millis(33));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_some() && !self.quitting {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        }
+
+        let p = ui::pal(ui);
+        // Like Windows' NavigationView: labels when there's room, icons only when narrow.
+        let compact = ui.available_width() < 720.0;
+        egui::Panel::left("nav")
+            .exact_size(if compact { 56.0 } else { 240.0 })
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 4, right: 4, top: 10, bottom: 8 }))
+            .show(ui, |ui| self.nav(ui, compact));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 0 }))
+            .show(ui, |ui| {
+                let title = match self.page {
+                    Page::Settings => "Settings",
+                    page => NAV.iter().find(|n| n.0 == page).map_or("", |n| n.2),
+                };
+                ui.heading(title);
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    ui.set_max_width(1000.0);
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    match self.page {
+                        Page::Home => self.home(ui),
+                        Page::Devices => self.devices(ui),
+                        Page::Voice => self.voice(ui),
+                        Page::Teach => self.teach(ui),
+                        Page::Tone => self.tone(ui),
+                        Page::Test => self.test(ui),
+                        Page::Settings => self.settings(ui),
+                    }
+                    ui.add_space(24.0);
+                });
+            });
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, &self.saved);
+    }
+}
+
+/// Section title between card groups, like the Settings app.
+fn section(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(14.0);
+    ui.label(RichText::new(text).font(ui::semibold(14.0)));
+    ui.add_space(2.0);
+}
+
+fn slider(ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>, unit: &str) -> egui::Response {
+    ui.add(egui::Slider::new(v, r).suffix(unit))
+}
+
+impl App {
+    fn nav(&mut self, ui: &mut egui::Ui, compact: bool) {
+        if compact {
+            ui.add_space(26.0);
+        } else {
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.label(RichText::new("MicClean").small().color(ui::pal(ui).text2));
+            });
+            ui.add_space(8.0);
+        }
+        for (page, ic, label) in NAV {
+            if ui::nav_item(ui, ic, label, self.page == page, compact).clicked() {
+                self.page = page;
+            }
+        }
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            if ui::nav_item(ui, icon::SETTINGS, "Settings", self.page == Page::Settings, compact).clicked() {
+                self.page = Page::Settings;
+            }
+        });
+    }
+
+    fn live_meters(&self) -> Meters {
+        if self.engine.is_some() {
+            self.meters.clone()
+        } else {
+            let quiet = -120.0;
+            Meters { in_db: quiet, out_db: quiet, comp_in_db: quiet, gate_level_db: quiet, reason: "no audio", ..Default::default() }
+        }
+    }
+
+    fn home(&mut self, ui: &mut egui::Ui) {
+        let p = ui::pal(ui);
+        let mut restart = false;
+        let title = if self.engine.is_some() { "Running" } else { "Not running" };
+        let status = match &self.glitches {
+            (0, _) => self.status.clone(),
+            (n, dev) => format!("{} · {n} glitch{} (last on {dev})", self.status, if *n == 1 { "" } else { "es" }),
+        };
+        ui::setting(ui, icon::MIC, title, &status, |ui| {
+            restart = ui::icon_button(ui, true, icon::REFRESH, "Restart").clicked();
+        });
+        if restart {
+            self.restart();
+        }
+
+        let m = self.live_meters();
+        ui::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Levels").font(ui::semibold(14.0)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let reason = match m.noise_match.and_then(|i| self.saved.profiles.noises.get(i)) {
+                        Some(n) if m.reason == "learned noise" => format!("noise: {}", n.name),
+                        _ => m.reason.to_string(),
+                    };
+                    if m.gate_open {
+                        ui::pill(ui, &format!("Open · {reason}"), p.good, p.on_accent);
+                    } else {
+                        ui::pill(ui, &format!("Muted · {reason}"), p.control_stroke, p.text2);
+                    }
+                    let pitch = m.pitch_hz.map_or("-".into(), |f| format!("{f:.0} Hz"));
+                    let detail = RichText::new(format!("voice {:.0}%  ·  pitch {pitch}", m.vad * 100.0)).small().color(p.text2);
+                    ui.add(egui::Label::new(detail).truncate());
+                });
+            });
+            for (label, db) in [("In", m.in_db), ("Out", m.out_db)] {
+                ui.horizontal(|ui| {
+                    ui.add_sized([28.0, 18.0], egui::Label::new(RichText::new(label).small().color(p.text2)));
+                    ui.add_sized([60.0, 18.0], egui::Label::new(RichText::new(format!("{db:.0} dB")).small()));
+                    ui::level(ui, db);
+                });
+            }
+        });
+        spectrum_card(ui, &m, &self.saved.params);
+
+        section(ui, "Quick settings");
+        let pr = &mut self.saved.params;
+        ui::setting(ui, icon::VOLUME, "Noise removal", "Strips fans, keyboards and room noise", |ui| {
+            ui::toggle(ui, &mut pr.denoise);
+        });
+        ui::setting(ui, icon::MUTE, "Voice gate", "Mutes you when you're not talking or singing", |ui| {
+            ui::toggle(ui, &mut pr.gate);
+        });
+        ui::setting(ui, icon::MIC, "Mic gain", "Boost or cut the mic before processing", |ui| {
+            slider(ui, &mut pr.input_gain_db, -20.0..=30.0, " dB");
+        });
+        ui::setting(ui, icon::SPEAKERS, "Output gain", "What Discord hears. The limiter stops it clipping", |ui| {
+            slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
+        });
+        ui::setting(ui, icon::POWER, "Bypass", "Send the raw mic to compare (echo cancellation stays on)", |ui| {
+            ui::toggle(ui, &mut pr.bypass);
+        });
+    }
+
+    fn devices(&mut self, ui: &mut egui::Ui) {
+        let (d, inputs, outputs) = (&mut self.saved.devices, &self.inputs, &self.outputs);
+        ui::setting(ui, icon::MIC, "Microphone", "The mic you talk into", |ui| pick(ui, "mic", &mut d.input, inputs));
+        ui::setting(ui, icon::SPEAKERS, "Send to", "Pick CABLE Input; Discord then uses CABLE Output as its mic", |ui| {
+            pick(ui, "out", &mut d.output, outputs)
+        });
+        ui::setting(ui, icon::HEADPHONE, "Monitor", "Hear yourself, e.g. on your headphones", |ui| {
+            pick_opt(ui, "mon", &mut d.monitor, outputs, "Off")
+        });
+        ui::setting(ui, icon::VOLUME, "Cancel echo from", "Your speakers, if you don't wear headphones", |ui| {
+            pick_opt(ui, "echo", &mut d.echo_ref, outputs, "Off (headphones)")
+        });
+        let (mut refresh, mut restart) = (false, false);
+        ui::setting(ui, icon::REFRESH, "Devices", "Plugged something in? Refresh the lists", |ui| {
+            restart = ui.button("Restart audio").clicked();
+            refresh = ui.button("Refresh").clicked();
+        });
+        if refresh {
+            self.refresh_devices();
+        }
+        if restart {
+            self.restart();
+        }
+
+        section(ui, "Discord setup");
+        let p = ui::pal(ui);
+        ui::card(ui, |ui| {
+            for step in [
+                "1. Install VB-Cable (free, vb-audio.com) and set Send to = CABLE Input above.",
+                "2. In Windows Sound settings, set CABLE Input and CABLE Output to 48000 Hz (Properties → Advanced). Optional: rename CABLE Output to MicClean.",
+                "3. Windows Settings → System → Sound → your mic: Audio enhancements = Off.",
+                "4. In Discord, Voice & Video: Input Device = CABLE Output (or MicClean).",
+                "5. Turn off Discord's Noise Suppression, Echo Cancellation and Automatic Gain Control.",
+                "6. Turn off Automatic Input Sensitivity and drag its slider all the way left.",
+            ] {
+                ui.label(RichText::new(step).color(p.text2));
+            }
+        });
+    }
+
+    fn voice(&mut self, ui: &mut egui::Ui) {
+        let m = self.live_meters();
+        let snap = self.saved.params.clone(); // heap-free copy for the graph to read
+        let pr = &mut self.saved.params;
+        ui::group(ui, icon::VOLUME, "Noise removal", "Removes fans, keyboards and room noise", Some(&mut pr.denoise), |ui| {
+            ui::row(ui, "Strength", |ui| {
+                ui.add(egui::Slider::new(&mut pr.denoise_strength, 0.0..=1.0));
+            });
+            ui::row(ui, "Back off while singing", |ui| {
+                ui.add(egui::Slider::new(&mut pr.sing_protect, 0.0..=1.0))
+                    .on_hover_text("Raise this if held notes sound watery or thin.");
+            });
+        });
+        ui::group(ui, icon::MUTE, "Voice gate", "Mutes you when you're not talking or singing", Some(&mut pr.gate), |ui| {
+            if let Some(t) = graphs::gate_graph(ui, &snap, &m) {
+                pr.gate_threshold_db = t.clamp(-80.0, -10.0);
+            }
+            ui.add_space(6.0);
+            ui::row(ui, "Minimum level", |ui| {
+                slider(ui, &mut pr.gate_threshold_db, -80.0..=-10.0, " dB");
+            });
+            ui::row(ui, "Close below it by", |ui| {
+                slider(ui, &mut pr.gate_hysteresis_db, 0.0..=20.0, " dB")
+                    .on_hover_text("Keeps fading notes open. 0 = opens and closes at the same level.");
+            });
+            ui::row(ui, "Voice confidence needed", |ui| {
+                ui.add(egui::Slider::new(&mut pr.vad_threshold, 0.05..=0.95));
+            });
+            ui::row(ui, "Hold open after you stop", |ui| {
+                slider(ui, &mut pr.gate_hold_ms, 0.0..=2000.0, " ms");
+            });
+            ui::row(ui, "Fade in", |ui| {
+                slider(ui, &mut pr.gate_attack_ms, 0.5..=50.0, " ms").on_hover_text("How fast it opens. Too fast can click.");
+            });
+            ui::row(ui, "Fade out", |ui| {
+                slider(ui, &mut pr.gate_release_ms, 10.0..=500.0, " ms").on_hover_text("How fast it closes once muting.");
+            });
+            ui::row(ui, "Volume while muted", |ui| {
+                slider(ui, &mut pr.gate_floor_db, -90.0..=0.0, " dB");
+            });
+        });
+    }
+
+    fn teach(&mut self, ui: &mut egui::Ui) {
+        let p = ui::pal(ui);
+        let learning = self.meters.learning;
+        let busy = learning.is_some() || self.engine.is_none();
+
+        section(ui, "Sounds to remove");
+        let mut learn_noise = false;
+        let mut forget = None;
+        ui::card(ui, |ui| {
+            ui::header(ui, icon::LEARN, "Learn a noise", "Name it, stay quiet, then make the sound for 5 seconds", |ui| {
+                learn_noise = ui::accent_button(ui, !busy, "Learn (5 s)").clicked();
+                ui.add(egui::TextEdit::singleline(&mut self.noise_name).hint_text("e.g. keyboard").desired_width(140.0));
+            });
+            if let Some((Kind::Noise, prog)) = learning {
+                ui.add(egui::ProgressBar::new(prog).desired_height(4.0));
+            }
+            for (i, n) in self.saved.profiles.noises.iter_mut().enumerate() {
+                ui::row(ui, &n.name, |ui| {
+                    ui::toggle(ui, &mut n.enabled).on_hover_text("Off lets this sound through for now");
+                    let del = egui::Button::new(RichText::new(icon::DELETE).font(ui::icon_font(14.0))).frame(false);
+                    if ui.add(del).on_hover_text("Forget").clicked() {
+                        forget = Some(i);
+                    }
+                });
+            }
+        });
+        if learn_noise {
+            let n = self.noise_name.trim();
+            self.pending_noise_name =
+                if n.is_empty() { format!("Noise {}", self.saved.profiles.noises.len() + 1) } else { n.to_string() };
+            self.noise_name.clear();
+            self.learn(Kind::Noise, 5.0);
+        }
+        if let Some(i) = forget {
+            self.saved.profiles.noises.remove(i);
+        }
+
+        section(ui, "Your voice");
+        let learned = self.saved.profiles.keep.is_some();
+        let desc = if learned {
+            "Learned. Sounds like this are never muted"
+        } else {
+            "Talk and sing for 10 seconds so it never cuts you"
+        };
+        let (mut learn_voice, mut forget_voice) = (false, false);
+        ui::card(ui, |ui| {
+            ui::header(ui, icon::MUSIC, "Learn your voice", desc, |ui| {
+                learn_voice = ui::accent_button(ui, !busy, "Learn (10 s)").clicked();
+                forget_voice = learned && ui.button("Forget").clicked();
+            });
+            if let Some((Kind::Keep, prog)) = learning {
+                ui.add(egui::ProgressBar::new(prog).desired_height(4.0));
+            }
+        });
+        if learn_voice {
+            self.learn(Kind::Keep, 10.0);
+        }
+        if forget_voice {
+            self.saved.profiles.keep = None;
+        }
+        ui::setting(ui, icon::SETTINGS, "Match looseness", "Higher means more sounds count as the learned ones", |ui| {
+            ui.add(egui::Slider::new(&mut self.saved.params.learn_match, 1.0..=8.0));
+        });
+        if !self.learn_msg.is_empty() {
+            ui.label(RichText::new(&self.learn_msg).color(p.text2));
+        }
+    }
+
+    fn tone(&mut self, ui: &mut egui::Ui) {
+        let m = self.live_meters();
+        let snap = self.saved.params.clone(); // heap-free copy for the graphs to read
+        let pr = &mut self.saved.params;
+        let eq_ui = &mut self.eq_ui;
+        ui::group(ui, icon::EQ, "Equalizer", "Up to 5 bands over your live output spectrum", Some(&mut pr.eq), |ui| {
+            eq_ui.show(ui, &mut pr.bands, &m.spec_out);
+        });
+
+        section(ui, "Dynamics");
+        let desc = format!("Evens out quiet and loud · now {:+.1} dB", m.agc_db);
+        ui::group(ui, icon::VOLUME, "Auto level", &desc, Some(&mut pr.agc), |ui| {
+            ui::row(ui, "Target level", |ui| {
+                slider(ui, &mut pr.agc_target_db, -36.0..=-10.0, " dB");
+            });
+            ui::row(ui, "Max boost", |ui| {
+                slider(ui, &mut pr.agc_max_gain_db, 0.0..=30.0, " dB");
+            });
+        });
+        let desc = format!("Tames harsh S sounds · now -{:.1} dB", m.deess_db);
+        ui::group(ui, icon::MUSIC, "De-esser", &desc, Some(&mut pr.deess), |ui| {
+            ui::row(ui, "Threshold", |ui| {
+                slider(ui, &mut pr.deess_threshold_db, -50.0..=0.0, " dB");
+            });
+        });
+        let desc = format!("Keeps loud parts in check · now -{:.1} dB", m.gr_db);
+        ui::group(ui, icon::EQ, "Compressor", &desc, Some(&mut pr.comp), |ui| {
+            if let Some(t) = graphs::comp_graph(ui, &snap, &m) {
+                pr.comp_threshold_db = t.clamp(-50.0, 0.0);
+            }
+            ui.add_space(6.0);
+            ui::row(ui, "Threshold", |ui| {
+                slider(ui, &mut pr.comp_threshold_db, -50.0..=0.0, " dB");
+            });
+            ui::row(ui, "Ratio", |ui| {
+                ui.add(egui::Slider::new(&mut pr.comp_ratio, 1.0..=20.0).logarithmic(true).suffix(":1"));
+            });
+            ui::row(ui, "Attack", |ui| {
+                slider(ui, &mut pr.comp_attack_ms, 0.5..=50.0, " ms");
+            });
+            ui::row(ui, "Release", |ui| {
+                slider(ui, &mut pr.comp_release_ms, 20.0..=1000.0, " ms");
+            });
+            ui::row(ui, "Makeup gain", |ui| {
+                slider(ui, &mut pr.comp_makeup_db, 0.0..=24.0, " dB");
+            });
+        });
+    }
+
+    fn test(&mut self, ui: &mut egui::Ui) {
+        let p = ui::pal(ui);
+        let recording = self.record_progress.is_some();
+        let mut record = false;
+        ui::card(ui, |ui| {
+            ui::header(ui, icon::RECORD, "Record a test", "10 seconds of your raw mic. Talk, then sing a long note", |ui| {
+                record = ui::accent_button(ui, !recording && self.engine.is_some(), "Record").clicked();
+            });
+            if let Some(prog) = self.record_progress {
+                ui.add(egui::ProgressBar::new(prog).desired_height(4.0));
+            }
+        });
+        if record {
+            self.shared.lock().unwrap().record = Some(vec![0.0; RECORD_SECS * dsp::SR as usize]);
+        }
+
+        let has_clip = self.clip.is_some() && !recording;
+        let (mut original, mut processed, mut stop) = (false, false, false);
+        ui::setting(ui, icon::PLAY, "Play it back", "Processed runs the clip through your current settings: tweak, replay", |ui| {
+            stop = ui::icon_button(ui, self.playback.is_some(), icon::STOP, "Stop").clicked();
+            processed = ui::icon_button(ui, has_clip, icon::PLAY, "Processed").clicked();
+            original = ui::icon_button(ui, has_clip, icon::PLAY, "Original").clicked();
+        });
+        if original {
+            self.play(false);
+        }
+        if processed {
+            self.play(true);
+        }
+        if stop {
+            self.stop_playback();
+        }
+        ui.label(RichText::new("Plays on the Monitor device, or your default speakers if Monitor is off.").small().color(p.text2));
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui::setting(ui, icon::POWER, "Start with Windows", "Opens hidden in the tray when you sign in", |ui| {
+            changed = ui::toggle(ui, &mut self.autostart).changed();
+        });
+        if changed && !autostart::set(self.autostart) {
+            self.autostart = autostart::enabled();
+            self.status = "Couldn't change the Windows startup entry.".into();
+        }
+        let mut reset = false;
+        ui::setting(ui, icon::REFRESH, "Reset all sliders", "Back to the defaults. Learned sounds are kept", |ui| {
+            reset = ui.button("Reset").clicked();
+        });
+        if reset {
+            self.saved.params = Params::default();
+        }
+        self.updates(ui);
+        ui::setting(
+            ui,
+            icon::INFO,
+            "About MicClean",
+            &format!("Version {}. Closing the window keeps it running in the tray. Right-click the tray icon to quit", update::VERSION),
+            |_| {},
+        );
+    }
+}
+
+impl App {
+    fn updates(&mut self, ui: &mut egui::Ui) {
+        use update::State;
+        let st = self.updater.state();
+        let desc = match &st {
+            _ if !self.installed => "This copy isn't installed, so it doesn't update itself".to_string(),
+            State::Idle => format!("You have {}", update::VERSION),
+            State::Checking => "Checking GitHub...".into(),
+            State::UpToDate => format!("You're up to date ({})", update::VERSION),
+            State::Available(r) => format!("Version {} is available. Installing closes MicClean for a few seconds, so your voice drops out briefly", r.version),
+            State::Installing => "Downloading and installing. MicClean restarts by itself".into(),
+            State::Failed(e) => format!("Couldn't update: {e}"),
+        };
+        let (mut install_rel, mut check) = (None, false);
+        let installed = self.installed;
+        ui::setting(ui, icon::REFRESH, "Updates", &desc, |ui| match &st {
+            State::Available(r) if installed => {
+                if ui::accent_button(ui, true, &format!("Update to {}", r.version)).clicked() {
+                    install_rel = Some(r.clone());
+                }
+            }
+            State::Checking | State::Installing => {
+                ui.spinner();
+            }
+            _ => check = ui.add_enabled(installed, egui::Button::new("Check now")).clicked(),
+        });
+        let mut auto = !self.saved.update_check_off;
+        ui::setting(ui, icon::INFO, "Check automatically", "Asks GitHub once a day. Nothing else is sent", |ui| {
+            ui::toggle(ui, &mut auto);
+        });
+        self.saved.update_check_off = !auto;
+        if let Some(r) = install_rel {
+            self.updater.install(r);
+        }
+        if check {
+            self.updater.check();
+        }
+    }
+}
+
+/// Output spectrum (bars), input spectrum (line) and the EQ curve (yellow, its own +-18 dB scale).
+fn spectrum_card(ui: &mut egui::Ui, m: &Meters, p: &Params) {
+    let pal = ui::pal(ui);
+    ui::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Spectrum").font(ui::semibold(14.0)));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new("bars: out  ·  line: mic  ·  yellow: EQ").small().color(pal.text2)).truncate());
+            });
+        });
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 140.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, pal.field);
+        let x_of = |f: f32| rect.left() + rect.width() * ((f / SPEC_LO).ln() / SPEC_SPAN.ln()).clamp(0.0, 1.0);
+        let y_db = |db: f32| rect.bottom() - rect.height() * ((db + 90.0) / 90.0).clamp(0.0, 1.0);
+        let y_eq = |db: f32| rect.center().y - rect.height() * 0.5 * (db / 18.0).clamp(-1.0, 1.0);
+        for (f, label) in [(100.0, "100"), (1000.0, "1k"), (10_000.0, "10k")] {
+            let x = x_of(f);
+            painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, pal.divider));
+            painter.text(
+                Pos2::new(x + 3.0, rect.bottom() - 2.0),
+                egui::Align2::LEFT_BOTTOM,
+                label,
+                egui::FontId::proportional(10.0),
+                pal.text2,
+            );
+        }
+        let w = rect.width() / SPEC_BINS as f32;
+        for (i, &db) in m.spec_out.0.iter().enumerate() {
+            let x0 = rect.left() + i as f32 * w;
+            let bar = Rect::from_min_max(Pos2::new(x0 + 0.5, y_db(db)), Pos2::new(x0 + w - 0.5, rect.bottom()));
+            painter.rect_filled(bar, 1.0, pal.accent.gamma_multiply(0.8));
+        }
+        let input: Vec<Pos2> =
+            m.spec_in.0.iter().enumerate().map(|(i, &db)| Pos2::new(rect.left() + (i as f32 + 0.5) * w, y_db(db))).collect();
+        painter.add(egui::Shape::line(input, Stroke::new(1.0, pal.text2)));
+
+        let freqs: Vec<f32> = (0..=150).map(|i| SPEC_LO * SPEC_SPAN.powf(i as f32 / 150.0)).collect();
+        let gains = dsp::eq_curve(p, &freqs);
+        let amber = Color32::from_rgb(240, 190, 50);
+        let col = if p.eq { amber } else { amber.gamma_multiply(0.3) };
+        let curve =
+            freqs.iter().zip(&gains).map(|(&f, &g)| Pos2::new(x_of(f), y_eq(if p.eq { g } else { 0.0 }))).collect();
+        painter.add(egui::Shape::line(curve, Stroke::new(2.0, col)));
+    });
+}
+
+fn pick(ui: &mut egui::Ui, id: &str, v: &mut String, list: &[String]) {
+    egui::ComboBox::from_id_salt(id).selected_text(v.as_str()).truncate().show_ui(ui, |ui| {
+        for n in list {
+            ui.selectable_value(v, n.clone(), n);
+        }
+    });
+}
+
+fn pick_opt(ui: &mut egui::Ui, id: &str, v: &mut Option<String>, list: &[String], none: &str) {
+    egui::ComboBox::from_id_salt(id).selected_text(v.as_deref().unwrap_or(none)).truncate().show_ui(ui, |ui| {
+        ui.selectable_value(v, None, none);
+        for n in list {
+            ui.selectable_value(v, Some(n.clone()), n);
+        }
+    });
+}
+
+const ICON: u32 = appicon::SIZE;
+
+fn icon_rgba(open: bool) -> Vec<u8> {
+    appicon::rgba(open, ICON)
+}
+
+/// "Start with Windows" = a value under the per-user Run key, written with reg.exe.
+mod autostart {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    fn reg(args: &[&str]) -> bool {
+        Command::new("reg")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    pub fn enabled() -> bool {
+        reg(&["query", KEY, "/v", "MicClean"])
+    }
+
+    pub fn set(on: bool) -> bool {
+        if !on {
+            return reg(&["delete", KEY, "/v", "MicClean", "/f"]);
+        }
+        let Ok(exe) = std::env::current_exe() else { return false };
+        let cmd = format!("\"{}\" --minimized", exe.display());
+        reg(&["add", KEY, "/v", "MicClean", "/t", "REG_SZ", "/d", &cmd, "/f"])
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// Touches the real Run key, so opt-in: `cargo test -- --ignored`. Restores what was there.
+        #[test]
+        #[ignore]
+        fn run_entry_is_quoted() {
+            let before = super::enabled();
+            assert!(super::set(true));
+            let out = super::Command::new("reg").args(["query", super::KEY, "/v", "MicClean"]).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            super::set(before);
+            let exe = std::env::current_exe().unwrap();
+            assert!(text.contains(&format!("\"{}\" --minimized", exe.display())), "{text}");
+            assert_eq!(super::enabled(), before);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Mem(String);
+
+    impl eframe::Storage for Mem {
+        fn get_string(&self, _: &str) -> Option<String> {
+            Some(self.0.clone())
+        }
+        fn set_string(&mut self, _: &str, value: String) {
+            self.0 = value;
+        }
+        fn remove_string(&mut self, _: &str) {}
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn old_fixed_eq_save_loads_as_bands() {
+        // A real save from before the parametric EQ.
+        let old = r#"(devices:(input:"Test Microphone",output:"CABLE Input (VB-Audio Virtual Cable)",monitor:None,echo_ref:None),params:(bypass:false,input_gain_db:0.0,denoise:true,denoise_strength:1.0,sing_protect:0.3,gate:false,gate_threshold_db:-50.0,vad_threshold:0.5,gate_hold_ms:400.0,gate_floor_db:-60.0,learn_match:3.0,agc:true,agc_target_db:-14.0,agc_max_gain_db:15.0,eq:true,low_cut_hz:165.0,low_gain_db:0.0,mid_freq_hz:300.0,mid_gain_db:2.8,high_gain_db:3.0,deess:true,deess_threshold_db:-24.0,comp:true,comp_threshold_db:-24.0,comp_ratio:3.0,comp_attack_ms:5.0,comp_release_ms:120.0,comp_makeup_db:4.0,output_gain_db:6.0),profiles:(noises:[],keep:None))"#;
+        let mut store = Mem(old.into());
+        let s = load(&store);
+        assert_eq!(s.devices.input, "Test Microphone", "settings were thrown away");
+        assert_eq!(s.params.output_gain_db, 6.0);
+        let b = s.params.bands;
+        assert_eq!(b[0].map(|b| (b.kind, b.freq)), Some((BandKind::LowCut, 165.0)));
+        assert!(b[1].is_none(), "0 dB low shelf should not become a band");
+        assert_eq!(b[2].map(|b| (b.kind, b.freq, b.gain_db)), Some((BandKind::Bell, 300.0, 2.8)));
+        assert_eq!(b[3].map(|b| (b.kind, b.gain_db)), Some((BandKind::HighShelf, 3.0)));
+
+        // After one save the file has bands only, and editing them sticks.
+        let mut edited = s;
+        edited.params.bands[4] = Some(Band { kind: BandKind::Notch, freq: 60.0, gain_db: 0.0, q: 8.0, on: true });
+        eframe::set_value(&mut store, eframe::APP_KEY, &edited);
+        assert!(!store.0.contains("low_cut_hz"));
+        assert_eq!(load(&store).params.bands, edited.params.bands);
+    }
+}

@@ -1,0 +1,41 @@
+# MicClean
+
+A small Windows app that cleans up your microphone before Discord (or anything else) hears it.
+
+- Noise removal (RNNoise) and echo cancellation (WebRTC AEC3, for speakers instead of headphones)
+- A voice gate that knows the difference between singing and fan hum, so long held notes aren't cut off
+- Teach it sounds to remove (keyboard, fan) and your own voice to keep
+- 5-band parametric EQ, de-esser, auto level and compressor, with live graphs
+- Record 10 seconds, then compare the original with the processed version
+- Lives in the tray, can start with Windows, reconnects if the mic is unplugged
+
+## Install
+
+Download `MicClean-Setup.exe` from the [latest release](../../releases/latest) and run it. It installs
+for your account only (no admin needed) and adds a Start menu entry. The installed copy checks GitHub
+once a day for new versions and updates with one click; this can be turned off in Settings.
+
+Windows will probably show "Windows protected your PC" because the installer isn't code-signed.
+Choose More info, then Run anyway. The checksum for each download is published next to it.
+
+## Use it with Discord
+
+MicClean sends its output to a virtual cable. Install the free [VB-Cable](https://vb-audio.com/Cable/)
+(not bundled, its license doesn't allow that), then follow the "Discord setup" steps on the Devices page.
+
+## Build
+
+Needs Rust (MSVC toolchain) and the Windows SDK.
+
+```
+cargo test
+./build-installer.ps1      # dist\MicClean-Setup.exe
+```
+
+A release is built by pushing a tag that matches the version in `Cargo.toml`, e.g. `git tag v0.2.0 && git push --tags`.
+
+## About this code
+
+Most of this project was written with AI assistance (Claude, by Anthropic), directed and tested by its
+author. The audio chain has unit tests; things that need real hardware (echo cancellation, device
+reconnects, the installer prompts) are tested by hand.
