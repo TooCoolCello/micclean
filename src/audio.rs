@@ -9,7 +9,9 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use serde::{Deserialize, Serialize};
 use sonora::config::{EchoCanceller, MaxProcessingRate, Pipeline};
 use sonora::{AudioProcessing, Config, StreamConfig};
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// GUI <-> mic callback mailbox. The callback only ever try_locks it.
 #[derive(Default)]
@@ -28,12 +30,24 @@ pub struct Shared {
     pub record_progress: Option<f32>,
     /// Silences the monitor output while a recording plays back on it.
     pub mute_monitor: bool,
+    /// The window is on screen, so the display-only spectra are worth computing.
+    pub viz: bool,
+    pub latency: Arc<Latency>,
     pub meters: Meters,
     /// Dropped or late capture buffers (cpal Xrun). The stream keeps running, so these are
     /// only counted, with the device that reported the last one.
     pub glitches: u32,
     pub glitch_dev: String,
     pub error: Option<String>,
+}
+
+/// Device-side delays in microseconds, written by the callbacks (atomics: no locking there).
+#[derive(Default)]
+pub struct Latency {
+    /// Mic: from capture to our callback.
+    pub capture_us: AtomicU32,
+    /// Discord feed: our output ring plus the device's buffer until playback.
+    pub output_us: AtomicU32,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -99,12 +113,13 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
 
     let mut missing = Vec::new();
     let mut outs = Vec::new(); // (ring, is_monitor)
-    let (stream, prod) = open_output(&dev.output, shared.clone())?;
+    let latency = shared.lock().map_err(es)?.latency.clone();
+    let (stream, prod) = open_output(&dev.output, shared.clone(), Some(latency.clone()))?;
     streams.push(stream);
     outs.push((prod, false));
     // Headphones unplugged shouldn't take the Discord feed down with them.
     if let Some(name) = &dev.monitor {
-        match open_output(name, shared.clone()) {
+        match open_output(name, shared.clone(), None) {
             Ok((stream, prod)) => {
                 streams.push(stream);
                 outs.push((prod, true));
@@ -153,7 +168,8 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     let mut mute_monitor = false;
     let sh = shared.clone();
 
-    streams.push(open_input(&mic, &mic_cfg, shared, move |mono| {
+    streams.push(open_input(&mic, &mic_cfg, shared, move |mono, lag| {
+        latency.capture_us.store(lag.as_micros() as u32, Relaxed);
         for &s in mono {
             acc.push(s);
             if acc.len() < frame_in {
@@ -183,6 +199,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
                     sh.recorded = rec.take();
                 }
                 mute_monitor = sh.mute_monitor;
+                chain.viz = sh.viz;
                 sh.meters = chain.meters.clone();
             }
 
@@ -193,11 +210,14 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
                     cons.skip(backlog - ref_n * 4); // fell 200 ms behind: catch up
                 }
                 let mut fed = false;
+                let mut peak = 1e-6f32;
                 while cons.occupied_len() >= ref_n {
                     cons.pop_slice(&mut ref_in);
+                    peak = ref_in.iter().fold(peak, |m, s| m.max(s.abs()));
                     let _ = apm.process_render_f32_with_config(&[&ref_in], &rc, &rc, &mut [&mut ref_out]);
                     fed = true;
                 }
+                chain.meters.echo_ref_db = 20.0 * peak.log10();
                 // WASAPI loopback goes quiet when nothing plays. After 30 ms of nothing, feed
                 // silence so AEC3 keeps its timeline; shorter gaps are just callback jitter.
                 starved = if fed { 0 } else { starved + 1 };
@@ -209,6 +229,11 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
 
             let _ = apm.process_capture_f32_with_config(&[&acc], &in_cfg, &out_cfg, &mut [&mut frame]);
             acc.clear();
+            if echo.is_some() {
+                let st = apm.statistics(); // a borrowed struct, nothing computed here
+                chain.meters.echo_erle_db = st.echo_return_loss_enhancement.map(|v| v as f32);
+                chain.meters.echo_delay_ms = st.delay_ms;
+            }
             if let Some(r) = &mut rec {
                 let k = (r.len() - rec_pos).min(FRAME);
                 r[rec_pos..rec_pos + k].copy_from_slice(&frame[..k]);
@@ -238,7 +263,7 @@ fn open_echo_ref(
     }
     let (mut prod, cons) = HeapRb::<f32>::new(ref_rate as usize).split();
     // Input stream on an output device = WASAPI loopback of what it plays.
-    let stream = open_input(&spk, &cfg, shared, move |mono| {
+    let stream = open_input(&spk, &cfg, shared, move |mono, _| {
         prod.push_slice(mono);
     })?;
     Ok((stream, cons, ref_rate))
@@ -269,17 +294,18 @@ pub fn play(name: Option<&str>, clip: Vec<f32>) -> Result<cpal::Stream, String> 
     Ok(stream)
 }
 
-/// Opens a capture stream in the device's native format and hands the callback mono f32.
+/// Opens a capture stream in the device's native format and hands the callback mono f32,
+/// plus how long ago the device captured it.
 fn open_input(
     dev: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
     shared: Arc<Mutex<Shared>>,
-    f: impl FnMut(&[f32]) + Send + 'static,
+    f: impl FnMut(&[f32], Duration) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
     fn build<T>(
         dev: &cpal::Device,
         sc: cpal::StreamConfig,
-        mut f: impl FnMut(&[f32]) + Send + 'static,
+        mut f: impl FnMut(&[f32], Duration) + Send + 'static,
         err: impl FnMut(cpal::Error) + Send + 'static,
     ) -> Result<cpal::Stream, cpal::Error>
     where
@@ -290,10 +316,11 @@ fn open_input(
         let mut mono = Vec::new();
         dev.build_input_stream(
             sc,
-            move |d: &[T], _: &cpal::InputCallbackInfo| {
+            move |d: &[T], info: &cpal::InputCallbackInfo| {
                 mono.clear();
                 mono.extend(d.chunks(ch).map(|fr| fr.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / ch as f32));
-                f(&mono);
+                let ts = info.timestamp();
+                f(&mono, ts.callback.duration_since(ts.capture));
             },
             err,
             None,
@@ -388,9 +415,11 @@ mod tests {
 }
 
 /// Opens a 48 kHz f32 output (WASAPI converts to the device format) fed by a mono ring.
+/// `latency`: report this output's delay there (the Discord feed only, not the monitor).
 fn open_output(
     name: &str,
     shared: Arc<Mutex<Shared>>,
+    latency: Option<Arc<Latency>>,
 ) -> Result<(cpal::Stream, ringbuf::HeapProd<f32>), String> {
     let dev = find(false, name)?;
     let ch = dev.default_output_config().map_err(es)?.channels();
@@ -400,9 +429,14 @@ fn open_output(
     let stream = dev
         .build_output_stream(
             cpal::StreamConfig { channels: ch, sample_rate: SR as u32, buffer_size: cpal::BufferSize::Default },
-            move |d: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            move |d: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 mono.resize(d.len() / ch as usize, 0.0);
                 reader.read(&mut cons, &mut mono);
+                if let Some(l) = &latency {
+                    let ts = info.timestamp();
+                    let ring = Duration::from_secs_f64(reader.fill / SR as f64);
+                    l.output_us.store((ts.playback.duration_since(ts.callback) + ring).as_micros() as u32, Relaxed);
+                }
                 for (fr, s) in d.chunks_mut(ch as usize).zip(&mono) {
                     fr.fill(*s);
                 }

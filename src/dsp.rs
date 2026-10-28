@@ -90,6 +90,8 @@ impl Default for Params {
 }
 
 pub const BANDS: usize = 5;
+/// The safety limiter's ceiling (linear, about -0.26 dBFS).
+pub const LIMIT_CEIL: f32 = 0.97;
 
 /// Filter shape of an EQ band (RBJ cookbook biquads). Also used inside the de-esser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -173,16 +175,21 @@ enum Match {
 
 impl Profiles {
     // ponytail: nearest-centroid classifier; swap for a small trained net if it misfires a lot.
-    fn classify(&self, f: &[f32; NB], max_dist: f32) -> Option<Match> {
-        let noise = self
-            .noises
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.enabled)
-            .map(|(i, n)| (i, n.profile.dist(f)))
-            .filter(|&(_, d)| d < max_dist)
-            .min_by(|a, b| a.1.total_cmp(&b.1));
-        let keep = self.keep.as_ref().map(|p| p.dist(f)).filter(|&d| d < max_dist);
+    /// Also writes each sound's distance into `m` for the match bars (INFINITY = off or none).
+    fn classify(&self, f: &[f32; NB], max_dist: f32, m: &mut Meters) -> Option<Match> {
+        m.match_dist = [f32::INFINITY; MATCH_BARS];
+        let mut noise = None::<(usize, f32)>;
+        for (i, n) in self.noises.iter().enumerate().filter(|(_, n)| n.enabled) {
+            let d = n.profile.dist(f);
+            if let Some(slot) = m.match_dist.get_mut(i) {
+                *slot = d;
+            }
+            if d < max_dist && noise.is_none_or(|(_, best)| d < best) {
+                noise = Some((i, d));
+            }
+        }
+        m.keep_dist = self.keep.as_ref().map_or(f32::INFINITY, |p| p.dist(f));
+        let keep = Some(m.keep_dist).filter(|&d| d < max_dist);
         match (noise, keep) {
             (Some((i, dn)), Some(dk)) => Some(if dk <= dn { Match::Keep } else { Match::Noise(i) }),
             (Some((i, _)), None) => Some(Match::Noise(i)),
@@ -225,7 +232,26 @@ pub struct Meters {
     pub learning: Option<(Kind, f32)>,
     pub spec_in: Spec,
     pub spec_out: Spec,
+    /// After noise removal, before the gate. Only updated while `Chain::viz` is set.
+    pub spec_clean: Spec,
+    /// How much noise removal took out of the last frame, smoothed.
+    pub denoise_db: f32,
+    /// De-esser detector (energy above 5 kHz), compared against its threshold.
+    pub deess_level_db: f32,
+    /// Limiter gain reduction over the last frame.
+    pub lim_db: f32,
+    /// Distance from each learned sound (first MATCH_BARS) and from the learned voice.
+    pub match_dist: [f32; MATCH_BARS],
+    pub keep_dist: f32,
+    /// Echo canceller: speaker level it hears, echo it removes (ERLE) and the delay it found.
+    /// Written by audio.rs, which owns the canceller.
+    pub echo_ref_db: f32,
+    pub echo_erle_db: Option<f32>,
+    pub echo_delay_ms: Option<i32>,
 }
+
+/// Learned sounds that get a live match bar. More can be learned; they just have no bar.
+pub const MATCH_BARS: usize = 16;
 
 pub struct Chain {
     rnn: Box<DenoiseState<'static>>,
@@ -234,6 +260,10 @@ pub struct Chain {
     pitch: Pitch,
     an_in: Analyzer,
     an_out: Analyzer,
+    an_clean: Analyzer,
+    /// The window is on screen: compute the display-only spectra. Hidden in the tray, the
+    /// only FFT left is the one the learned-sound classifier needs.
+    pub viz: bool,
     learner: Option<Learner>,
     learned: Option<(Kind, Option<Profile>)>,
     hold: u32,
@@ -255,6 +285,8 @@ impl Default for Chain {
             pitch: Pitch::default(),
             an_in: Analyzer::new(),
             an_out: Analyzer::new(),
+            an_clean: Analyzer::new(),
+            viz: false,
             learner: None,
             learned: None,
             hold: 0,
@@ -338,7 +370,9 @@ impl Chain {
 
         // Analysis runs on the raw frame so learning still works while bypassed.
         self.an_in.push(x);
-        self.an_in.display(&mut self.meters.spec_in);
+        if self.viz {
+            self.an_in.display(&mut self.meters.spec_in);
+        }
         let bands = self.an_in.features();
         if let Some(l) = &mut self.learner {
             l.add(&bands, rms_db(x));
@@ -350,7 +384,7 @@ impl Chain {
             }
         }
         let f0 = self.pitch.push(x);
-        let class = prof.classify(&bands, p.learn_match);
+        let class = prof.classify(&bands, p.learn_match, &mut self.meters);
         self.meters.pitch_hz = f0;
         self.meters.noise_match = match class {
             Some(Match::Noise(i)) => Some(i),
@@ -377,14 +411,25 @@ impl Chain {
             let singing = self.pitch.track(f0, vad >= p.vad_threshold);
             let protect = if singing || class == Some(Match::Keep) { p.sing_protect } else { 0.0 };
             let target = p.denoise_strength * (1.0 - protect);
+            // Energy in vs out over the same (delayed) frame: what noise removal took away.
+            let (mut e_in, mut e_out) = (1e-12f32, 1e-12f32);
             for (i, s) in x.iter_mut().enumerate() {
                 let m = self.mix + (target - self.mix) * i as f32 / FRAME as f32;
                 let dry = std::mem::replace(&mut self.dry[i], *s);
                 *s = dry * (1.0 - m) + wet[i] / 32768.0 * m;
+                e_in += dry * dry;
+                e_out += *s * *s;
             }
             self.mix = target;
+            let cut = (10.0 * (e_in / e_out).log10()).max(0.0);
+            self.meters.denoise_db += (cut - self.meters.denoise_db) * 0.1;
+            if self.viz {
+                self.an_clean.push(x);
+                self.an_clean.display(&mut self.meters.spec_clean);
+            }
         } else {
             self.pitch.track(f0, false);
+            self.meters.denoise_db = 0.0;
         }
         self.meters.vad = vad;
 
@@ -444,6 +489,7 @@ impl Chain {
         if p.deess {
             x.iter_mut().for_each(|s| *s = self.deess.run(*s, p.deess_threshold_db));
             self.meters.deess_db = self.deess.gr_db;
+            self.meters.deess_level_db = 20.0 * self.deess.env.max(1e-6).log10();
         }
 
         self.meters.gr_db = 0.0;
@@ -463,19 +509,23 @@ impl Chain {
         }
 
         // Safety limiter: instant attack, so output never exceeds the ceiling.
-        const CEIL: f32 = 0.97;
         let out_g = db2lin(p.output_gain_db);
         let rel = coef(50.0);
+        let mut worst = 1.0f32;
         for s in x.iter_mut() {
             *s *= out_g;
             self.lim_env = s.abs().max(self.lim_env * rel);
-            if self.lim_env > CEIL {
-                *s *= CEIL / self.lim_env;
+            if self.lim_env > LIMIT_CEIL {
+                worst = worst.max(self.lim_env / LIMIT_CEIL);
+                *s *= LIMIT_CEIL / self.lim_env;
             }
         }
+        self.meters.lim_db = 20.0 * worst.log10();
         self.meters.out_db = peak_db(x);
-        self.an_out.push(x);
-        self.an_out.display(&mut self.meters.spec_out);
+        if self.viz {
+            self.an_out.push(x);
+            self.an_out.display(&mut self.meters.spec_out);
+        }
     }
 }
 
@@ -863,7 +913,7 @@ mod tests {
     }
 
     fn run(p: &Params, prof: &Profiles, x: &[f32]) -> (Vec<f32>, Chain) {
-        let mut chain = Chain::default();
+        let mut chain = Chain { viz: true, ..Chain::default() };
         let mut y = Vec::new();
         for c in x.chunks(FRAME) {
             let mut f = c.to_vec();
@@ -959,6 +1009,9 @@ mod tests {
         }
         assert_eq!(chain.meters.reason, "learned noise");
         assert_eq!(chain.meters.noise_match, Some(1));
+        let d = chain.meters.match_dist;
+        assert!(d[1] < p.learn_match && d[0] > p.learn_match, "match bars {:?}", &d[..2]);
+        assert!(d[2].is_infinite() && chain.meters.keep_dist.is_infinite(), "unused bars should be empty");
         assert!(!chain.meters.gate_open);
 
         profiles.noises[1].enabled = false;
@@ -1048,6 +1101,27 @@ mod tests {
         let (y, chain) = run(&p, &Profiles::default(), &sine(1000.0, FRAME * 500, 0.045));
         let out = rms_db(&y[FRAME * 400..]);
         assert!((out + 22.0).abs() < 1.0, "got {out} dB, gain {}", chain.meters.agc_db);
+    }
+
+    #[test]
+    fn visual_meters_track_their_stages() {
+        let mut seed = 3;
+        // Noise removal on plain hiss takes a lot out.
+        let p = Params { denoise: true, ..only("none") };
+        let (_, chain) = run(&p, &Profiles::default(), &noise(FRAME * 100, 0.05, &mut seed));
+        assert!(chain.meters.denoise_db > 6.0, "denoise {} dB", chain.meters.denoise_db);
+        assert!(chain.meters.spec_clean.0.iter().any(|&d| d > -100.0), "clean spectrum not drawn");
+
+        // +20 dB into the limiter: about 19 dB of limiting, nothing above the ceiling.
+        let p = Params { output_gain_db: 20.0, ..only("none") };
+        let (y, chain) = run(&p, &Profiles::default(), &sine(1000.0, FRAME * 20, 0.9));
+        assert!((chain.meters.lim_db - 19.3).abs() < 1.0, "limiting {} dB", chain.meters.lim_db);
+        assert!(y.iter().all(|s| s.abs() <= LIMIT_CEIL + 1e-4));
+
+        // An "s" well over the de-esser threshold shows up on its detector.
+        let p = Params { deess_threshold_db: -30.0, ..only("deess") };
+        let (_, chain) = run(&p, &Profiles::default(), &sine(8000.0, FRAME * 20, 0.5));
+        assert!(chain.meters.deess_level_db > -30.0, "detector {} dB", chain.meters.deess_level_db);
     }
 
     #[test]

@@ -1,9 +1,14 @@
-//! Interactive graphs: the parametric EQ editor and the compressor and gate level curves.
-//! They only run while their page is on screen, and the EQ curve is cached between frames.
+//! Interactive graphs and visualizers: the parametric EQ editor, compressor and gate curves,
+//! meters, histories and the signal-chain boxes. They only run while their page is on screen,
+//! and the EQ curve is cached between frames.
 
 use crate::dsp::{self, BANDS, Band, BandKind, Meters, Params, SPEC_BINS, SPEC_LO, SPEC_SPAN, Spec};
 use crate::ui;
-use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Mesh, PointerButton, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, CursorIcon, FontId, Mesh, PointerButton, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, UiBuilder,
+    Vec2,
+};
+use std::time::{Duration, Instant};
 
 const F_LO: f32 = 20.0;
 const F_HI: f32 = 20_000.0;
@@ -19,7 +24,7 @@ const COLORS: [Color32; BANDS] = [
     Color32::from_rgb(80, 170, 250),
     Color32::from_rgb(190, 125, 250),
 ];
-const AMBER: Color32 = Color32::from_rgb(240, 190, 50);
+pub const AMBER: Color32 = Color32::from_rgb(240, 190, 50);
 
 fn hz(f: f32) -> String {
     if f >= 1000.0 { format!("{:.2} kHz", f / 1000.0) } else { format!("{f:.0} Hz") }
@@ -356,4 +361,173 @@ pub fn gate_graph(ui: &mut egui::Ui, p: &Params, m: &Meters) -> Option<f32> {
         t
     })
     .inner
+}
+
+/// Scrolling history sampled every `every`, kept GUI-side in a fixed array (no allocation, and
+/// the audio thread never sees it).
+pub struct History<T: Copy, const N: usize> {
+    v: [T; N],
+    pos: usize,
+    next: Instant,
+    every: Duration,
+}
+
+impl<T: Copy, const N: usize> History<T, N> {
+    pub fn new(fill: T, every_ms: u64) -> Self {
+        Self { v: [fill; N], pos: 0, next: Instant::now(), every: Duration::from_millis(every_ms) }
+    }
+
+    pub fn push(&mut self, x: T, now: Instant) {
+        if now < self.next {
+            return;
+        }
+        self.next = now + self.every;
+        self.v[self.pos] = x;
+        self.pos = (self.pos + 1) % N;
+    }
+
+    /// Oldest first.
+    fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        self.v[self.pos..].iter().chain(&self.v[..self.pos]).copied()
+    }
+}
+
+/// Horizontal bar from `lo` to `hi` with an optional marker line (a threshold or a ceiling).
+pub fn meter(ui: &mut egui::Ui, width: f32, value: f32, lo: f32, hi: f32, mark: Option<f32>, color: Color32) {
+    let pal = ui::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 8.0), Sense::hover());
+    let frac = |v: f32| ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+    ui.painter().rect_filled(rect, 4.0, pal.control_stroke);
+    let f = frac(value);
+    if f > 0.0 {
+        ui.painter().rect_filled(Rect::from_min_size(rect.min, Vec2::new(rect.width() * f, rect.height())), 4.0, color);
+    }
+    if let Some(m) = mark {
+        let x = rect.left() + rect.width() * frac(m);
+        ui.painter().vline(x, rect.y_range().expand(3.0), Stroke::new(2.0, pal.text));
+    }
+}
+
+/// A row with a meter and a readout, e.g. "Sibilance  [=====|   ]  -18 dB".
+#[allow(clippy::too_many_arguments)]
+pub fn meter_row(ui: &mut egui::Ui, label: &str, value: f32, lo: f32, hi: f32, mark: Option<f32>, color: Color32, text: &str) {
+    ui::row(ui, label, |ui| {
+        ui.add_sized([72.0, 18.0], egui::Label::new(RichText::new(text).small()));
+        let w = ui.available_width().min(260.0);
+        meter(ui, w, value, lo, hi, mark, color);
+    });
+}
+
+/// Mic spectrum against the denoised one, with what noise removal took out shaded red.
+pub fn denoise_view(ui: &mut egui::Ui, m: &Meters) {
+    let pal = ui::pal(ui);
+    let live = ui.is_enabled();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 110.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, pal.field);
+    let x = |i: usize| rect.left() + rect.width() * (i as f32 + 0.5) / SPEC_BINS as f32;
+    let y = |db: f32| rect.bottom() - rect.height() * ((db + 90.0) / 90.0).clamp(0.0, 1.0);
+    let clean = |i: usize| if live { m.spec_clean.0[i] } else { m.spec_in.0[i] };
+    let removed = (0..SPEC_BINS).map(|i| (Pos2::new(x(i), y(m.spec_in.0[i].max(clean(i)))), Pos2::new(x(i), y(clean(i)))));
+    painter.add(band_fill(removed, Color32::from_rgb(232, 72, 72).gamma_multiply(0.35)));
+    let floor = (0..SPEC_BINS).map(|i| (Pos2::new(x(i), y(clean(i))), Pos2::new(x(i), rect.bottom())));
+    painter.add(band_fill(floor, pal.accent.gamma_multiply(0.3)));
+    painter.add(Shape::line((0..SPEC_BINS).map(|i| Pos2::new(x(i), y(m.spec_in.0[i]))).collect(), Stroke::new(1.0, pal.text2)));
+    for (f, label) in [(100.0, "100"), (1000.0, "1k"), (10_000.0, "10k")] {
+        let fx = rect.left() + rect.width() * (f / SPEC_LO).ln() / SPEC_SPAN.ln();
+        painter.vline(fx, rect.y_range(), Stroke::new(1.0, pal.divider));
+        painter.text(Pos2::new(fx + 3.0, rect.bottom() - 2.0), Align2::LEFT_BOTTOM, label, FontId::proportional(10.0), pal.text2);
+    }
+    let text = if live { format!("Removing {:.0} dB", m.denoise_db) } else { "Off".into() };
+    painter.text(rect.left_top() + Vec2::new(8.0, 6.0), Align2::LEFT_TOP, text, FontId::proportional(13.0), pal.text);
+    painter.text(rect.right_top() + Vec2::new(-8.0, 6.0), Align2::RIGHT_TOP, "grey: mic · blue: kept · red: removed", FontId::proportional(10.0), pal.text2);
+}
+
+/// Line graph of a history, oldest on the left. `zero` draws a reference line there.
+pub fn history_graph<const N: usize>(ui: &mut egui::Ui, h: &History<f32, N>, lo: f32, hi: f32, zero: Option<f32>, color: Color32, span: &str) {
+    let pal = ui::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 80.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, pal.field);
+    let y = |v: f32| rect.bottom() - rect.height() * ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+    if let Some(z) = zero {
+        painter.hline(rect.x_range(), y(z), Stroke::new(1.0, pal.control_stroke));
+    }
+    let pts: Vec<Pos2> = h.iter().enumerate().map(|(k, v)| Pos2::new(rect.left() + rect.width() * k as f32 / (N - 1) as f32, y(v))).collect();
+    painter.add(Shape::line(pts, Stroke::new(2.0, if ui.is_enabled() { color } else { pal.text2 })));
+    let small = FontId::proportional(10.0);
+    painter.text(rect.left_top() + Vec2::new(4.0, 2.0), Align2::LEFT_TOP, format!("{hi:+.0} dB"), small.clone(), pal.text2);
+    painter.text(rect.left_bottom() + Vec2::new(4.0, -2.0), Align2::LEFT_BOTTOM, format!("{lo:+.0} dB"), small.clone(), pal.text2);
+    painter.text(rect.right_bottom() + Vec2::new(-4.0, -2.0), Align2::RIGHT_BOTTOM, span, small, pal.text2);
+}
+
+/// "A3 +12 cents" for a frequency.
+pub fn note_name(f: f32) -> String {
+    const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let midi = 69.0 + 12.0 * (f / 440.0).log2();
+    let n = midi.round() as i32;
+    format!("{}{} {:+.0}¢", NAMES[n.rem_euclid(12) as usize], n.div_euclid(12) - 1, (midi - n as f32) * 100.0)
+}
+
+/// The detected pitch over the last few seconds on a note grid. Green while the gate was open.
+pub fn pitch_view<const N: usize>(ui: &mut egui::Ui, h: &History<(f32, bool), N>, m: &Meters, span: &str) {
+    let pal = ui::pal(ui);
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(110.0);
+            let (note, hz) = m.pitch_hz.map_or(("-".to_string(), String::new()), |f| (note_name(f), format!("{f:.0} Hz")));
+            ui.label(RichText::new(note).font(ui::semibold(22.0)));
+            ui.label(RichText::new(hz).small().color(pal.text2));
+            let state = match m.reason {
+                "singing" => "holding your note",
+                "voice" | "learned voice" => "voice",
+                _ if m.pitch_hz.is_some() => "pitched, not voice",
+                _ => "no pitch",
+            };
+            ui.label(RichText::new(state).small().color(if m.gate_open { pal.good } else { pal.text2 }));
+        });
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 120.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, pal.field);
+        let (lo, hi) = (65.0f32.log2(), 1100.0f32.log2());
+        let y = |f: f32| rect.bottom() - rect.height() * ((f.log2() - lo) / (hi - lo));
+        for (octave, f) in [(2, 65.41f32), (3, 130.81), (4, 261.63), (5, 523.25), (6, 1046.5)] {
+            painter.hline(rect.x_range(), y(f), Stroke::new(1.0, pal.divider));
+            painter.text(Pos2::new(rect.left() + 3.0, y(f) - 1.0), Align2::LEFT_BOTTOM, format!("C{octave}"), FontId::proportional(10.0), pal.text2);
+        }
+        let x = |k: usize| rect.left() + rect.width() * k as f32 / (N - 1) as f32;
+        let mut prev: Option<(Pos2, bool)> = None;
+        for (k, (f, open)) in h.iter().enumerate() {
+            let p = (f.is_finite()).then(|| Pos2::new(x(k), y(f)));
+            if let (Some((a, _)), Some(b)) = (prev, p) {
+                // A jump of over half an octave is a new note, not a line to draw.
+                if (a.y - b.y).abs() < rect.height() * 0.5 / (hi - lo) {
+                    painter.line_segment([a, b], Stroke::new(2.5, if open { pal.good } else { pal.text2 }));
+                }
+            }
+            prev = p.map(|p| (p, open));
+        }
+        painter.text(rect.right_bottom() + Vec2::new(-4.0, -2.0), Align2::RIGHT_BOTTOM, span, FontId::proportional(10.0), pal.text2);
+    });
+}
+
+/// One box of the signal-chain strip: name, activity light, live value and (if it can be
+/// switched) its on/off toggle. Clicking the box elsewhere opens its settings.
+pub fn stage_box(ui: &mut egui::Ui, w: f32, name: &str, on: Option<&mut bool>, active: bool, level: f32, value: &str) -> egui::Response {
+    let pal = ui::pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 64.0), Sense::click());
+    let painter = ui.painter();
+    let fill = if resp.hovered() { pal.control_hover } else { pal.card };
+    painter.rect(rect, 6.0, fill, Stroke::new(1.0, pal.card_stroke), StrokeKind::Inside);
+    let text = if active { pal.text } else { pal.text2 };
+    painter.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, name, ui::semibold(13.0), text);
+    let light = if active { pal.good.gamma_multiply(0.2 + 0.8 * level.clamp(0.0, 1.0)) } else { pal.control_stroke };
+    painter.circle_filled(Pos2::new(rect.right() - 12.0, rect.top() + 15.0), 5.0, light);
+    painter.text(rect.left_bottom() + Vec2::new(10.0, -9.0), Align2::LEFT_BOTTOM, value, FontId::proportional(11.0), pal.text2);
+    if let Some(on) = on {
+        let r = Rect::from_min_size(Pos2::new(rect.right() - 50.0, rect.bottom() - 28.0), Vec2::new(40.0, 20.0));
+        // A child that isn't allocated in the row, so the toggle doesn't push the next box.
+        ui::toggle(&mut ui.new_child(UiBuilder::new().max_rect(r)), on);
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
