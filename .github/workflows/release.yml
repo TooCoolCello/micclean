@@ -1,0 +1,41 @@
+name: Release
+
+# Push a tag like v0.2.0 to build the installer and publish it. The tag has to match the
+# version in Cargo.toml, because the in-app updater compares the two.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $want = "v" + ((Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value)
+          if ($env:GITHUB_REF_NAME -ne $want) { throw "tag $env:GITHUB_REF_NAME doesn't match Cargo.toml ($want)" }
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build installer
+        shell: pwsh
+        run: ./build-installer.ps1
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist\MicClean-Setup.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  MicClean-Setup.exe" | Out-File -Encoding ascii dist\MicClean-Setup.exe.sha256
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist\MicClean-Setup.exe dist\MicClean-Setup.exe.sha256 --title $env:GITHUB_REF_NAME --generate-notes
