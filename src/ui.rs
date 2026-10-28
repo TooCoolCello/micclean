@@ -100,6 +100,11 @@ pub fn pal(ui: &Ui) -> Palette {
     Palette::of(ui.visuals().dark_mode)
 }
 
+/// Same palette from the context, for dialogs drawn outside any Ui.
+pub fn pal_ctx(ctx: &egui::Context) -> Palette {
+    Palette::of(ctx.theme() == egui::Theme::Dark)
+}
+
 /// Fonts, accent and both palettes. Fonts come from C:\Windows\Fonts, so nothing is bundled.
 pub fn install(ctx: &egui::Context) {
     let _ = ACCENT.set(system_accent().unwrap_or(Color32::from_rgb(0, 120, 212)));

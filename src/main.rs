@@ -92,6 +92,10 @@ struct Saved {
     profiles: Profiles,
     /// Stored inverted so a save from before this existed (and Default) means "check".
     update_check_off: bool,
+    /// Skip the "update available" popup (Settings still shows it).
+    update_popup_off: bool,
+    /// Install updates without asking, once the gate is closed.
+    auto_update: bool,
 }
 
 /// The fixed 4-filter EQ that saves had before the parametric one.
@@ -179,6 +183,9 @@ struct App {
     /// Only the installed copy can replace itself, so only it checks.
     installed: bool,
     next_update_check: Instant,
+    update_prompt: bool,
+    /// Version the user said "Later" to; it isn't offered again until the next launch.
+    update_dismissed: Option<String>,
     /// Frames until a --minimized start hides the window.
     hide_in: u8,
     page: Page,
@@ -248,7 +255,9 @@ impl App {
             autostart: autostart::enabled(),
             updater: Default::default(),
             installed: install::is_installed_copy(),
-            next_update_check: now + Duration::from_secs(20), // after startup has settled
+            next_update_check: now + Duration::from_secs(3), // after the audio has started
+            update_prompt: false,
+            update_dismissed: None,
             hide_in: 0,
             page: Page::Home,
             hwnd,
@@ -400,6 +409,18 @@ impl eframe::App for App {
             self.next_update_check = now + Duration::from_secs(24 * 3600);
             self.updater.check();
         }
+        if let update::State::Available(r) = self.updater.state()
+            && self.update_dismissed.as_deref() != Some(&r.version)
+        {
+            if self.saved.auto_update {
+                // Never in the middle of a sentence: wait until the gate has closed.
+                if self.installed && !self.meters.gate_open {
+                    self.updater.install(r);
+                }
+            } else if !self.saved.update_popup_off {
+                self.update_prompt = true;
+            }
+        }
         if self.saved.devices != self.engine_devices {
             self.restart();
         }
@@ -462,6 +483,9 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
 
+        if self.update_prompt {
+            self.update_popup(&ctx);
+        }
         let p = ui::pal(ui);
         // Like Windows' NavigationView: labels when there's room, icons only when narrow.
         let compact = ui.available_width() < 720.0;
@@ -871,6 +895,47 @@ impl App {
 }
 
 impl App {
+    /// "Update available" dialog on launch. Both switches apply whichever button is pressed.
+    fn update_popup(&mut self, ctx: &egui::Context) {
+        let update::State::Available(r) = self.updater.state() else {
+            self.update_prompt = false;
+            return;
+        };
+        let p = ui::pal_ctx(ctx);
+        let (mut now, mut later) = (false, false);
+        let (mut auto, mut quiet) = (self.saved.auto_update, self.saved.update_popup_off);
+        let resp = egui::Modal::new(egui::Id::unique("update_prompt")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(RichText::new(format!("MicClean {} is available", r.version)).font(ui::semibold(18.0)));
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("You have {}. Updating closes MicClean for a few seconds, so your voice drops out briefly.", update::VERSION)).color(p.text2));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui::toggle(ui, &mut auto);
+                ui.label("Update automatically from now on");
+            });
+            ui.horizontal(|ui| {
+                ui::toggle(ui, &mut quiet);
+                ui.label("Don't show this popup again");
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                now = ui::accent_button(ui, true, "Update now").clicked();
+                later = ui.button("Later").clicked();
+            });
+        });
+        later |= resp.should_close();
+        self.saved.auto_update = auto;
+        self.saved.update_popup_off = quiet;
+        if now || later {
+            self.update_prompt = false;
+            self.update_dismissed = Some(r.version.clone());
+        }
+        if now {
+            self.updater.install(r);
+        }
+    }
+
     fn updates(&mut self, ui: &mut egui::Ui) {
         use update::State;
         let st = self.updater.state();
@@ -896,11 +961,17 @@ impl App {
             }
             _ => check = ui.add_enabled(installed, egui::Button::new("Check now")).clicked(),
         });
-        let mut auto = !self.saved.update_check_off;
-        ui::setting(ui, icon::INFO, "Check automatically", "Asks GitHub once a day. Nothing else is sent", |ui| {
-            ui::toggle(ui, &mut auto);
+        let (mut check_on, mut popup_on) = (!self.saved.update_check_off, !self.saved.update_popup_off);
+        ui::setting(ui, icon::INFO, "Check for updates", "Asks GitHub when MicClean starts, then once a day. Nothing else is sent", |ui| {
+            ui::toggle(ui, &mut check_on);
         });
-        self.saved.update_check_off = !auto;
+        ui::setting(ui, icon::INFO, "Show a popup when there's an update", "Off: the Updates card above still shows it", |ui| {
+            ui::toggle(ui, &mut popup_on);
+        });
+        ui::setting(ui, icon::REFRESH, "Install updates automatically", "Waits until you aren't talking, then closes MicClean for a few seconds", |ui| {
+            ui::toggle(ui, &mut self.saved.auto_update);
+        });
+        (self.saved.update_check_off, self.saved.update_popup_off) = (!check_on, !popup_on);
         if let Some(r) = install_rel {
             self.updater.install(r);
         }
