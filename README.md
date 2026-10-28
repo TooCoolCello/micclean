@@ -21,7 +21,8 @@ Choose More info, then Run anyway. The checksum for each download is published n
 ## Use it with Discord
 
 MicClean sends its output to a virtual cable. Install the free [VB-Cable](https://vb-audio.com/Cable/)
-(not bundled, its license doesn't allow that), then follow the "Discord setup" steps on the Devices page.
+(not bundled, its license doesn't allow that), then click the Discord box in the signal chain and
+follow its "Discord setup" steps.
 
 ## Build
 

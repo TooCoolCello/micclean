@@ -28,6 +28,8 @@ pub mod icon {
     pub const INFO: &str = "\u{E946}";
     pub const MUSIC: &str = "\u{E8D6}";
     pub const POWER: &str = "\u{E7E8}";
+    pub const MENU: &str = "\u{E700}";
+    pub const CLOSE: &str = "\u{E711}";
 }
 
 pub struct Palette {

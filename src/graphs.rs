@@ -512,13 +512,24 @@ pub fn pitch_view<const N: usize>(ui: &mut egui::Ui, h: &History<(f32, bool), N>
 }
 
 /// One box of the signal-chain strip: name, activity light, live value and (if it can be
-/// switched) its on/off toggle. Clicking the box elsewhere opens its settings.
-pub fn stage_box(ui: &mut egui::Ui, w: f32, name: &str, on: Option<&mut bool>, active: bool, level: f32, value: &str) -> egui::Response {
+/// switched) its on/off toggle. Clicking the box elsewhere opens its settings; the open one
+/// gets an accent outline.
+pub fn stage_box(
+    ui: &mut egui::Ui,
+    w: f32,
+    name: &str,
+    on: Option<&mut bool>,
+    selected: bool,
+    active: bool,
+    level: f32,
+    value: &str,
+) -> egui::Response {
     let pal = ui::pal(ui);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 64.0), Sense::click());
     let painter = ui.painter();
     let fill = if resp.hovered() { pal.control_hover } else { pal.card };
-    painter.rect(rect, 6.0, fill, Stroke::new(1.0, pal.card_stroke), StrokeKind::Inside);
+    let stroke = if selected { Stroke::new(2.0, pal.accent) } else { Stroke::new(1.0, pal.card_stroke) };
+    painter.rect(rect, 6.0, fill, stroke, StrokeKind::Inside);
     let text = if active { pal.text } else { pal.text2 };
     painter.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, name, ui::semibold(13.0), text);
     let light = if active { pal.good.gamma_multiply(0.2 + 0.8 * level.clamp(0.0, 1.0)) } else { pal.control_stroke };

@@ -99,6 +99,8 @@ struct Saved {
     presets: Vec<Preset>,
     /// Starter presets were made once (from the settings at the time). Deleting them sticks.
     presets_seeded: bool,
+    /// The nav rail folded down to icons.
+    nav_compact: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -207,22 +209,48 @@ fn load(storage: &dyn eframe::Storage) -> Saved {
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Home,
-    Devices,
-    Voice,
     Teach,
-    Tone,
     Test,
     Settings,
 }
 
-const NAV: [(Page, &str, &str); 6] = [
+const NAV: [(Page, &str, &str); 3] = [
     (Page::Home, icon::HOME, "Home"),
-    (Page::Devices, icon::SPEAKERS, "Devices"),
-    (Page::Voice, icon::MIC, "Voice"),
-    (Page::Teach, icon::LEARN, "Teach it"),
-    (Page::Tone, icon::EQ, "Tone"),
+    (Page::Teach, icon::LEARN, "Learn sounds"),
     (Page::Test, icon::RECORD, "Test recording"),
 ];
+
+/// A box in the signal chain; clicking one opens its settings under the chain.
+#[derive(Clone, Copy, PartialEq)]
+enum Node {
+    Mic,
+    Echo,
+    Noise,
+    Gate,
+    Level,
+    Eq,
+    Deess,
+    Comp,
+    Limiter,
+    Discord,
+}
+
+impl Node {
+    fn title(self) -> &'static str {
+        match self {
+            Node::Mic => "Microphone",
+            Node::Echo => "Echo cancellation",
+            Node::Noise => "Noise removal",
+            Node::Gate => "Voice gate",
+            Node::Level => "Auto level",
+            Node::Eq => "Equalizer",
+            Node::Deess => "De-esser",
+            Node::Comp => "Compressor",
+            Node::Limiter => "Limiter",
+            Node::Discord => "Discord output",
+        }
+    }
+}
 
 struct App {
     saved: Saved,
@@ -271,6 +299,8 @@ struct App {
     /// Frames until a --minimized start hides the window.
     hide_in: u8,
     page: Page,
+    /// The chain box whose settings are open on Home.
+    node: Option<Node>,
     hwnd: Option<isize>,
     title_dark: Option<bool>,
 }
@@ -279,7 +309,8 @@ impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let _ = CTX.set(cc.egui_ctx.clone());
-        ui::install(&cc.egui_ctx);        let hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
+        ui::install(&cc.egui_ctx);
+        let hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
             RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
             _ => None,
         });
@@ -348,6 +379,7 @@ impl App {
             pitch_hist: graphs::History::new((f32::NAN, false), 33), // 6 s
             hide_in: 0,
             page: Page::Home,
+            node: None,
             hwnd,
             title_dark: None,
         };
@@ -361,6 +393,9 @@ impl App {
             d.output = app.outputs.iter().find(|n| n.contains("CABLE Input")).cloned().unwrap_or_default();
         }
         app.restart();
+        if app.engine.is_none() {
+            app.node = Some(Node::Mic); // first run or a missing mic: start where it gets fixed
+        }
         app
     }
 
@@ -371,10 +406,11 @@ impl App {
 
     fn restart(&mut self) {
         self.engine = None; // stop old streams before opening the devices again
-        self.engine_devices = self.saved.devices.clone();        self.last_beat = Instant::now();
+        self.engine_devices = self.saved.devices.clone();
+        self.last_beat = Instant::now();
         self.needs_restart = false;
         if self.saved.devices.input.is_empty() || self.saved.devices.output.is_empty() {
-            self.status = "Pick a microphone and where to send it on the Devices page.".into();
+            self.status = "Click Mic and Discord in the signal chain to pick your devices.".into();
             return;
         }
         match audio::start(&self.saved.devices, self.shared.clone()) {
@@ -586,8 +622,9 @@ impl eframe::App for App {
             self.update_popup(&ctx);
         }
         let p = ui::pal(ui);
-        // Like Windows' NavigationView: labels when there's room, icons only when narrow.
-        let compact = ui.available_width() < 720.0;
+        // Like Windows' NavigationView: labels when there's room, icons only when narrow or
+        // folded with the menu button.
+        let compact = self.saved.nav_compact || ui.available_width() < 720.0;
         egui::Panel::left("nav")
             .exact_size(if compact { 56.0 } else { 240.0 })
             .resizable(false)
@@ -610,10 +647,7 @@ impl eframe::App for App {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     match self.page {
                         Page::Home => self.home(ui),
-                        Page::Devices => self.devices(ui),
-                        Page::Voice => self.voice(ui),
                         Page::Teach => self.teach(ui),
-                        Page::Tone => self.tone(ui),
                         Page::Test => self.test(ui),
                         Page::Settings => self.settings(ui),
                     }
@@ -634,6 +668,16 @@ fn section(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
 }
 
+/// "In  -23 dB  ━━━━━━──": a label, the level and a -60..0 dB meter.
+fn level_row(ui: &mut egui::Ui, label: &str, db: f32) {
+    let p = ui::pal(ui);
+    ui.horizontal(|ui| {
+        ui.add_sized([28.0, 18.0], egui::Label::new(RichText::new(label).small().color(p.text2)));
+        ui.add_sized([60.0, 18.0], egui::Label::new(RichText::new(format!("{db:.0} dB")).small()));
+        ui::level(ui, db);
+    });
+}
+
 fn slider(ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>, unit: &str) -> egui::Response {
     ui.add(egui::Slider::new(v, r).suffix(unit))
 }
@@ -650,15 +694,11 @@ fn match_bar(ui: &mut egui::Ui, dist: f32, looseness: f32) {
 
 impl App {
     fn nav(&mut self, ui: &mut egui::Ui, compact: bool) {
-        if compact {
-            ui.add_space(26.0);
-        } else {
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
-                ui.label(RichText::new("MicClean").small().color(ui::pal(ui).text2));
-            });
-            ui.add_space(8.0);
+        let fold = if compact { "Show labels" } else { "MicClean" };
+        if ui::nav_item(ui, icon::MENU, fold, false, compact).clicked() {
+            self.saved.nav_compact = !compact;
         }
+        ui.add_space(4.0);
         for (page, ic, label) in NAV {
             if ui::nav_item(ui, ic, label, self.page == page, compact).clicked() {
                 self.page = page;
@@ -681,7 +721,6 @@ impl App {
     }
 
     fn home(&mut self, ui: &mut egui::Ui) {
-        let p = ui::pal(ui);
         let mut restart = false;
         let title = if self.engine.is_some() { "Running" } else { "Not running" };
         let status = match &self.glitches {
@@ -697,52 +736,27 @@ impl App {
 
         let m = self.live_meters();
         self.chain_strip(ui, &m);
-        self.presets_card(ui);
-        ui::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Levels").font(ui::semibold(14.0)));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let reason = match m.noise_match.and_then(|i| self.saved.profiles.noises.get(i)) {
-                        Some(n) if m.reason == "learned noise" => format!("noise: {}", n.name),
-                        _ => m.reason.to_string(),
-                    };
-                    if m.gate_open {
-                        ui::pill(ui, &format!("Open · {reason}"), p.good, p.on_accent);
-                    } else {
-                        ui::pill(ui, &format!("Muted · {reason}"), p.control_stroke, p.text2);
-                    }
-                    let pitch = m.pitch_hz.map_or("-".into(), |f| format!("{f:.0} Hz"));
-                    let detail = RichText::new(format!("voice {:.0}%  ·  pitch {pitch}", m.vad * 100.0)).small().color(p.text2);
-                    ui.add(egui::Label::new(detail).truncate());
-                });
-            });
-            for (label, db) in [("In", m.in_db), ("Out", m.out_db)] {
+        match self.node {
+            Some(n) => {
+                ui.add_space(10.0);
+                let mut close = false;
                 ui.horizontal(|ui| {
-                    ui.add_sized([28.0, 18.0], egui::Label::new(RichText::new(label).small().color(p.text2)));
-                    ui.add_sized([60.0, 18.0], egui::Label::new(RichText::new(format!("{db:.0} dB")).small()));
-                    ui::level(ui, db);
+                    ui.label(RichText::new(n.title()).font(ui::semibold(20.0)));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        close = ui::icon_button(ui, true, icon::CLOSE, "Close").clicked();
+                    });
                 });
+                ui.add_space(4.0);
+                self.panel(ui, n, &m);
+                if close {
+                    self.node = None;
+                }
             }
-        });
-        spectrum_card(ui, &m, &self.saved.params);
-
-        section(ui, "Quick settings");
-        let pr = &mut self.saved.params;
-        ui::setting(ui, icon::VOLUME, "Noise removal", "Strips fans, keyboards and room noise", |ui| {
-            ui::toggle(ui, &mut pr.denoise);
-        });
-        ui::setting(ui, icon::MUTE, "Voice gate", "Mutes you when you're not talking or singing", |ui| {
-            ui::toggle(ui, &mut pr.gate);
-        });
-        ui::setting(ui, icon::MIC, "Mic gain", "Boost or cut the mic before processing", |ui| {
-            slider(ui, &mut pr.input_gain_db, -20.0..=30.0, " dB");
-        });
-        ui::setting(ui, icon::SPEAKERS, "Output gain", "What Discord hears. The limiter stops it clipping", |ui| {
-            slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
-        });
-        ui::setting(ui, icon::POWER, "Bypass", "Send the raw mic to compare (echo cancellation stays on)", |ui| {
-            ui::toggle(ui, &mut pr.bypass);
-        });
+            None => {
+                self.presets_card(ui);
+                self.overview(ui, &m);
+            }
+        }
     }
 
     /// Every stage in the order Discord hears them: on/off, a light that glows with how hard it
@@ -767,22 +781,36 @@ impl App {
         });
         ui.add_space(2.0);
 
-        let echo_on = self.saved.devices.echo_ref.is_some();
+        let d = &self.saved.devices;
+        let echo_on = d.echo_ref.is_some();
         let bands = pr.bands.iter().flatten().filter(|b| b.on).count();
-        let active = [echo_on, pr.denoise, pr.gate, pr.agc, pr.eq, pr.deess, pr.comp, true].map(|a| a && !off && running);
+        // Mic and Discord carry sound whenever audio runs, Bypass or not.
+        let active = [running, echo_on, pr.denoise, pr.gate, pr.agc, pr.eq, pr.deess, pr.comp, true, running]
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| a && running && (!off || i == 0 || i == 9));
         let db = |v: f32| format!("-{v:.1} dB");
+        let fill = |v: f32| (v + 60.0) / 60.0;
         let echo = if echo_on { m.echo_erle_db.map_or("listening".into(), |e| format!("-{e:.0} dB")) } else { "headphones".into() };
-        let stages: [(&str, Page, Option<&mut bool>, f32, String); 8] = [
-            ("Echo", Page::Voice, None, m.echo_erle_db.unwrap_or(0.0) / 30.0, echo),
-            ("Noise", Page::Voice, Some(&mut pr.denoise), m.denoise_db / 20.0, db(m.denoise_db)),
-            ("Gate", Page::Voice, Some(&mut pr.gate), if m.gate_open { 1.0 } else { 0.0 }, if m.gate_open { "open" } else { "muted" }.into()),
-            ("Auto level", Page::Tone, Some(&mut pr.agc), m.agc_db.abs() / 12.0, format!("{:+.1} dB", m.agc_db)),
-            ("EQ", Page::Tone, Some(&mut pr.eq), 0.5, format!("{bands} band{}", if bands == 1 { "" } else { "s" })),
-            ("De-esser", Page::Tone, Some(&mut pr.deess), m.deess_db / 8.0, db(m.deess_db)),
-            ("Compressor", Page::Tone, Some(&mut pr.comp), m.gr_db / 12.0, db(m.gr_db)),
-            ("Limiter", Page::Tone, None, m.lim_db / 6.0, if m.lim_db > 0.1 { db(m.lim_db) } else { "idle".into() }),
+        let device = |name: &str, db: f32, none: &str| match (name.is_empty(), running) {
+            (true, _) => none.to_string(),
+            (_, false) => "-".into(),
+            _ => format!("{db:.0} dB"),
+        };
+        let (mic, discord) = (device(&d.input, m.in_db, "pick a mic"), device(&d.output, m.out_db, "pick output"));
+        let stages: [(Node, &str, Option<&mut bool>, f32, String); 10] = [
+            (Node::Mic, "Mic", None, fill(m.in_db), mic),
+            (Node::Echo, "Echo", None, m.echo_erle_db.unwrap_or(0.0) / 30.0, echo),
+            (Node::Noise, "Noise", Some(&mut pr.denoise), m.denoise_db / 20.0, db(m.denoise_db)),
+            (Node::Gate, "Gate", Some(&mut pr.gate), if m.gate_open { 1.0 } else { 0.0 }, if m.gate_open { "open" } else { "muted" }.into()),
+            (Node::Level, "Auto level", Some(&mut pr.agc), m.agc_db.abs() / 12.0, format!("{:+.1} dB", m.agc_db)),
+            (Node::Eq, "EQ", Some(&mut pr.eq), 0.5, format!("{bands} band{}", if bands == 1 { "" } else { "s" })),
+            (Node::Deess, "De-esser", Some(&mut pr.deess), m.deess_db / 8.0, db(m.deess_db)),
+            (Node::Comp, "Compressor", Some(&mut pr.comp), m.gr_db / 12.0, db(m.gr_db)),
+            (Node::Limiter, "Limiter", None, m.lim_db / 6.0, if m.lim_db > 0.1 { db(m.lim_db) } else { "idle".into() }),
+            (Node::Discord, "Discord", None, fill(m.out_db), discord),
         ];
-        // As many 100 px boxes per row as fit, then even rows (4 + 4, not 6 + 2) filling the width.
+        // As many 100 px boxes per row as fit, then even rows (5 + 5, not 8 + 2) filling the width.
         let avail = ui.available_width();
         let rows = stages.len().div_ceil((((avail + 6.0) / 106.0) as usize).clamp(1, stages.len()));
         let per = stages.len().div_ceil(rows);
@@ -790,21 +818,22 @@ impl App {
         let mut go = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-            for ((name, page, on, level, value), active) in stages.into_iter().zip(active) {
+            for ((node, name, on, level, value), active) in stages.into_iter().zip(active) {
                 let value = match (active, off, running) {
                     (true, ..) => value,
+                    _ if matches!(node, Node::Mic | Node::Discord) => value, // "pick a mic" or "-"
                     (_, true, _) => "bypassed".into(),
                     (_, _, false) => "-".into(),
-                    _ if name == "Echo" => value,
+                    _ if node == Node::Echo => value,
                     _ => "off".into(),
                 };
-                if graphs::stage_box(ui, w, name, on, active, level, &value).clicked() {
-                    go = Some(page);
+                if graphs::stage_box(ui, w, name, on, self.node == Some(node), active, level, &value).clicked() {
+                    go = Some(node);
                 }
             }
         });
-        if let Some(page) = go {
-            self.page = page;
+        if let Some(node) = go {
+            self.node = if self.node == Some(node) { None } else { Some(node) };
         }
     }
 
@@ -852,115 +881,230 @@ impl App {
         }
     }
 
-    fn devices(&mut self, ui: &mut egui::Ui) {
-        let (d, inputs, outputs) = (&mut self.saved.devices, &self.inputs, &self.outputs);
-        ui::setting(ui, icon::MIC, "Microphone", "The mic you talk into", |ui| pick(ui, "mic", &mut d.input, inputs));
-        ui::setting(ui, icon::SPEAKERS, "Send to", "Pick CABLE Input; Discord then uses CABLE Output as its mic", |ui| {
-            pick(ui, "out", &mut d.output, outputs)
-        });
-        ui::setting(ui, icon::HEADPHONE, "Monitor", "Hear yourself, e.g. on your headphones", |ui| {
-            pick_opt(ui, "mon", &mut d.monitor, outputs, "Off")
-        });
-        ui::setting(ui, icon::VOLUME, "Cancel echo from", "Your speakers, if you don't wear headphones", |ui| {
-            pick_opt(ui, "echo", &mut d.echo_ref, outputs, "Off (headphones)")
-        });
-        let (mut refresh, mut restart) = (false, false);
-        ui::setting(ui, icon::REFRESH, "Devices", "Plugged something in? Refresh the lists", |ui| {
-            restart = ui.button("Restart audio").clicked();
-            refresh = ui.button("Refresh").clicked();
-        });
-        if refresh {
-            self.refresh_devices();
-        }
-        if restart {
-            self.restart();
-        }
-
-        section(ui, "Discord setup");
+    /// Nothing selected in the chain: levels, spectrum and Bypass.
+    fn overview(&mut self, ui: &mut egui::Ui, m: &Meters) {
         let p = ui::pal(ui);
         ui::card(ui, |ui| {
-            for step in [
-                "1. Install VB-Cable (free, vb-audio.com) and set Send to = CABLE Input above.",
-                "2. In Windows Sound settings, set CABLE Input and CABLE Output to 48000 Hz (Properties → Advanced). Optional: rename CABLE Output to MicClean.",
-                "3. Windows Settings → System → Sound → your mic: Audio enhancements = Off.",
-                "4. In Discord, Voice & Video: Input Device = CABLE Output (or MicClean).",
-                "5. Turn off Discord's Noise Suppression, Echo Cancellation and Automatic Gain Control.",
-                "6. Turn off Automatic Input Sensitivity and drag its slider all the way left.",
-            ] {
-                ui.label(RichText::new(step).color(p.text2));
-            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Levels").font(ui::semibold(14.0)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let reason = match m.noise_match.and_then(|i| self.saved.profiles.noises.get(i)) {
+                        Some(n) if m.reason == "learned noise" => format!("noise: {}", n.name),
+                        _ => m.reason.to_string(),
+                    };
+                    if m.gate_open {
+                        ui::pill(ui, &format!("Open · {reason}"), p.good, p.on_accent);
+                    } else {
+                        ui::pill(ui, &format!("Muted · {reason}"), p.control_stroke, p.text2);
+                    }
+                    let pitch = m.pitch_hz.map_or("-".into(), |f| format!("{f:.0} Hz"));
+                    let detail = RichText::new(format!("voice {:.0}%  ·  pitch {pitch}", m.vad * 100.0)).small().color(p.text2);
+                    ui.add(egui::Label::new(detail).truncate());
+                });
+            });
+            level_row(ui, "In", m.in_db);
+            level_row(ui, "Out", m.out_db);
         });
+        spectrum_card(ui, m, &self.saved.params);
+        ui::setting(ui, icon::POWER, "Bypass", "Send the raw mic to compare (echo cancellation stays on)", |ui| {
+            ui::toggle(ui, &mut self.saved.params.bypass);
+        });
+        ui.label(RichText::new("Click a box in the signal chain to open its settings here.").small().color(p.text2));
     }
 
-    fn voice(&mut self, ui: &mut egui::Ui) {
-        let m = self.live_meters();
-        let snap = self.saved.params.clone(); // heap-free copy for the graph to read
-        let (shown, hold) = (self.ab_shown, &mut self.ab_hold);
-        let pr = &mut self.saved.params;
-        ui::group(ui, icon::VOLUME, "Noise removal", "Removes fans, keyboards and room noise", Some(&mut pr.denoise), |ui| {
-            graphs::denoise_view(ui, &m);
-            ui.add_space(6.0);
-            ab_row(ui, Stage::Denoise, shown, hold);
-            ui::row(ui, "Strength", |ui| {
-                ui.add(egui::Slider::new(&mut pr.denoise_strength, 0.0..=1.0));
-            });
-            ui::row(ui, "Back off while singing", |ui| {
-                ui.add(egui::Slider::new(&mut pr.sing_protect, 0.0..=1.0))
-                    .on_hover_text("Raise this if held notes sound watery or thin.");
-            });
-        });
-        ui::group(ui, icon::MUTE, "Voice gate", "Mutes you when you're not talking or singing", Some(&mut pr.gate), |ui| {
-            if let Some(t) = graphs::gate_graph(ui, &snap, &m) {
-                pr.gate_threshold_db = t.clamp(-80.0, -10.0);
-            }
-            ui.add_space(6.0);
-            ab_row(ui, Stage::Gate, shown, hold);
-            ui::row(ui, "Minimum level", |ui| {
-                slider(ui, &mut pr.gate_threshold_db, -80.0..=-10.0, " dB");
-            });
-            ui::row(ui, "Close below it by", |ui| {
-                slider(ui, &mut pr.gate_hysteresis_db, 0.0..=20.0, " dB")
-                    .on_hover_text("Keeps fading notes open. 0 = opens and closes at the same level.");
-            });
-            ui::row(ui, "Voice confidence needed", |ui| {
-                ui.add(egui::Slider::new(&mut pr.vad_threshold, 0.05..=0.95));
-            });
-            ui::row(ui, "Hold open after you stop", |ui| {
-                slider(ui, &mut pr.gate_hold_ms, 0.0..=2000.0, " ms");
-            });
-            ui::row(ui, "Fade in", |ui| {
-                slider(ui, &mut pr.gate_attack_ms, 0.5..=50.0, " ms").on_hover_text("How fast it opens. Too fast can click.");
-            });
-            ui::row(ui, "Fade out", |ui| {
-                slider(ui, &mut pr.gate_release_ms, 10.0..=500.0, " ms").on_hover_text("How fast it closes once muting.");
-            });
-            ui::row(ui, "Volume while muted", |ui| {
-                slider(ui, &mut pr.gate_floor_db, -90.0..=0.0, " dB");
-            });
-        });
-
-        ui::card(ui, |ui| {
-            let desc = "A held note that started as voice keeps the gate open, even when the voice detector loses it";
-            ui::header(ui, icon::MUSIC, "Singing detector", desc, |_| {});
-            graphs::pitch_view(ui, &self.pitch_hist, &m, "last 6 s");
-        });
-
+    /// The settings of one chain box, shown right under the chain: its graph or meters, the
+    /// hold-to-compare button and every setting it has.
+    fn panel(&mut self, ui: &mut egui::Ui, node: Node, m: &Meters) {
         let p = ui::pal(ui);
-        match &self.saved.devices.echo_ref {
-            None => {
-                let desc = "Off. Not needed with headphones; with speakers, pick them under Devices → Cancel echo from";
-                ui::setting(ui, icon::SPEAKERS, "Echo cancellation", desc, |_| {});
+        let snap = self.saved.params.clone(); // heap-free copy for the graphs to read
+        let (shown, hold) = (self.ab_shown, &mut self.ab_hold);
+        let (agc_hist, pitch_hist, eq_ui) = (&self.agc_hist, &self.pitch_hist, &mut self.eq_ui);
+        let (d, inputs, outputs) = (&mut self.saved.devices, &self.inputs, &self.outputs);
+        let pr = &mut self.saved.params;
+        let mut refresh = false;
+        let refresh_button = |ui: &mut egui::Ui| ui.button("Refresh list").on_hover_text("Plugged something in?").clicked();
+        match node {
+            Node::Mic => {
+                ui::setting(ui, icon::MIC, "Microphone", "The mic you talk into", |ui| {
+                    refresh |= refresh_button(ui);
+                    pick(ui, "mic", &mut d.input, inputs);
+                });
+                ui::group(ui, icon::MIC, "Mic gain", "Boost or cut the mic before anything else", None, |ui| {
+                    level_row(ui, "In", m.in_db);
+                    ui::row(ui, "Gain", |ui| {
+                        slider(ui, &mut pr.input_gain_db, -20.0..=30.0, " dB");
+                    });
+                });
             }
-            Some(spk) => ui::card(ui, |ui| {
-                ui::header(ui, icon::SPEAKERS, "Echo cancellation", &format!("Removing what {spk} plays from your mic"), |_| {});
-                let level = format!("{:.0} dB", m.echo_ref_db);
-                graphs::meter_row(ui, "Speaker level", m.echo_ref_db, -60.0, 0.0, None, p.accent, &level);
-                let erle = m.echo_erle_db.map_or("learning...".into(), |e| format!("{e:.0} dB"));
-                graphs::meter_row(ui, "Echo removed", m.echo_erle_db.unwrap_or(0.0), 0.0, 40.0, None, p.good, &erle);
-                ui::row(ui, "Speaker delay it found", |ui| {
-                    ui.label(m.echo_delay_ms.map_or("-".into(), |d| format!("{d} ms")));
+            Node::Echo => {
+                ui::setting(ui, icon::SPEAKERS, "Cancel echo from", "Your speakers, if you don't wear headphones", |ui| {
+                    refresh |= refresh_button(ui);
+                    pick_opt(ui, "echo", &mut d.echo_ref, outputs, "Off (headphones)");
+                });
+                match &d.echo_ref {
+                    None => {
+                        let desc = "Off. Headphones don't leak into the mic, so there's nothing to cancel";
+                        ui::setting(ui, icon::HEADPHONE, "Echo cancellation", desc, |_| {});
+                    }
+                    Some(spk) => ui::card(ui, |ui| {
+                        ui::header(ui, icon::SPEAKERS, "Echo cancellation", &format!("Removing what {spk} plays from your mic"), |_| {});
+                        let level = format!("{:.0} dB", m.echo_ref_db);
+                        graphs::meter_row(ui, "Speaker level", m.echo_ref_db, -60.0, 0.0, None, p.accent, &level);
+                        let erle = m.echo_erle_db.map_or("learning...".into(), |e| format!("{e:.0} dB"));
+                        graphs::meter_row(ui, "Echo removed", m.echo_erle_db.unwrap_or(0.0), 0.0, 40.0, None, p.good, &erle);
+                        ui::row(ui, "Speaker delay it found", |ui| {
+                            ui.label(m.echo_delay_ms.map_or("-".into(), |d| format!("{d} ms")));
+                        });
+                    }),
+                }
+            }
+            Node::Noise => ui::group(ui, icon::VOLUME, "Noise removal", "Removes fans, keyboards and room noise", Some(&mut pr.denoise), |ui| {
+                graphs::denoise_view(ui, m);
+                ui.add_space(6.0);
+                ab_row(ui, Stage::Denoise, shown, hold);
+                ui::row(ui, "Strength", |ui| {
+                    ui.add(egui::Slider::new(&mut pr.denoise_strength, 0.0..=1.0));
+                });
+                ui::row(ui, "Back off while singing", |ui| {
+                    ui.add(egui::Slider::new(&mut pr.sing_protect, 0.0..=1.0))
+                        .on_hover_text("Raise this if held notes sound watery or thin.");
                 });
             }),
+            Node::Gate => {
+                ui::group(ui, icon::MUTE, "Voice gate", "Mutes you when you're not talking or singing", Some(&mut pr.gate), |ui| {
+                    if let Some(t) = graphs::gate_graph(ui, &snap, m) {
+                        pr.gate_threshold_db = t.clamp(-80.0, -10.0);
+                    }
+                    ui.add_space(6.0);
+                    ab_row(ui, Stage::Gate, shown, hold);
+                    ui::row(ui, "Minimum level", |ui| {
+                        slider(ui, &mut pr.gate_threshold_db, -80.0..=-10.0, " dB");
+                    });
+                    ui::row(ui, "Close below it by", |ui| {
+                        slider(ui, &mut pr.gate_hysteresis_db, 0.0..=20.0, " dB")
+                            .on_hover_text("Keeps fading notes open. 0 = opens and closes at the same level.");
+                    });
+                    ui::row(ui, "Voice confidence needed", |ui| {
+                        ui.add(egui::Slider::new(&mut pr.vad_threshold, 0.05..=0.95));
+                    });
+                    ui::row(ui, "Hold open after you stop", |ui| {
+                        slider(ui, &mut pr.gate_hold_ms, 0.0..=2000.0, " ms");
+                    });
+                    ui::row(ui, "Fade in", |ui| {
+                        slider(ui, &mut pr.gate_attack_ms, 0.5..=50.0, " ms").on_hover_text("How fast it opens. Too fast can click.");
+                    });
+                    ui::row(ui, "Fade out", |ui| {
+                        slider(ui, &mut pr.gate_release_ms, 10.0..=500.0, " ms").on_hover_text("How fast it closes once muting.");
+                    });
+                    ui::row(ui, "Volume while muted", |ui| {
+                        slider(ui, &mut pr.gate_floor_db, -90.0..=0.0, " dB");
+                    });
+                });
+                ui::card(ui, |ui| {
+                    let desc = "A held note that started as voice keeps the gate open, even when the voice detector loses it";
+                    ui::header(ui, icon::MUSIC, "Singing detector", desc, |_| {});
+                    graphs::pitch_view(ui, pitch_hist, m, "last 6 s");
+                });
+            }
+            Node::Level => {
+                let desc = format!("Evens out quiet and loud · now {:+.1} dB", m.agc_db);
+                ui::group(ui, icon::VOLUME, "Auto level", &desc, Some(&mut pr.agc), |ui| {
+                    graphs::history_graph(ui, agc_hist, -12.0, snap.agc_max_gain_db.max(1.0), Some(0.0), p.accent, "gain it applied, last 30 s");
+                    ui.add_space(6.0);
+                    ab_row(ui, Stage::Agc, shown, hold);
+                    ui::row(ui, "Target level", |ui| {
+                        slider(ui, &mut pr.agc_target_db, -36.0..=-10.0, " dB");
+                    });
+                    ui::row(ui, "Max boost", |ui| {
+                        slider(ui, &mut pr.agc_max_gain_db, 0.0..=30.0, " dB");
+                    });
+                });
+            }
+            Node::Eq => ui::group(ui, icon::EQ, "Equalizer", "Up to 5 bands over your live output spectrum", Some(&mut pr.eq), |ui| {
+                eq_ui.show(ui, &mut pr.bands, &m.spec_out);
+                ab_row(ui, Stage::Eq, shown, hold);
+            }),
+            Node::Deess => {
+                let desc = format!("Tames harsh S sounds · now -{:.1} dB", m.deess_db);
+                ui::group(ui, icon::MUSIC, "De-esser", &desc, Some(&mut pr.deess), |ui| {
+                    let (lvl, thr) = (m.deess_level_db, snap.deess_threshold_db);
+                    let hot = if lvl > thr { graphs::AMBER } else { p.accent };
+                    graphs::meter_row(ui, "S sounds (5 kHz+)", lvl, -60.0, 0.0, Some(thr), hot, &format!("{lvl:.0} dB"));
+                    graphs::meter_row(ui, "Cutting them by", m.deess_db, 0.0, 12.0, None, graphs::AMBER, &format!("-{:.1} dB", m.deess_db));
+                    ab_row(ui, Stage::Deess, shown, hold);
+                    ui::row(ui, "Threshold", |ui| {
+                        slider(ui, &mut pr.deess_threshold_db, -50.0..=0.0, " dB");
+                    });
+                });
+            }
+            Node::Comp => {
+                let desc = format!("Keeps loud parts in check · now -{:.1} dB", m.gr_db);
+                ui::group(ui, icon::EQ, "Compressor", &desc, Some(&mut pr.comp), |ui| {
+                    if let Some(t) = graphs::comp_graph(ui, &snap, m) {
+                        pr.comp_threshold_db = t.clamp(-50.0, 0.0);
+                    }
+                    ui.add_space(6.0);
+                    ab_row(ui, Stage::Comp, shown, hold);
+                    ui::row(ui, "Threshold", |ui| {
+                        slider(ui, &mut pr.comp_threshold_db, -50.0..=0.0, " dB");
+                    });
+                    ui::row(ui, "Ratio", |ui| {
+                        ui.add(egui::Slider::new(&mut pr.comp_ratio, 1.0..=20.0).logarithmic(true).suffix(":1"));
+                    });
+                    ui::row(ui, "Attack", |ui| {
+                        slider(ui, &mut pr.comp_attack_ms, 0.5..=50.0, " ms");
+                    });
+                    ui::row(ui, "Release", |ui| {
+                        slider(ui, &mut pr.comp_release_ms, 20.0..=1000.0, " ms");
+                    });
+                    ui::row(ui, "Makeup gain", |ui| {
+                        slider(ui, &mut pr.comp_makeup_db, 0.0..=24.0, " dB");
+                    });
+                });
+            }
+            Node::Limiter => ui::group(ui, icon::VOLUME, "Limiter", "Always on, so nothing Discord gets can clip", None, |ui| {
+                let red = Color32::from_rgb(232, 72, 72);
+                let limiting = m.lim_db > 0.1;
+                let ceil = 20.0 * dsp::LIMIT_CEIL.log10();
+                let peak = format!("{:.1} dB", m.out_db);
+                graphs::meter_row(ui, "Output peak", m.out_db, -60.0, 0.0, Some(ceil), if limiting { red } else { p.accent }, &peak);
+                let amount = if limiting { format!("-{:.1} dB", m.lim_db) } else { "idle".into() };
+                graphs::meter_row(ui, "Limiting", m.lim_db, 0.0, 12.0, None, red, &amount);
+                ui::row(ui, "Output gain", |ui| {
+                    slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
+                });
+            }),
+            Node::Discord => {
+                ui::setting(ui, icon::SPEAKERS, "Send to", "Pick CABLE Input; Discord then uses CABLE Output as its mic", |ui| {
+                    refresh |= refresh_button(ui);
+                    pick(ui, "out", &mut d.output, outputs);
+                });
+                ui::setting(ui, icon::HEADPHONE, "Monitor", "Hear yourself, e.g. on your headphones", |ui| {
+                    pick_opt(ui, "mon", &mut d.monitor, outputs, "Off");
+                });
+                ui::group(ui, icon::SPEAKERS, "What Discord gets", "After every effect and the limiter", None, |ui| {
+                    level_row(ui, "Out", m.out_db);
+                    ui::row(ui, "Output gain", |ui| {
+                        slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
+                    });
+                });
+                section(ui, "Discord setup");
+                ui::card(ui, |ui| {
+                    for step in [
+                        "1. Install VB-Cable (free, vb-audio.com) and set Send to = CABLE Input above.",
+                        "2. In Windows Sound settings, set CABLE Input and CABLE Output to 48000 Hz (Properties → Advanced). Optional: rename CABLE Output to MicClean.",
+                        "3. Windows Settings → System → Sound → your mic: Audio enhancements = Off.",
+                        "4. In Discord, Voice & Video: Input Device = CABLE Output (or MicClean).",
+                        "5. Turn off Discord's Noise Suppression, Echo Cancellation and Automatic Gain Control.",
+                        "6. Turn off Automatic Input Sensitivity and drag its slider all the way left.",
+                    ] {
+                        ui.label(RichText::new(step).color(p.text2));
+                    }
+                });
+            }
+        }
+        if refresh {
+            self.refresh_devices();
         }
     }
 
@@ -1038,80 +1182,6 @@ impl App {
         if !self.learn_msg.is_empty() {
             ui.label(RichText::new(&self.learn_msg).color(p.text2));
         }
-    }
-
-    fn tone(&mut self, ui: &mut egui::Ui) {
-        let m = self.live_meters();
-        let snap = self.saved.params.clone(); // heap-free copy for the graphs to read
-        let p = ui::pal(ui);
-        let (shown, hold) = (self.ab_shown, &mut self.ab_hold);
-        let agc_hist = &self.agc_hist;
-        let pr = &mut self.saved.params;
-        let eq_ui = &mut self.eq_ui;
-        ui::group(ui, icon::EQ, "Equalizer", "Up to 5 bands over your live output spectrum", Some(&mut pr.eq), |ui| {
-            eq_ui.show(ui, &mut pr.bands, &m.spec_out);
-            ab_row(ui, Stage::Eq, shown, hold);
-        });
-
-        section(ui, "Dynamics");
-        let desc = format!("Evens out quiet and loud · now {:+.1} dB", m.agc_db);
-        ui::group(ui, icon::VOLUME, "Auto level", &desc, Some(&mut pr.agc), |ui| {
-            graphs::history_graph(ui, agc_hist, -12.0, snap.agc_max_gain_db.max(1.0), Some(0.0), p.accent, "gain it applied, last 30 s");
-            ui.add_space(6.0);
-            ab_row(ui, Stage::Agc, shown, hold);
-            ui::row(ui, "Target level", |ui| {
-                slider(ui, &mut pr.agc_target_db, -36.0..=-10.0, " dB");
-            });
-            ui::row(ui, "Max boost", |ui| {
-                slider(ui, &mut pr.agc_max_gain_db, 0.0..=30.0, " dB");
-            });
-        });
-        let desc = format!("Tames harsh S sounds · now -{:.1} dB", m.deess_db);
-        ui::group(ui, icon::MUSIC, "De-esser", &desc, Some(&mut pr.deess), |ui| {
-            let (lvl, thr) = (m.deess_level_db, snap.deess_threshold_db);
-            let hot = if lvl > thr { graphs::AMBER } else { p.accent };
-            graphs::meter_row(ui, "S sounds (5 kHz+)", lvl, -60.0, 0.0, Some(thr), hot, &format!("{lvl:.0} dB"));
-            graphs::meter_row(ui, "Cutting them by", m.deess_db, 0.0, 12.0, None, graphs::AMBER, &format!("-{:.1} dB", m.deess_db));
-            ab_row(ui, Stage::Deess, shown, hold);
-            ui::row(ui, "Threshold", |ui| {
-                slider(ui, &mut pr.deess_threshold_db, -50.0..=0.0, " dB");
-            });
-        });
-        let desc = format!("Keeps loud parts in check · now -{:.1} dB", m.gr_db);
-        ui::group(ui, icon::EQ, "Compressor", &desc, Some(&mut pr.comp), |ui| {
-            if let Some(t) = graphs::comp_graph(ui, &snap, &m) {
-                pr.comp_threshold_db = t.clamp(-50.0, 0.0);
-            }
-            ui.add_space(6.0);
-            ab_row(ui, Stage::Comp, shown, hold);
-            ui::row(ui, "Threshold", |ui| {
-                slider(ui, &mut pr.comp_threshold_db, -50.0..=0.0, " dB");
-            });
-            ui::row(ui, "Ratio", |ui| {
-                ui.add(egui::Slider::new(&mut pr.comp_ratio, 1.0..=20.0).logarithmic(true).suffix(":1"));
-            });
-            ui::row(ui, "Attack", |ui| {
-                slider(ui, &mut pr.comp_attack_ms, 0.5..=50.0, " ms");
-            });
-            ui::row(ui, "Release", |ui| {
-                slider(ui, &mut pr.comp_release_ms, 20.0..=1000.0, " ms");
-            });
-            ui::row(ui, "Makeup gain", |ui| {
-                slider(ui, &mut pr.comp_makeup_db, 0.0..=24.0, " dB");
-            });
-        });
-        ui::group(ui, icon::VOLUME, "Limiter", "Always on, so nothing Discord gets can clip", None, |ui| {
-            let red = Color32::from_rgb(232, 72, 72);
-            let limiting = m.lim_db > 0.1;
-            let ceil = 20.0 * dsp::LIMIT_CEIL.log10();
-            let peak = format!("{:.1} dB", m.out_db);
-            graphs::meter_row(ui, "Output peak", m.out_db, -60.0, 0.0, Some(ceil), if limiting { red } else { p.accent }, &peak);
-            let amount = if limiting { format!("-{:.1} dB", m.lim_db) } else { "idle".into() };
-            graphs::meter_row(ui, "Limiting", m.lim_db, 0.0, 12.0, None, red, &amount);
-            ui::row(ui, "Output gain", |ui| {
-                slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
-            });
-        });
     }
 
     fn test(&mut self, ui: &mut egui::Ui) {
