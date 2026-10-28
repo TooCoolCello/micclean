@@ -223,7 +223,7 @@ const NAV: [(Page, &str, &str); 3] = [
 /// A box in the signal chain; clicking one opens its settings under the chain.
 #[derive(Clone, Copy, PartialEq)]
 enum Node {
-    Mic,
+    Input,
     Echo,
     Noise,
     Gate,
@@ -232,13 +232,13 @@ enum Node {
     Deess,
     Comp,
     Limiter,
-    Discord,
+    Output,
 }
 
 impl Node {
     fn title(self) -> &'static str {
         match self {
-            Node::Mic => "Microphone",
+            Node::Input => "Input",
             Node::Echo => "Echo cancellation",
             Node::Noise => "Noise removal",
             Node::Gate => "Voice gate",
@@ -247,7 +247,7 @@ impl Node {
             Node::Deess => "De-esser",
             Node::Comp => "Compressor",
             Node::Limiter => "Limiter",
-            Node::Discord => "Discord output",
+            Node::Output => "Output",
         }
     }
 }
@@ -394,7 +394,7 @@ impl App {
         }
         app.restart();
         if app.engine.is_none() {
-            app.node = Some(Node::Mic); // first run or a missing mic: start where it gets fixed
+            app.node = Some(Node::Input); // first run or a missing mic: start where it gets fixed
         }
         app
     }
@@ -410,7 +410,7 @@ impl App {
         self.last_beat = Instant::now();
         self.needs_restart = false;
         if self.saved.devices.input.is_empty() || self.saved.devices.output.is_empty() {
-            self.status = "Click Mic and Discord in the signal chain to pick your devices.".into();
+            self.status = "Click Input and Output in the signal chain to pick your devices.".into();
             return;
         }
         match audio::start(&self.saved.devices, self.shared.clone()) {
@@ -774,7 +774,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if running {
                     ui.label(RichText::new(format!("≈ {:.0} ms delay", cap + rnn + out)).small().color(p.text2)).on_hover_text(format!(
-                        "Mic buffer {cap:.0} ms · noise removal {rnn:.0} ms · output buffer {out:.0} ms.\nDiscord adds its own network delay on top."
+                        "Input buffer {cap:.0} ms · noise removal {rnn:.0} ms · output buffer {out:.0} ms.\nThe app you send to adds its own delay on top."
                     ));
                 }
             });
@@ -784,7 +784,7 @@ impl App {
         let d = &self.saved.devices;
         let echo_on = d.echo_ref.is_some();
         let bands = pr.bands.iter().flatten().filter(|b| b.on).count();
-        // Mic and Discord carry sound whenever audio runs, Bypass or not.
+        // Input and Output carry sound whenever audio runs, Bypass or not.
         let active = [running, echo_on, pr.denoise, pr.gate, pr.agc, pr.eq, pr.deess, pr.comp, true, running]
             .into_iter()
             .enumerate()
@@ -797,9 +797,9 @@ impl App {
             (_, false) => "-".into(),
             _ => format!("{db:.0} dB"),
         };
-        let (mic, discord) = (device(&d.input, m.in_db, "pick a mic"), device(&d.output, m.out_db, "pick output"));
+        let (input, output) = (device(&d.input, m.in_db, "pick input"), device(&d.output, m.out_db, "pick output"));
         let stages: [(Node, &str, Option<&mut bool>, f32, String); 10] = [
-            (Node::Mic, "Mic", None, fill(m.in_db), mic),
+            (Node::Input, "Input", None, fill(m.in_db), input),
             (Node::Echo, "Echo", None, m.echo_erle_db.unwrap_or(0.0) / 30.0, echo),
             (Node::Noise, "Noise", Some(&mut pr.denoise), m.denoise_db / 20.0, db(m.denoise_db)),
             (Node::Gate, "Gate", Some(&mut pr.gate), if m.gate_open { 1.0 } else { 0.0 }, if m.gate_open { "open" } else { "muted" }.into()),
@@ -808,7 +808,7 @@ impl App {
             (Node::Deess, "De-esser", Some(&mut pr.deess), m.deess_db / 8.0, db(m.deess_db)),
             (Node::Comp, "Compressor", Some(&mut pr.comp), m.gr_db / 12.0, db(m.gr_db)),
             (Node::Limiter, "Limiter", None, m.lim_db / 6.0, if m.lim_db > 0.1 { db(m.lim_db) } else { "idle".into() }),
-            (Node::Discord, "Discord", None, fill(m.out_db), discord),
+            (Node::Output, "Output", None, fill(m.out_db), output),
         ];
         // As many 100 px boxes per row as fit, then even rows (5 + 5, not 8 + 2) filling the width.
         let avail = ui.available_width();
@@ -821,7 +821,7 @@ impl App {
             for ((node, name, on, level, value), active) in stages.into_iter().zip(active) {
                 let value = match (active, off, running) {
                     (true, ..) => value,
-                    _ if matches!(node, Node::Mic | Node::Discord) => value, // "pick a mic" or "-"
+                    _ if matches!(node, Node::Input | Node::Output) => value, // "pick input" or "-"
                     (_, true, _) => "bypassed".into(),
                     (_, _, false) => "-".into(),
                     _ if node == Node::Echo => value,
@@ -924,12 +924,12 @@ impl App {
         let mut refresh = false;
         let refresh_button = |ui: &mut egui::Ui| ui.button("Refresh list").on_hover_text("Plugged something in?").clicked();
         match node {
-            Node::Mic => {
-                ui::setting(ui, icon::MIC, "Microphone", "The mic you talk into", |ui| {
+            Node::Input => {
+                ui::setting(ui, icon::MIC, "Input device", "The mic or line input to clean up", |ui| {
                     refresh |= refresh_button(ui);
                     pick(ui, "mic", &mut d.input, inputs);
                 });
-                ui::group(ui, icon::MIC, "Mic gain", "Boost or cut the mic before anything else", None, |ui| {
+                ui::group(ui, icon::MIC, "Input gain", "Boost or cut the input before anything else", None, |ui| {
                     level_row(ui, "In", m.in_db);
                     ui::row(ui, "Gain", |ui| {
                         slider(ui, &mut pr.input_gain_db, -20.0..=30.0, " dB");
@@ -1062,7 +1062,7 @@ impl App {
                     });
                 });
             }
-            Node::Limiter => ui::group(ui, icon::VOLUME, "Limiter", "Always on, so nothing Discord gets can clip", None, |ui| {
+            Node::Limiter => ui::group(ui, icon::VOLUME, "Limiter", "Always on, so nothing you send can clip", None, |ui| {
                 let red = Color32::from_rgb(232, 72, 72);
                 let limiting = m.lim_db > 0.1;
                 let ceil = 20.0 * dsp::LIMIT_CEIL.log10();
@@ -1074,21 +1074,21 @@ impl App {
                     slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
                 });
             }),
-            Node::Discord => {
-                ui::setting(ui, icon::SPEAKERS, "Send to", "Pick CABLE Input; Discord then uses CABLE Output as its mic", |ui| {
+            Node::Output => {
+                ui::setting(ui, icon::SPEAKERS, "Send to", "Where the cleaned sound goes. For Discord or other apps, pick CABLE Input; they then use CABLE Output as their mic", |ui| {
                     refresh |= refresh_button(ui);
                     pick(ui, "out", &mut d.output, outputs);
                 });
                 ui::setting(ui, icon::HEADPHONE, "Monitor", "Hear yourself, e.g. on your headphones", |ui| {
                     pick_opt(ui, "mon", &mut d.monitor, outputs, "Off");
                 });
-                ui::group(ui, icon::SPEAKERS, "What Discord gets", "After every effect and the limiter", None, |ui| {
+                ui::group(ui, icon::SPEAKERS, "What gets sent", "After every effect and the limiter", None, |ui| {
                     level_row(ui, "Out", m.out_db);
                     ui::row(ui, "Output gain", |ui| {
                         slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
                     });
                 });
-                section(ui, "Discord setup");
+                section(ui, "Using it with Discord");
                 ui::card(ui, |ui| {
                     for step in [
                         "1. Install VB-Cable (free, vb-audio.com) and set Send to = CABLE Input above.",
@@ -1340,7 +1340,7 @@ fn spectrum_card(ui: &mut egui::Ui, m: &Meters, p: &Params) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Spectrum").font(ui::semibold(14.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add(egui::Label::new(RichText::new("bars: out  ·  line: mic  ·  yellow: EQ").small().color(pal.text2)).truncate());
+                ui.add(egui::Label::new(RichText::new("bars: out  ·  line: in  ·  yellow: EQ").small().color(pal.text2)).truncate());
             });
         });
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 140.0), egui::Sense::hover());
