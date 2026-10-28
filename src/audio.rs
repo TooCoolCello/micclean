@@ -362,7 +362,7 @@ mod tests {
     fn drift_reader_rides_out_clock_drift() {
         for ppm in [-400.0, 400.0] {
             let (mut prod, mut cons) = HeapRb::<f32>::new(SR as usize).split();
-            let mut r = DriftReader::default();
+            let mut r = DriftReader { period: 480, ..Default::default() };
             let (mut out, mut prev) = ([0.0f32; 480], 0.0f32);
             let (mut owed, mut n, mut jump) = (0.0f64, 0u64, 0.0f32);
             // 10 minutes: the mic pushes 10 ms bursts on its clock, the output pulls 10 ms on its own.
@@ -390,6 +390,28 @@ mod tests {
             assert!(off.abs() < 600.0, "{ppm} ppm: fill {off:+.0} off target");
             println!("{ppm:+} ppm: fill {off:+.0} samples off target");
         }
+    }
+
+    /// VB-Cable's measured pattern: a 1056-sample first callback (the whole buffer), then 480s
+    /// with an occasional late wake that asks for 960 at once. The cushion stays at 30 ms.
+    #[test]
+    fn whole_buffer_first_callback_does_not_grow_the_cushion() {
+        let (mut prod, mut cons) = HeapRb::<f32>::new(SR as usize).split();
+        let mut r = DriftReader { period: 480, ..Default::default() };
+        let mut out = [0.0f32; 1056];
+        r.read(&mut cons, &mut out);
+        for tick in 1..3000 {
+            prod.push_slice(&[0.25; 480]);
+            match tick % 37 {
+                0 => continue, // a late wake...
+                1 => r.read(&mut cons, &mut out[..960]), // ...catches up with two periods
+                _ => r.read(&mut cons, &mut out[..480]),
+            }
+            if tick > 10 {
+                assert!(r.primed, "ran dry at tick {tick}");
+            }
+        }
+        assert!((r.fill - 1440.0).abs() < 150.0, "fill {:.0}, want 1440", r.fill);
     }
 
     /// Needs real devices: `cargo test -- --ignored`. Runs default mic -> default output with
@@ -422,10 +444,16 @@ fn open_output(
     latency: Option<Arc<Latency>>,
 ) -> Result<(cpal::Stream, ringbuf::HeapProd<f32>), String> {
     let dev = find(false, name)?;
-    let ch = dev.default_output_config().map_err(es)?.channels();
+    let cfg = dev.default_output_config().map_err(es)?;
+    let ch = cfg.channels();
+    // cpal reports the shared-mode engine period here, in device frames.
+    let period = match cfg.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, .. } if *min > 0 => *min as usize * SR as usize / cfg.sample_rate() as usize,
+        _ => SR as usize / 100, // Windows' engine runs 10 ms periods
+    };
     let (prod, mut cons) = HeapRb::<f32>::new(SR as usize).split();
     let mut mono = Vec::new();
-    let mut reader = DriftReader::default();
+    let mut reader = DriftReader { period, ..Default::default() };
     let stream = dev
         .build_output_stream(
             cpal::StreamConfig { channels: ch, sample_rate: SR as u32, buffer_size: cpal::BufferSize::Default },
@@ -459,14 +487,15 @@ struct DriftReader {
     t: f64,
     /// Ring fill smoothed over ~1 s, in samples.
     fill: f64,
-    /// Largest callback seen, in samples.
+    /// The device's steady callback size, in samples. Not the largest callback seen: the first
+    /// one is the whole buffer (1056 on VB-Cable) and late wakes ask for two periods at once,
+    /// but the mic keeps filling the ring through both, so neither needs a bigger cushion.
     period: usize,
     primed: bool,
 }
 
 impl DriftReader {
     fn read(&mut self, ring: &mut ringbuf::HeapCons<f32>, out: &mut [f32]) {
-        self.period = self.period.max(out.len());
         // Enough to ride out one whole callback on top of the mic's 10 ms bursts.
         let target = 720 + self.period * 3 / 2;
         let have = ring.occupied_len();
