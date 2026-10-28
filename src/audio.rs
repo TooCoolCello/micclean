@@ -11,7 +11,7 @@ use sonora::config::{EchoCanceller, MaxProcessingRate, Pipeline};
 use sonora::{AudioProcessing, Config, StreamConfig};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// GUI <-> mic callback mailbox. The callback only ever try_locks it.
 #[derive(Default)]
@@ -64,6 +64,13 @@ pub fn device_names(input: bool) -> Vec<String> {
     let devs = if input { host.input_devices() } else { host.output_devices() };
     devs.map(|d| d.filter_map(|d| d.description().ok().map(|d| d.name().to_string())).collect())
         .unwrap_or_default()
+}
+
+/// The rate Windows runs a device at (its shared-mode mix format).
+pub fn device_rate(input: bool, name: &str) -> Option<u32> {
+    let d = find(input, name).ok()?;
+    let cfg = if input { d.default_input_config() } else { d.default_output_config() };
+    cfg.ok().map(|c| c.sample_rate())
 }
 
 fn find(input: bool, name: &str) -> Result<cpal::Device, String> {
@@ -175,6 +182,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
             if acc.len() < frame_in {
                 continue;
             }
+            let t0 = Instant::now();
             if let Ok(mut sh) = sh.try_lock() {
                 if sh.params_ver != params_ver {
                     params = sh.params.clone();
@@ -245,6 +253,8 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
                     o.push_slice(&frame);
                 }
             }
+            let load = t0.elapsed().as_secs_f32() / 0.01;
+            chain.meters.dsp_load += (load - chain.meters.dsp_load) * 0.02;
         }
     })?);
 

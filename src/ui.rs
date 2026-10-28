@@ -30,6 +30,8 @@ pub mod icon {
     pub const POWER: &str = "\u{E7E8}";
     pub const MENU: &str = "\u{E700}";
     pub const CLOSE: &str = "\u{E711}";
+    pub const WARNING: &str = "\u{E7BA}";
+    pub const FOLDER: &str = "\u{E838}";
 }
 
 pub struct Palette {

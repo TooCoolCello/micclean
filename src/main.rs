@@ -5,6 +5,7 @@ mod audio;
 mod dsp;
 mod graphs;
 mod install;
+mod logfile;
 mod ui;
 mod update;
 
@@ -250,7 +251,45 @@ impl Node {
             Node::Output => "Output",
         }
     }
+
+    /// Puts this box's settings back to the defaults. Its on/off switch stays as it is.
+    fn reset(self, p: &mut Params) {
+        let d = Params::default();
+        match self {
+            Node::Input => p.input_gain_db = d.input_gain_db,
+            Node::Echo => {}
+            Node::Noise => (p.denoise_strength, p.sing_protect) = (d.denoise_strength, d.sing_protect),
+            Node::Gate => {
+                (p.gate_threshold_db, p.gate_hysteresis_db, p.vad_threshold) = (d.gate_threshold_db, d.gate_hysteresis_db, d.vad_threshold);
+                (p.gate_hold_ms, p.gate_attack_ms, p.gate_release_ms) = (d.gate_hold_ms, d.gate_attack_ms, d.gate_release_ms);
+                p.gate_floor_db = d.gate_floor_db;
+            }
+            Node::Level => (p.agc_target_db, p.agc_max_gain_db) = (d.agc_target_db, d.agc_max_gain_db),
+            Node::Eq => p.bands = d.bands,
+            Node::Deess => p.deess_threshold_db = d.deess_threshold_db,
+            Node::Comp => {
+                (p.comp_threshold_db, p.comp_ratio, p.comp_makeup_db) = (d.comp_threshold_db, d.comp_ratio, d.comp_makeup_db);
+                (p.comp_attack_ms, p.comp_release_ms) = (d.comp_attack_ms, d.comp_release_ms);
+            }
+            Node::Limiter | Node::Output => p.output_gain_db = d.output_gain_db,
+        }
+    }
 }
+
+/// Calibrate: room noise first, then talking, both read off the gate's level meter.
+struct Calib {
+    start: Instant,
+    /// Last meters frame sampled, so a frame isn't counted twice.
+    frame: u64,
+    quiet: Vec<f32>,
+    voice: Vec<f32>,
+}
+
+const CALIB_QUIET: f32 = 3.0;
+const CALIB_END: f32 = 9.0;
+
+/// Every library license compiled into the exe, written by licenses.ps1.
+const NOTICES: &str = include_str!("../THIRD-PARTY-NOTICES.txt");
 
 struct App {
     saved: Saved,
@@ -301,6 +340,16 @@ struct App {
     page: Page,
     /// The chain box whose settings are open on Home.
     node: Option<Node>,
+    calib: Option<Calib>,
+    calib_msg: String,
+    /// Windows' rate for the input, output and monitor devices, looked up on each restart.
+    rates: [Option<u32>; 3],
+    show_notices: bool,
+    /// What the log file already has, so it gets changes only.
+    logged_status: String,
+    logged_glitches: u32,
+    next_glitch_log: Instant,
+    logged_update: Option<std::mem::Discriminant<update::State>>,
     hwnd: Option<isize>,
     title_dark: Option<bool>,
 }
@@ -314,6 +363,7 @@ impl App {
             RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
             _ => None,
         });
+        logfile::line(&format!("MicClean {} started", update::VERSION));
         let saved = cc.storage.map(load).unwrap_or_default();
         let shared = Shared {
             params: saved.params.clone(),
@@ -380,6 +430,14 @@ impl App {
             hide_in: 0,
             page: Page::Home,
             node: None,
+            calib: None,
+            calib_msg: String::new(),
+            rates: [None; 3],
+            show_notices: false,
+            logged_status: String::new(),
+            logged_glitches: 0,
+            next_glitch_log: now,
+            logged_update: None,
             hwnd,
             title_dark: None,
         };
@@ -409,6 +467,9 @@ impl App {
         self.engine_devices = self.saved.devices.clone();
         self.last_beat = Instant::now();
         self.needs_restart = false;
+        let d = &self.saved.devices;
+        let rate = |input, name: &str| if name.is_empty() { None } else { audio::device_rate(input, name) };
+        self.rates = [rate(true, &d.input), rate(false, &d.output), d.monitor.as_deref().and_then(|n| rate(false, n))];
         if self.saved.devices.input.is_empty() || self.saved.devices.output.is_empty() {
             self.status = "Click Input and Output in the signal chain to pick your devices.".into();
             return;
@@ -442,6 +503,12 @@ impl App {
             .engine
             .as_ref()
             .is_some_and(|e| e.missing.iter().any(|m| self.outputs.contains(m)));
+        if stalled {
+            logfile::line("No sound from the input for 2 s, restarting audio");
+        }
+        if came_back {
+            logfile::line("A missing device is back, restarting audio");
+        }
         if self.engine.is_none() || stalled || came_back || self.needs_restart {
             self.refresh_devices();
             self.restart();
@@ -527,6 +594,79 @@ impl App {
         self.learn_msg.clear();
         self.shared.lock().unwrap().learn = Some((kind, secs));
     }
+
+    /// Status changes, glitches (at most a line a minute) and update steps go to the log file.
+    fn log_changes(&mut self, update: &update::State, now: Instant) {
+        if self.status != self.logged_status {
+            logfile::line(&self.status);
+            self.logged_status.clone_from(&self.status);
+        }
+        if self.glitches.0 != self.logged_glitches && now >= self.next_glitch_log {
+            logfile::line(&format!("{} glitches so far, last on {}", self.glitches.0, self.glitches.1));
+            (self.logged_glitches, self.next_glitch_log) = (self.glitches.0, now + Duration::from_secs(60));
+        }
+        let kind = std::mem::discriminant(update);
+        if self.logged_update != Some(kind) {
+            self.logged_update = Some(kind);
+            match update {
+                update::State::Available(r) => logfile::line(&format!("Update {} available", r.version)),
+                update::State::Installing => logfile::line("Installing the update"),
+                update::State::Failed(e) => logfile::line(&format!("Update failed: {e}")),
+                _ => {}
+            }
+        }
+    }
+
+    /// Samples the gate's level meter once per audio frame while Calibrate runs, then sets the
+    /// input gain and gate from it.
+    fn calibrate_step(&mut self) {
+        let Some(c) = &mut self.calib else { return };
+        let t = c.start.elapsed().as_secs_f32();
+        if t >= CALIB_END {
+            let c = self.calib.take().expect("checked above");
+            self.calib_msg = Self::calibrate(&mut self.saved.params, c.quiet, c.voice);
+            logfile::line(&format!("Calibrated: {}", self.calib_msg));
+            return;
+        }
+        let m = &self.meters;
+        if m.frames == c.frame {
+            return;
+        }
+        c.frame = m.frames;
+        if t < CALIB_QUIET {
+            if t > 0.5 {
+                c.quiet.push(m.gate_level_db); // past the click of the button
+            }
+        } else if m.vad >= 0.5 {
+            c.voice.push(m.gate_level_db); // talking, not the pauses between words
+        }
+    }
+
+    /// Input gain puts your normal voice at the Auto level target, so auto level only has to
+    /// even things out. The gate closes a little above the room noise but well under your voice.
+    fn calibrate(p: &mut Params, mut quiet: Vec<f32>, mut voice: Vec<f32>) -> String {
+        if quiet.len() < 20 || voice.len() < 30 {
+            return "Didn't hear enough talking. Try again and keep talking for the whole 6 seconds.".into();
+        }
+        let pct = |v: &mut Vec<f32>, q: f32| {
+            v.sort_by(f32::total_cmp);
+            v[((v.len() - 1) as f32 * q) as usize]
+        };
+        let (noise, talk) = (pct(&mut quiet, 0.9), pct(&mut voice, 0.5));
+        let old = p.input_gain_db;
+        p.input_gain_db = (old + p.agc_target_db - talk).clamp(-20.0, 30.0);
+        let (noise, talk) = (noise + p.input_gain_db - old, talk + p.input_gain_db - old);
+        let (lo, hi) = (noise + p.gate_hysteresis_db + 3.0, talk - 20.0);
+        p.gate_threshold_db = if lo <= hi { lo } else { (lo + hi) / 2.0 }.clamp(-80.0, -10.0);
+        let mut msg = format!(
+            "Input gain {:+.1} dB, gate minimum level {:.0} dB (room {noise:.0} dB, your voice {talk:.0} dB).",
+            p.input_gain_db, p.gate_threshold_db
+        );
+        if talk - noise < 15.0 {
+            msg += " Your voice is close to the room noise: noise removal and getting closer to the mic help.";
+        }
+        msg
+    }
 }
 
 impl eframe::App for App {
@@ -537,11 +677,14 @@ impl eframe::App for App {
         let now = Instant::now();
         self.agc_hist.push(self.meters.agc_db, now);
         self.pitch_hist.push((self.meters.pitch_hz.unwrap_or(f32::NAN), self.meters.gate_open), now);
+        self.calibrate_step();
         if self.installed && !self.saved.update_check_off && now >= self.next_update_check {
             self.next_update_check = now + Duration::from_secs(24 * 3600);
             self.updater.check();
         }
-        if let update::State::Available(r) = self.updater.state()
+        let st = self.updater.state();
+        self.log_changes(&st, now);
+        if let update::State::Available(r) = st
             && self.update_dismissed.as_deref() != Some(&r.version)
         {
             if self.saved.auto_update {
@@ -621,6 +764,9 @@ impl eframe::App for App {
         if self.update_prompt {
             self.update_popup(&ctx);
         }
+        if self.show_notices {
+            self.notices(&ctx);
+        }
         let p = ui::pal(ui);
         // Like Windows' NavigationView: labels when there's room, icons only when narrow or
         // folded with the menu button.
@@ -666,6 +812,11 @@ fn section(ui: &mut egui::Ui, text: &str) {
     ui.add_space(14.0);
     ui.label(RichText::new(text).font(ui::semibold(14.0)));
     ui.add_space(2.0);
+}
+
+/// "CABLE Input runs at 44100 Hz", with what that costs and how to fix it.
+fn rate_note(ui: &mut egui::Ui, name: &str, rate: u32, desc: &str) {
+    ui::setting(ui, icon::WARNING, &format!("{name} runs at {rate} Hz"), desc, |_| {});
 }
 
 /// "In  -23 dB  ━━━━━━──": a label, the level and a -60..0 dB meter.
@@ -739,15 +890,23 @@ impl App {
         match self.node {
             Some(n) => {
                 ui.add_space(10.0);
-                let mut close = false;
+                let (mut close, mut reset) = (false, false);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(n.title()).font(ui::semibold(20.0)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         close = ui::icon_button(ui, true, icon::CLOSE, "Close").clicked();
+                        if n != Node::Echo {
+                            reset = ui::icon_button(ui, true, icon::REFRESH, "Reset")
+                                .on_hover_text("Back to the defaults for this box. On/off stays as it is")
+                                .clicked();
+                        }
                     });
                 });
                 ui.add_space(4.0);
                 self.panel(ui, n, &m);
+                if reset {
+                    n.reset(&mut self.saved.params);
+                }
                 if close {
                     self.node = None;
                 }
@@ -773,8 +932,9 @@ impl App {
             ui.label(RichText::new("Signal chain").font(ui::semibold(14.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if running {
-                    ui.label(RichText::new(format!("≈ {:.0} ms delay", cap + rnn + out)).small().color(p.text2)).on_hover_text(format!(
-                        "Input buffer {cap:.0} ms · noise removal {rnn:.0} ms · output buffer {out:.0} ms.\nThe app you send to adds its own delay on top."
+                    let text = format!("≈ {:.0} ms delay  ·  DSP {:.1}%", cap + rnn + out, m.dsp_load * 100.0);
+                    ui.label(RichText::new(text).small().color(p.text2)).on_hover_text(format!(
+                        "Input buffer {cap:.0} ms · noise removal {rnn:.0} ms · output buffer {out:.0} ms.\nThe app you send to adds its own delay on top.\n\nDSP: time spent cleaning each 10 ms of sound, as a share of one CPU core."
                     ));
                 }
             });
@@ -797,7 +957,11 @@ impl App {
             (_, false) => "-".into(),
             _ => format!("{db:.0} dB"),
         };
-        let (input, output) = (device(&d.input, m.in_db, "pick input"), device(&d.output, m.out_db, "pick output"));
+        let input = device(&d.input, m.in_db, "pick input");
+        let output = match self.rates[1] {
+            Some(r) if r != dsp::SR as u32 && !d.output.is_empty() => "set 48 kHz".into(),
+            _ => device(&d.output, m.out_db, "pick output"),
+        };
         let stages: [(Node, &str, Option<&mut bool>, f32, String); 10] = [
             (Node::Input, "Input", None, fill(m.in_db), input),
             (Node::Echo, "Echo", None, m.echo_erle_db.unwrap_or(0.0) / 30.0, echo),
@@ -920,6 +1084,9 @@ impl App {
         let (shown, hold) = (self.ab_shown, &mut self.ab_hold);
         let (agc_hist, pitch_hist, eq_ui) = (&self.agc_hist, &self.pitch_hist, &mut self.eq_ui);
         let (d, inputs, outputs) = (&mut self.saved.devices, &self.inputs, &self.outputs);
+        let (calib, calib_msg) = (&mut self.calib, &mut self.calib_msg);
+        let (rates, running) = (self.rates, self.engine.is_some());
+        let off_rate = |i: usize| rates[i].filter(|&r| r != dsp::SR as u32);
         let pr = &mut self.saved.params;
         let mut refresh = false;
         let refresh_button = |ui: &mut egui::Ui| ui.button("Refresh list").on_hover_text("Plugged something in?").clicked();
@@ -929,11 +1096,44 @@ impl App {
                     refresh |= refresh_button(ui);
                     pick(ui, "mic", &mut d.input, inputs);
                 });
+                if let Some(r) = off_rate(0) {
+                    let desc = "MicClean converts it to 48000 Hz. Setting the device to 48000 Hz in Windows skips that step";
+                    rate_note(ui, &d.input, r, desc);
+                }
                 ui::group(ui, icon::MIC, "Input gain", "Boost or cut the input before anything else", None, |ui| {
                     level_row(ui, "In", m.in_db);
                     ui::row(ui, "Gain", |ui| {
                         slider(ui, &mut pr.input_gain_db, -20.0..=30.0, " dB");
                     });
+                });
+                ui::card(ui, |ui| {
+                    let desc = "Sets the input gain and the gate's minimum level for your room and voice. Takes 9 seconds";
+                    ui::header(ui, icon::MIC, "Calibrate", desc, |ui| {
+                        if calib.is_some() {
+                            if ui.button("Cancel").clicked() {
+                                *calib = None;
+                            }
+                        } else if ui
+                            .add_enabled(running && !snap.bypass, egui::Button::new("Calibrate"))
+                            .on_disabled_hover_text("Needs audio running and Bypass off")
+                            .clicked()
+                        {
+                            *calib = Some(Calib { start: Instant::now(), frame: 0, quiet: Vec::new(), voice: Vec::new() });
+                            calib_msg.clear();
+                        }
+                    });
+                    if let Some(c) = calib {
+                        let t = c.start.elapsed().as_secs_f32();
+                        let (what, frac) = if t < CALIB_QUIET {
+                            ("Stay quiet...", t / CALIB_QUIET)
+                        } else {
+                            ("Now talk like you would in a call...", (t - CALIB_QUIET) / (CALIB_END - CALIB_QUIET))
+                        };
+                        ui.label(RichText::new(what).font(ui::semibold(14.0)));
+                        ui.add(egui::ProgressBar::new(frac.min(1.0)).desired_height(6.0));
+                    } else if !calib_msg.is_empty() {
+                        ui.label(RichText::new(calib_msg.as_str()).color(p.text2));
+                    }
                 });
             }
             Node::Echo => {
@@ -1079,9 +1279,16 @@ impl App {
                     refresh |= refresh_button(ui);
                     pick(ui, "out", &mut d.output, outputs);
                 });
+                let convert = "Windows converts MicClean's 48000 Hz for it, which adds delay. Set it to 48000 Hz in Sound settings (Properties → Advanced)";
+                if let Some(r) = off_rate(1) {
+                    rate_note(ui, &d.output, r, convert);
+                }
                 ui::setting(ui, icon::HEADPHONE, "Monitor", "Hear yourself, e.g. on your headphones", |ui| {
                     pick_opt(ui, "mon", &mut d.monitor, outputs, "Off");
                 });
+                if let (Some(r), Some(mon)) = (off_rate(2), &d.monitor) {
+                    rate_note(ui, mon, r, convert);
+                }
                 ui::group(ui, icon::SPEAKERS, "What gets sent", "After every effect and the limiter", None, |ui| {
                     level_row(ui, "Out", m.out_db);
                     ui::row(ui, "Output gain", |ui| {
@@ -1236,6 +1443,15 @@ impl App {
             self.saved.params = Params::default();
         }
         self.updates(ui);
+        let mut show_log = false;
+        ui::setting(ui, icon::FOLDER, "Log file", "Device errors, glitches, restarts and updates, for troubleshooting. It stays on this PC", |ui| {
+            show_log = ui.button("Show in folder").clicked();
+        });
+        if show_log {
+            use std::os::windows::process::CommandExt;
+            // raw_arg: explorer wants /select,"path" exactly, which normal argument quoting breaks.
+            let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", logfile::path().display())).spawn();
+        }
         ui::setting(
             ui,
             icon::INFO,
@@ -1243,6 +1459,36 @@ impl App {
             &format!("Version {}. Closing the window keeps it running in the tray. Right-click the tray icon to quit", update::VERSION),
             |_| {},
         );
+        ui::setting(ui, icon::INFO, "Open-source licenses", "MicClean is built with these libraries", |ui| {
+            self.show_notices |= ui.button("View").clicked();
+        });
+    }
+
+    /// The licenses of every library in the exe, a visible screenful at a time.
+    fn notices(&mut self, ctx: &egui::Context) {
+        static LINES: OnceLock<Vec<&str>> = OnceLock::new();
+        let lines = LINES.get_or_init(|| NOTICES.lines().collect());
+        let mut close = false;
+        let resp = egui::Modal::new(egui::Id::unique("notices")).show(ctx, |ui| {
+            let size = ctx.content_rect().size();
+            ui.set_width((size.x - 80.0).clamp(300.0, 760.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Open-source licenses").font(ui::semibold(18.0)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = ui::icon_button(ui, true, icon::CLOSE, "Close").clicked();
+                });
+            });
+            ui.add_space(6.0);
+            let row = ui.text_style_height(&egui::TextStyle::Monospace);
+            egui::ScrollArea::both().max_height(size.y - 160.0).auto_shrink(false).show_rows(ui, row, lines.len(), |ui, range| {
+                for line in &lines[range] {
+                    ui.add(egui::Label::new(RichText::new(*line).monospace()).extend());
+                }
+            });
+        });
+        if close || resp.should_close() {
+            self.show_notices = false;
+        }
     }
 }
 
@@ -1467,6 +1713,25 @@ mod tests {
         }
         fn remove_string(&mut self, _: &str) {}
         fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn calibration_sets_gain_to_the_auto_level_target_and_gate_above_the_room() {
+        // Defaults: auto level target -22 dB, gate hysteresis 6 dB.
+        let mut p = Params::default();
+        App::calibrate(&mut p, vec![-70.0; 60], vec![-34.0; 100]);
+        assert_eq!(p.input_gain_db, 12.0, "voice -34 lifted to -22");
+        assert_eq!(p.gate_threshold_db, -49.0, "room now -58: closes at -55, 3 dB above it");
+
+        // Noisy room: halfway between "above the room" (-23) and "20 dB under the voice" (-42).
+        let mut p = Params::default();
+        let msg = App::calibrate(&mut p, vec![-40.0; 60], vec![-30.0; 100]);
+        assert_eq!(p.gate_threshold_db, -32.5);
+        assert!(msg.contains("close to the room noise"), "{msg}");
+
+        let mut p = Params::default();
+        assert!(App::calibrate(&mut p, vec![-70.0; 60], vec![-34.0; 5]).starts_with("Didn't hear"));
+        assert!(p == Params::default(), "too little talking changes nothing");
     }
 
     #[test]

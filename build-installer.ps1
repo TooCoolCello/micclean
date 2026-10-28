@@ -8,6 +8,7 @@ if (Test-Path target\release\micclean.exe) {
     Remove-Item target\release\micclean.old.exe -Force -ErrorAction SilentlyContinue
     Rename-Item target\release\micclean.exe micclean.old.exe -ErrorAction SilentlyContinue
 }
+& "$PSScriptRoot\licenses.ps1" # the exe embeds the notices, so they match its dependencies
 cargo build --release
 if ($LASTEXITCODE) { throw "cargo build failed" }
 

@@ -248,6 +248,9 @@ pub struct Meters {
     pub echo_ref_db: f32,
     pub echo_erle_db: Option<f32>,
     pub echo_delay_ms: Option<i32>,
+    /// Time spent on one 10 ms frame (echo cancellation and the whole chain) as a share of
+    /// those 10 ms, smoothed over about half a second. Written by audio.rs.
+    pub dsp_load: f32,
 }
 
 /// Learned sounds that get a live match bar. More can be learned; they just have no bar.

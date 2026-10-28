@@ -6,6 +6,7 @@ A small Windows app that cleans up your microphone before Discord (or anything e
 - A voice gate that knows the difference between singing and fan hum, so long held notes aren't cut off
 - Teach it sounds to remove (keyboard, fan) and your own voice to keep
 - 5-band parametric EQ, de-esser, auto level and compressor, with live graphs
+- Calibrate button: 9 seconds of quiet and talking sets the input gain and the gate for your room
 - Record 10 seconds, then compare the original with the processed version
 - Lives in the tray, can start with Windows, reconnects if the mic is unplugged
 
@@ -32,6 +33,9 @@ Needs Rust (MSVC toolchain) and the Windows SDK.
 cargo test
 ./build-installer.ps1      # dist\MicClean-Setup.exe
 ```
+
+`licenses.ps1` rewrites `THIRD-PARTY-NOTICES.txt` (shown in Settings) from the license files of every
+library in the exe. `build-installer.ps1` runs it; run it yourself after changing dependencies.
 
 A release is built by pushing a tag that matches the version in `Cargo.toml`, e.g. `git tag v0.2.0 && git push --tags`.
 
