@@ -6,6 +6,7 @@ mod dsp;
 mod graphs;
 mod install;
 mod logfile;
+mod smart;
 mod ui;
 mod update;
 
@@ -102,6 +103,8 @@ struct Saved {
     presets_seeded: bool,
     /// The nav rail folded down to icons.
     nav_compact: bool,
+    /// What the last Smart setup chose, for each box's Suggest button.
+    smart: Option<Params>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -274,19 +277,41 @@ impl Node {
             Node::Limiter | Node::Output => p.output_gain_db = d.output_gain_db,
         }
     }
+
+    /// The boxes Smart setup chooses settings for.
+    const SMART: [Node; 6] = [Node::Input, Node::Noise, Node::Gate, Node::Eq, Node::Deess, Node::Comp];
+
+    /// Copies what Smart setup chose (`s`) for this box. Other boxes are left alone.
+    fn suggest(self, p: &mut Params, s: &Params) {
+        match self {
+            Node::Input => p.input_gain_db = s.input_gain_db,
+            Node::Noise => p.denoise_strength = s.denoise_strength,
+            // Chosen for the suggested input gain, so it follows the gain you actually have.
+            Node::Gate => p.gate_threshold_db = (s.gate_threshold_db + p.input_gain_db - s.input_gain_db).clamp(-80.0, -10.0),
+            Node::Eq => p.bands = s.bands,
+            Node::Deess => p.deess_threshold_db = s.deess_threshold_db,
+            Node::Comp => (p.comp_threshold_db, p.comp_ratio, p.comp_makeup_db) = (s.comp_threshold_db, s.comp_ratio, s.comp_makeup_db),
+            Node::Echo | Node::Level | Node::Limiter | Node::Output => {}
+        }
+    }
 }
 
-/// Calibrate: room noise first, then talking, both read off the gate's level meter.
+/// Smart setup in progress: room noise first, then you reading, one sample per audio frame.
 struct Calib {
     start: Instant,
     /// Last meters frame sampled, so a frame isn't counted twice.
     frame: u64,
-    quiet: Vec<f32>,
-    voice: Vec<f32>,
+    /// Gate level and raw peak of each quiet frame.
+    quiet: Vec<(f32, f32)>,
+    talk: Vec<smart::Take>,
 }
 
 const CALIB_QUIET: f32 = 3.0;
-const CALIB_END: f32 = 9.0;
+const CALIB_END: f32 = 18.0;
+/// Read aloud during Smart setup: plenty of S sounds for the de-esser, and a range of pitch.
+const PASSAGE: &str = "Some days start slowly. I sip my coffee, check the schedule, and see what's waiting for us. \
+    Six messages, a missed call, and a song stuck in my head since Sunday. \
+    So let's get started: say hello, share the plan, and keep it simple.";
 
 /// Every library license compiled into the exe, written by licenses.ps1.
 const NOTICES: &str = include_str!("../THIRD-PARTY-NOTICES.txt");
@@ -341,7 +366,9 @@ struct App {
     /// The chain box whose settings are open on Home.
     node: Option<Node>,
     calib: Option<Calib>,
-    calib_msg: String,
+    /// What the last Smart setup changed (or why it couldn't), and the settings from before it.
+    smart_report: Vec<String>,
+    smart_undo: Option<Params>,
     /// Windows' rate for the input, output and monitor devices, looked up on each restart.
     rates: [Option<u32>; 3],
     show_notices: bool,
@@ -431,7 +458,8 @@ impl App {
             page: Page::Home,
             node: None,
             calib: None,
-            calib_msg: String::new(),
+            smart_report: Vec::new(),
+            smart_undo: None,
             rates: [None; 3],
             show_notices: false,
             logged_status: String::new(),
@@ -520,6 +548,11 @@ impl App {
         let mut want = self.saved.params.clone();
         if let Some(s) = self.ab_shown {
             s.turn_off(&mut want);
+        }
+        if self.calib.is_some() {
+            // Smart setup needs every stage's meter on your voice: nothing bypassed, the gate
+            // open, the de-esser and compressor running.
+            (want.bypass, want.gate, want.deess, want.comp) = (false, false, true, true);
         }
         if sh.params != want {
             sh.params = want;
@@ -617,15 +650,30 @@ impl App {
         }
     }
 
-    /// Samples the gate's level meter once per audio frame while Calibrate runs, then sets the
-    /// input gain and gate from it.
-    fn calibrate_step(&mut self) {
+    /// Samples the meters once per audio frame while Smart setup runs, then applies what it
+    /// chose and keeps the old settings for Undo.
+    fn smart_step(&mut self) {
         let Some(c) = &mut self.calib else { return };
         let t = c.start.elapsed().as_secs_f32();
         if t >= CALIB_END {
             let c = self.calib.take().expect("checked above");
-            self.calib_msg = Self::calibrate(&mut self.saved.params, c.quiet, c.voice);
-            logfile::line(&format!("Calibrated: {}", self.calib_msg));
+            match smart::analyse(&self.saved.params, &c.quiet, &c.talk) {
+                Ok(o) => {
+                    let old = self.saved.params.clone();
+                    for n in Node::SMART {
+                        n.suggest(&mut self.saved.params, &o.params);
+                    }
+                    self.smart_report = smart::changes(&old, &self.saved.params);
+                    if self.smart_report.is_empty() {
+                        self.smart_report.push("Your settings already suit your voice. Nothing changed.".into());
+                    }
+                    self.smart_report.extend(o.notes);
+                    self.saved.smart = Some(o.params);
+                    self.smart_undo = Some(old);
+                }
+                Err(e) => self.smart_report = vec![e],
+            }
+            logfile::line(&format!("Smart setup: {}", self.smart_report.join(" / ")));
             return;
         }
         let m = &self.meters;
@@ -635,37 +683,13 @@ impl App {
         c.frame = m.frames;
         if t < CALIB_QUIET {
             if t > 0.5 {
-                c.quiet.push(m.gate_level_db); // past the click of the button
+                c.quiet.push((m.gate_level_db, m.in_db)); // past the click of the button
             }
         } else if m.vad >= 0.5 {
-            c.voice.push(m.gate_level_db); // talking, not the pauses between words
+            // Talking, not the pauses between words.
+            let (level, peak, agc, deess, comp) = (m.gate_level_db, m.in_db, m.agc_db, m.deess_level_db, m.comp_in_db);
+            c.talk.push(smart::Take { level, peak, agc, deess, comp, pitch: m.pitch_hz, bands: m.bands_db });
         }
-    }
-
-    /// Input gain puts your normal voice at the Auto level target, so auto level only has to
-    /// even things out. The gate closes a little above the room noise but well under your voice.
-    fn calibrate(p: &mut Params, mut quiet: Vec<f32>, mut voice: Vec<f32>) -> String {
-        if quiet.len() < 20 || voice.len() < 30 {
-            return "Didn't hear enough talking. Try again and keep talking for the whole 6 seconds.".into();
-        }
-        let pct = |v: &mut Vec<f32>, q: f32| {
-            v.sort_by(f32::total_cmp);
-            v[((v.len() - 1) as f32 * q) as usize]
-        };
-        let (noise, talk) = (pct(&mut quiet, 0.9), pct(&mut voice, 0.5));
-        let old = p.input_gain_db;
-        p.input_gain_db = (old + p.agc_target_db - talk).clamp(-20.0, 30.0);
-        let (noise, talk) = (noise + p.input_gain_db - old, talk + p.input_gain_db - old);
-        let (lo, hi) = (noise + p.gate_hysteresis_db + 3.0, talk - 20.0);
-        p.gate_threshold_db = if lo <= hi { lo } else { (lo + hi) / 2.0 }.clamp(-80.0, -10.0);
-        let mut msg = format!(
-            "Input gain {:+.1} dB, gate minimum level {:.0} dB (room {noise:.0} dB, your voice {talk:.0} dB).",
-            p.input_gain_db, p.gate_threshold_db
-        );
-        if talk - noise < 15.0 {
-            msg += " Your voice is close to the room noise: noise removal and getting closer to the mic help.";
-        }
-        msg
     }
 }
 
@@ -677,7 +701,7 @@ impl eframe::App for App {
         let now = Instant::now();
         self.agc_hist.push(self.meters.agc_db, now);
         self.pitch_hist.push((self.meters.pitch_hz.unwrap_or(f32::NAN), self.meters.gate_open), now);
-        self.calibrate_step();
+        self.smart_step();
         if self.installed && !self.saved.update_check_off && now >= self.next_update_check {
             self.next_update_check = now + Duration::from_secs(24 * 3600);
             self.updater.check();
@@ -890,7 +914,8 @@ impl App {
         match self.node {
             Some(n) => {
                 ui.add_space(10.0);
-                let (mut close, mut reset) = (false, false);
+                let (mut close, mut reset, mut suggest) = (false, false, false);
+                let (params, smart) = (&self.saved.params, self.saved.smart.as_ref().filter(|_| Node::SMART.contains(&n)));
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(n.title()).font(ui::semibold(20.0)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -900,12 +925,28 @@ impl App {
                                 .on_hover_text("Back to the defaults for this box. On/off stays as it is")
                                 .clicked();
                         }
+                        if let Some(s) = smart {
+                            suggest = ui::icon_button(ui, true, icon::SMART, "Suggest")
+                                .on_hover_ui(|ui| {
+                                    let mut q = params.clone();
+                                    n.suggest(&mut q, s);
+                                    let lines = smart::changes(params, &q);
+                                    ui.label(match lines.is_empty() {
+                                        true => "Already set the way your Smart setup chose".to_string(),
+                                        false => format!("From your Smart setup:\n{}", lines.join("\n")),
+                                    });
+                                })
+                                .clicked();
+                        }
                     });
                 });
                 ui.add_space(4.0);
                 self.panel(ui, n, &m);
                 if reset {
                     n.reset(&mut self.saved.params);
+                }
+                if suggest && let Some(s) = self.saved.smart.clone() {
+                    n.suggest(&mut self.saved.params, &s);
                 }
                 if close {
                     self.node = None;
@@ -1045,9 +1086,59 @@ impl App {
         }
     }
 
-    /// Nothing selected in the chain: levels, spectrum and Bypass.
+    /// Room noise, then you reading a passage; every effect is set from that. While it runs
+    /// the passage and a progress bar show here; afterwards what changed, with Undo.
+    fn smart_card(&mut self, ui: &mut egui::Ui) {
+        let p = ui::pal(ui);
+        let can_start = self.engine.is_some() && !self.saved.params.bypass;
+        let (calib, report, has_undo) = (&mut self.calib, &self.smart_report, self.smart_undo.is_some());
+        let (mut start, mut undo) = (false, false);
+        ui::card(ui, |ui| {
+            let desc = "Listens to your room for 3 seconds and to you reading for 15, then sets each effect for your voice";
+            ui::header(ui, icon::SMART, "Smart setup", desc, |ui| {
+                if calib.is_some() {
+                    if ui.button("Cancel").clicked() {
+                        *calib = None;
+                    }
+                } else {
+                    start = ui::accent_button(ui, can_start, "Start").on_disabled_hover_text("Needs audio running and Bypass off").clicked();
+                }
+            });
+            if let Some(c) = calib {
+                let t = c.start.elapsed().as_secs_f32();
+                ui.add_space(6.0);
+                if t < CALIB_QUIET {
+                    ui.label(RichText::new("Stay quiet for a moment...").font(ui::semibold(16.0)));
+                } else {
+                    ui.label(RichText::new("Now read this out loud, like you would in a call:").color(p.text2));
+                    ui.label(RichText::new(PASSAGE).size(17.0));
+                }
+                ui.add_space(4.0);
+                ui.add(egui::ProgressBar::new((t / CALIB_END).min(1.0)).desired_height(6.0));
+            } else if !report.is_empty() {
+                ui.add_space(4.0);
+                for line in report {
+                    ui.label(RichText::new(line).color(p.text2));
+                }
+                if has_undo {
+                    undo = ui.button("Undo").on_hover_text("Puts every setting back to how it was before").clicked();
+                }
+            }
+        });
+        if start {
+            self.calib = Some(Calib { start: Instant::now(), frame: 0, quiet: Vec::new(), talk: Vec::new() });
+            self.smart_report.clear();
+        }
+        if undo && let Some(old) = self.smart_undo.take() {
+            self.saved.params = Params { bypass: self.saved.params.bypass, ..old };
+            self.smart_report = vec!["Undone: your settings are back to how they were.".into()];
+        }
+    }
+
+    /// Nothing selected in the chain: Smart setup, levels, spectrum and Bypass.
     fn overview(&mut self, ui: &mut egui::Ui, m: &Meters) {
         let p = ui::pal(ui);
+        self.smart_card(ui);
         ui::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Levels").font(ui::semibold(14.0)));
@@ -1084,8 +1175,7 @@ impl App {
         let (shown, hold) = (self.ab_shown, &mut self.ab_hold);
         let (agc_hist, pitch_hist, eq_ui) = (&self.agc_hist, &self.pitch_hist, &mut self.eq_ui);
         let (d, inputs, outputs) = (&mut self.saved.devices, &self.inputs, &self.outputs);
-        let (calib, calib_msg) = (&mut self.calib, &mut self.calib_msg);
-        let (rates, running) = (self.rates, self.engine.is_some());
+        let rates = self.rates;
         let off_rate = |i: usize| rates[i].filter(|&r| r != dsp::SR as u32);
         let pr = &mut self.saved.params;
         let mut refresh = false;
@@ -1105,35 +1195,6 @@ impl App {
                     ui::row(ui, "Gain", |ui| {
                         slider(ui, &mut pr.input_gain_db, -20.0..=30.0, " dB");
                     });
-                });
-                ui::card(ui, |ui| {
-                    let desc = "Sets the input gain and the gate's minimum level for your room and voice. Takes 9 seconds";
-                    ui::header(ui, icon::MIC, "Calibrate", desc, |ui| {
-                        if calib.is_some() {
-                            if ui.button("Cancel").clicked() {
-                                *calib = None;
-                            }
-                        } else if ui
-                            .add_enabled(running && !snap.bypass, egui::Button::new("Calibrate"))
-                            .on_disabled_hover_text("Needs audio running and Bypass off")
-                            .clicked()
-                        {
-                            *calib = Some(Calib { start: Instant::now(), frame: 0, quiet: Vec::new(), voice: Vec::new() });
-                            calib_msg.clear();
-                        }
-                    });
-                    if let Some(c) = calib {
-                        let t = c.start.elapsed().as_secs_f32();
-                        let (what, frac) = if t < CALIB_QUIET {
-                            ("Stay quiet...", t / CALIB_QUIET)
-                        } else {
-                            ("Now talk like you would in a call...", (t - CALIB_QUIET) / (CALIB_END - CALIB_QUIET))
-                        };
-                        ui.label(RichText::new(what).font(ui::semibold(14.0)));
-                        ui.add(egui::ProgressBar::new(frac.min(1.0)).desired_height(6.0));
-                    } else if !calib_msg.is_empty() {
-                        ui.label(RichText::new(calib_msg.as_str()).color(p.text2));
-                    }
                 });
             }
             Node::Echo => {
@@ -1716,22 +1777,12 @@ mod tests {
     }
 
     #[test]
-    fn calibration_sets_gain_to_the_auto_level_target_and_gate_above_the_room() {
-        // Defaults: auto level target -22 dB, gate hysteresis 6 dB.
-        let mut p = Params::default();
-        App::calibrate(&mut p, vec![-70.0; 60], vec![-34.0; 100]);
-        assert_eq!(p.input_gain_db, 12.0, "voice -34 lifted to -22");
-        assert_eq!(p.gate_threshold_db, -49.0, "room now -58: closes at -55, 3 dB above it");
-
-        // Noisy room: halfway between "above the room" (-23) and "20 dB under the voice" (-42).
-        let mut p = Params::default();
-        let msg = App::calibrate(&mut p, vec![-40.0; 60], vec![-30.0; 100]);
-        assert_eq!(p.gate_threshold_db, -32.5);
-        assert!(msg.contains("close to the room noise"), "{msg}");
-
-        let mut p = Params::default();
-        assert!(App::calibrate(&mut p, vec![-70.0; 60], vec![-34.0; 5]).starts_with("Didn't hear"));
-        assert!(p == Params::default(), "too little talking changes nothing");
+    fn suggested_gate_follows_the_input_gain_you_kept() {
+        let s = Params { input_gain_db: 12.0, gate_threshold_db: -49.0, ..Params::default() };
+        let mut p = Params { input_gain_db: 6.0, ..Params::default() };
+        Node::Gate.suggest(&mut p, &s);
+        assert_eq!(p.gate_threshold_db, -55.0, "6 dB less gain than suggested: threshold 6 dB lower");
+        assert_eq!(p.input_gain_db, 6.0, "the gate's Suggest leaves the gain alone");
     }
 
     #[test]

@@ -10,7 +10,12 @@ use std::sync::Arc;
 
 pub const SR: f32 = 48_000.0;
 pub const FRAME: usize = DenoiseState::FRAME_SIZE; // 480 samples = 10 ms
-const NB: usize = 16; // band count for the learned profiles
+pub const NB: usize = 16; // band count for the learned profiles and Smart setup
+
+/// Lower edge of analysis band `i` (log-spaced, 100 Hz..12 kHz; `i = NB` is the top edge).
+pub fn band_edge(i: usize) -> f32 {
+    100.0 * 120f32.powf(i as f32 / NB as f32)
+}
 pub const SPEC_BINS: usize = 64;
 /// Spectrum display covers SPEC_LO..SPEC_LO*SPEC_SPAN Hz on a log axis.
 pub const SPEC_LO: f32 = 40.0;
@@ -251,6 +256,8 @@ pub struct Meters {
     /// Time spent on one 10 ms frame (echo cancellation and the whole chain) as a share of
     /// those 10 ms, smoothed over about half a second. Written by audio.rs.
     pub dsp_load: f32,
+    /// The input's mean power in the NB analysis bands (after input gain), for Smart setup.
+    pub bands_db: [f32; NB],
 }
 
 /// Learned sounds that get a live match bar. More can be learned; they just have no bar.
@@ -377,6 +384,7 @@ impl Chain {
             self.an_in.display(&mut self.meters.spec_in);
         }
         let bands = self.an_in.features();
+        self.meters.bands_db = bands;
         if let Some(l) = &mut self.learner {
             l.add(&bands, rms_db(x));
             self.meters.learning = Some((l.kind, l.progress()));
@@ -668,8 +676,7 @@ impl Analyzer {
 
     /// Classifier features: mean log power in 16 log-spaced bands, 100 Hz..12 kHz.
     fn features(&self) -> [f32; NB] {
-        let edge = |i: usize| 100.0 * 120f32.powf(i as f32 / NB as f32);
-        std::array::from_fn(|i| self.band_db(edge(i), edge(i + 1), false))
+        std::array::from_fn(|i| self.band_db(band_edge(i), band_edge(i + 1), false))
     }
 
     /// Updates a peak-hold display spectrum that falls at 60 dB/s.

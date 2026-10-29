@@ -6,7 +6,8 @@ A small Windows app that cleans up your microphone before Discord (or anything e
 - A voice gate that knows the difference between singing and fan hum, so long held notes aren't cut off
 - Teach it sounds to remove (keyboard, fan) and your own voice to keep
 - 5-band parametric EQ, de-esser, auto level and compressor, with live graphs
-- Calibrate button: 9 seconds of quiet and talking sets the input gain and the gate for your room
+- Smart setup: 3 seconds of your room and 15 of you reading set every effect for your voice, with
+  Undo and a Suggest button in each effect
 - Record 10 seconds, then compare the original with the processed version
 - Lives in the tray, can start with Windows, reconnects if the mic is unplugged
 

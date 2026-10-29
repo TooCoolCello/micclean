@@ -32,6 +32,7 @@ pub mod icon {
     pub const CLOSE: &str = "\u{E711}";
     pub const WARNING: &str = "\u{E7BA}";
     pub const FOLDER: &str = "\u{E838}";
+    pub const SMART: &str = "\u{E82F}"; // light bulb
 }
 
 pub struct Palette {
