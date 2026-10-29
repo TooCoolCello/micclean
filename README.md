@@ -19,7 +19,10 @@ A small Windows app that cleans up your microphone before Discord (or anything e
 
 Download `MicClean-Setup.exe` from the [latest release](../../releases/latest) and run it. It installs
 for your account only (no admin needed) and adds a Start menu entry. The installed copy checks GitHub
-once a day for new versions and updates with one click; this can be turned off in Settings.
+once a day for new versions and updates with one click; this can be turned off in Settings. If an
+update can't be installed, the version you had keeps running. Your settings are copied to
+`%APPDATA%\MicClean\backups` (the last 10 versions), and a damaged settings file is replaced by the
+newest copy.
 
 Windows will probably show "Windows protected your PC" because the installer isn't code-signed.
 Choose More info, then Run anyway. The checksum for each download is published next to it.

@@ -27,6 +27,8 @@ pub enum State {
     UpToDate,
     Available(Release),
     Installing,
+    /// Setup is running and waiting for this copy to close, so it can be replaced.
+    Restarting,
     Failed(String),
 }
 
@@ -39,7 +41,7 @@ impl Updater {
         self.0.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    fn set(&self, s: State) {
+    pub fn set(&self, s: State) {
         if let Ok(mut st) = self.0.lock() {
             *st = s;
         }
@@ -47,14 +49,14 @@ impl Updater {
 
     /// Asks GitHub for the newest release, in the background. No-op while one is in flight.
     pub fn check(&self) {
-        if matches!(self.state(), State::Checking | State::Installing) {
+        if matches!(self.state(), State::Checking | State::Installing | State::Restarting) {
             return;
         }
         self.set(State::Checking);
         let me = self.clone();
         std::thread::spawn(move || {
             // Leftover from the last update; it may still be locked, then the next check gets it.
-            let _ = std::fs::remove_dir_all(temp_dir());
+            let _ = std::fs::remove_dir_all(install::update_dir());
             me.set(match latest() {
                 Ok(Some(r)) => State::Available(r),
                 Ok(None) => State::UpToDate,
@@ -63,24 +65,46 @@ impl Updater {
         });
     }
 
-    /// Downloads and checks the setup file, then runs it. The setup closes this copy, installs
-    /// and starts the new one, so on success this process is about to be killed.
-    pub fn install(&self, rel: Release) {
-        if matches!(self.state(), State::Installing) {
+    /// Downloads and checks the setup file, then runs it. The state turns `Restarting` once it
+    /// runs: this copy then closes itself (saving your settings), and setup installs and starts
+    /// the new one, back in the tray if `minimized`.
+    pub fn install(&self, rel: Release, minimized: bool) {
+        if matches!(self.state(), State::Installing | State::Restarting) {
             return;
         }
         self.set(State::Installing);
         let me = self.clone();
         std::thread::spawn(move || {
-            if let Err(e) = download_and_run(&rel) {
-                me.set(State::Failed(e));
-            }
+            me.set(match download_and_run(&rel, minimized) {
+                Ok(()) => State::Restarting,
+                Err(e) => State::Failed(e),
+            });
         });
     }
 }
 
-fn temp_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("MicClean-update")
+/// Why setup couldn't install an update, once: setup started this copy again after it failed.
+pub fn take_failure() -> Option<String> {
+    let note = install::failure_note();
+    let why = std::fs::read_to_string(&note).ok()?;
+    let _ = std::fs::remove_file(note);
+    Some(why)
+}
+
+/// The version the last update tried to install. It stays until this copy is that version,
+/// so an update that didn't take is never retried on its own, launch after launch.
+fn attempt_file() -> std::path::PathBuf {
+    crate::logfile::path().with_file_name("update-attempt.txt")
+}
+
+/// A version an update tried and failed to install (Settings can still try it by hand).
+pub fn failed_version() -> Option<String> {
+    let v = std::fs::read_to_string(attempt_file()).ok()?.trim().to_string();
+    if v == VERSION {
+        let _ = std::fs::remove_file(attempt_file()); // it worked
+        return None;
+    }
+    Some(v)
 }
 
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
@@ -158,8 +182,8 @@ fn first_hash(text: &str) -> Option<String> {
     (h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).then_some(h)
 }
 
-fn download_and_run(rel: &Release) -> Result<(), String> {
-    let dir = temp_dir();
+fn download_and_run(rel: &Release, minimized: bool) -> Result<(), String> {
+    let dir = install::update_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let setup = dir.join(SETUP);
     curl(&["-o", &setup.to_string_lossy(), &rel.setup_url])?;
@@ -170,7 +194,30 @@ fn download_and_run(rel: &Release) -> Result<(), String> {
         let _ = std::fs::remove_file(&setup);
         return Err("the download didn't match its checksum, so nothing was installed".into());
     }
-    Command::new(&setup).args(["--silent", "--launch"]).spawn().map(|_| ()).map_err(|e| format!("couldn't start setup: {e}"))
+    // Noted before setup runs, so not even a setup that dies silently gets retried forever.
+    std::fs::write(attempt_file(), &rel.version).map_err(|e| format!("couldn't note the update: {e}"))?;
+    let started = install::setup_started();
+    let _ = std::fs::remove_file(&started);
+    let pid = std::process::id().to_string();
+    let mut cmd = Command::new(&setup);
+    cmd.args(["--silent", "--launch", "--wait", &pid]);
+    if minimized {
+        cmd.arg("--minimized");
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("couldn't start setup: {e}"))?;
+    // This copy closes only once setup is really running: one that antivirus stops before it
+    // starts would leave nobody to start MicClean again.
+    for _ in 0..300 {
+        if started.exists() {
+            return Ok(());
+        }
+        if let Ok(Some(code)) = child.try_wait() {
+            return Err(format!("setup stopped before it started ({code})"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    Err("setup didn't start within 30 seconds".into())
 }
 
 #[cfg(test)]

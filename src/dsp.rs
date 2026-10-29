@@ -302,7 +302,7 @@ pub struct Chain {
     learner: Option<Learner>,
     /// Last frame's learned-sound match.
     class: Option<Match>,
-    learned: Option<(Kind, Option<Profile>)>,
+    learned: Option<(Kind, Result<Profile, &'static str>)>,
     hold: u32,
     gate_gain: f32,
     agc_db: f32,
@@ -394,8 +394,8 @@ impl Chain {
         self.learner = Some(Learner::new(kind, (seconds * 100.0) as u32));
     }
 
-    /// Finished learn run: the profile, or None if the clip was too quiet to learn from.
-    pub fn take_learned(&mut self) -> Option<(Kind, Option<Profile>)> {
+    /// Finished learn run: the profile, or why the clip couldn't be learned from.
+    pub fn take_learned(&mut self) -> Option<(Kind, Result<Profile, &'static str>)> {
         self.learned.take()
     }
 
@@ -426,45 +426,32 @@ impl Chain {
         let f0 = self.pitch.push(x);
         self.meters.pitch_hz = f0;
 
-        if p.bypass {
-            // Nothing is cleaned: a learn run takes the raw sound rather than stall.
-            self.learn_step(&self.meters.bands_db.clone());
-            self.meters.out_db = peak_db(x);
-            self.meters.gr_db = 0.0;
-            self.meters.reason = "bypassed";
-            self.meters.spec_out = self.meters.spec_in;
-            return;
+        // RNNoise always runs: its voice detector drives the gate with noise removal off too,
+        // and its one-frame delay never comes and goes, so switching noise removal or Bypass
+        // can't replay a stale frame or skip one. Off just mixes in none of its output.
+        let mut inp = [0.0; FRAME];
+        let mut wet = [0.0; FRAME];
+        for (i, s) in x.iter().enumerate() {
+            inp[i] = s * 32768.0; // RNNoise wants i16-scaled floats
         }
-
-        let mut vad = 1.0;
-        if p.denoise {
-            let mut inp = [0.0; FRAME];
-            let mut wet = [0.0; FRAME];
-            for (i, s) in x.iter().enumerate() {
-                inp[i] = s * 32768.0; // RNNoise wants i16-scaled floats
-            }
-            vad = self.rnn.process_frame(&mut wet, &inp);
-            // Pitch decides before the denoised frame comes out, so this is a free 10 ms lookahead.
-            // Learned sounds are matched after noise removal, so it goes by last frame's match.
-            let singing = self.pitch.track(f0, vad >= p.vad_threshold);
-            let protect = if singing || self.class == Some(Match::Keep) { p.sing_protect } else { 0.0 };
-            let target = p.denoise_strength * (1.0 - protect);
-            // Energy in vs out over the same (delayed) frame: what noise removal took away.
-            let (mut e_in, mut e_out) = (1e-12f32, 1e-12f32);
-            for (i, s) in x.iter_mut().enumerate() {
-                let m = self.mix + (target - self.mix) * i as f32 / FRAME as f32;
-                let dry = std::mem::replace(&mut self.dry[i], *s);
-                *s = dry * (1.0 - m) + wet[i] / 32768.0 * m;
-                e_in += dry * dry;
-                e_out += *s * *s;
-            }
-            self.mix = target;
-            let cut = (10.0 * (e_in / e_out).log10()).max(0.0);
-            self.meters.denoise_db += (cut - self.meters.denoise_db) * 0.1;
-        } else {
-            self.pitch.track(f0, false);
-            self.meters.denoise_db = 0.0;
+        let vad = self.rnn.process_frame(&mut wet, &inp);
+        // Pitch decides before the denoised frame comes out, so this is a free 10 ms lookahead.
+        // Learned sounds are matched after noise removal, so it goes by last frame's match.
+        let singing = self.pitch.track(f0, vad >= p.vad_threshold);
+        let protect = if singing || self.class == Some(Match::Keep) { p.sing_protect } else { 0.0 };
+        let target = if p.denoise && !p.bypass { p.denoise_strength * (1.0 - protect) } else { 0.0 };
+        // Energy in vs out over the same (delayed) frame: what noise removal took away.
+        let (mut e_in, mut e_out) = (1e-12f32, 1e-12f32);
+        for (i, s) in x.iter_mut().enumerate() {
+            let m = self.mix + (target - self.mix) * i as f32 / FRAME as f32;
+            let dry = std::mem::replace(&mut self.dry[i], *s);
+            *s = dry * (1.0 - m) + wet[i] / 32768.0 * m;
+            e_in += dry * dry;
+            e_out += *s * *s;
         }
+        self.mix = target;
+        let cut = (10.0 * (e_in / e_out).log10()).max(0.0);
+        self.meters.denoise_db += (cut - self.meters.denoise_db) * 0.1;
         self.meters.vad = vad;
 
         // Learned sounds are learned and told apart after noise removal: the room it takes out
@@ -475,6 +462,17 @@ impl Chain {
         }
         let clean = self.an_clean.features();
         self.learn_step(&clean);
+
+        if p.bypass {
+            // Your mic at your input gain, nothing cleaned, but still through the clip guard:
+            // a quiet mic turned up 30 dB mustn't clip hard into Discord.
+            (self.class, self.meters.noise_match, self.hold) = (None, None, 0);
+            (self.meters.gate_open, self.meters.reason) = (true, "bypassed");
+            (self.meters.gr_db, self.meters.deess_db) = (0.0, 0.0);
+            self.limit(x, 0.0);
+            return;
+        }
+
         let class = prof.classify(&clean, p.learn_match, &mut self.meters);
         self.class = class;
         self.meters.noise_match = match class {
@@ -497,6 +495,9 @@ impl Chain {
         };
         if want {
             self.hold = (p.gate_hold_ms / 10.0) as u32;
+        } else if matches!(class, Some(Match::Noise(_))) && vad < p.vad_threshold {
+            // A learned noise right after you stop talking (typing, say) doesn't ride the hold.
+            self.hold = 0;
         } else {
             self.hold = self.hold.saturating_sub(1);
         }
@@ -557,8 +558,12 @@ impl Chain {
             self.meters.comp_in_db = 20.0 * peak.log10();
         }
 
-        // Safety limiter: instant attack, so output never exceeds the ceiling.
-        let out_g = db2lin(p.output_gain_db);
+        self.limit(x, p.output_gain_db);
+    }
+
+    /// Output gain, then the safety limiter: instant attack, so output never exceeds the ceiling.
+    fn limit(&mut self, x: &mut [f32], gain_db: f32) {
+        let out_g = db2lin(gain_db);
         let rel = coef(50.0);
         let mut worst = 1.0f32;
         for s in x.iter_mut() {
@@ -750,24 +755,32 @@ impl Learner {
         1.0 - self.left as f32 / self.total as f32
     }
 
-    fn finish(&self) -> Option<Profile> {
+    /// The learned profile, or why there's none, in words for the app to show.
+    fn finish(&self) -> Result<Profile, &'static str> {
+        const QUIET: &str = "That clip was too quiet, nothing saved.";
+        const SHORT: &str = "That sound was too short to learn. Keep it going, or make it a few times over.";
         let pct = |mut v: Vec<f32>, q: f32| {
             v.sort_by(f32::total_cmp);
             v[((v.len() - 1) as f32 * q) as usize]
         };
         let frames: Vec<([f32; NB], f32)> = self.frames.iter().map(shape).collect();
         if frames.is_empty() {
-            return None;
+            return Err(QUIET);
         }
         // The sound is the louder half between the room (quietest 10%) and its loud parts. A
-        // steady sound like a fan has no quiet part, so all of it counts.
+        // steady sound like a fan has no quiet part, so all of it counts. Its loud parts are
+        // the loudest 1%, so a single bark or clap of 0.2 s still stands out from the room.
         let levels = || frames.iter().map(|f| f.1).collect::<Vec<f32>>();
-        let (lo, hi) = (pct(levels(), 0.1), pct(levels(), 0.95));
+        let (lo, hi, top) = (pct(levels(), 0.1), pct(levels(), 0.99), pct(levels(), 1.0));
+        if hi - lo < 10.0 && top - lo >= 10.0 {
+            // Under 1% of the clip: learning it would learn the room.
+            return Err(SHORT);
+        }
         let cut = if hi - lo < 10.0 { f32::NEG_INFINITY } else { (lo + hi) / 2.0 };
         // Below -110 dB is digital silence, which teaches nothing.
         let kept: Vec<&([f32; NB], f32)> = frames.iter().filter(|f| f.1 >= cut && f.1 > -110.0).collect();
         if kept.len() < 20 {
-            return None;
+            return Err(if cut.is_finite() { SHORT } else { QUIET });
         }
         let n = kept.len() as f32;
         let mean: [f32; NB] = std::array::from_fn(|i| kept.iter().map(|f| f.0[i]).sum::<f32>() / n);
@@ -776,7 +789,7 @@ impl Learner {
         // 6 dB under its quietest tenth, so it still matches as it fades, but never down in the
         // room it was left out of.
         let floor = (pct(kept.iter().map(|f| f.1).collect(), 0.1) - 6.0).max(cut);
-        Some(Profile { mean, var, floor_db: Some(floor) })
+        Ok(Profile { mean, var, floor_db: Some(floor) })
     }
 }
 
@@ -958,11 +971,13 @@ mod tests {
             .collect()
     }
 
-    /// Only the named stage on, gate open, so a test sees one effect at a time.
+    /// Only the named stage on, gate open, so a test sees one effect at a time. Every frame
+    /// counts as voice: test tones don't sound like it to RNNoise.
     fn only(stage: &str) -> Params {
         Params {
             denoise: false,
             gate: false,
+            vad_threshold: 0.0,
             agc: stage == "agc",
             eq: stage == "eq",
             deess: stage == "deess",
@@ -1113,6 +1128,93 @@ mod tests {
         assert!(louder > 0.9, "the hum itself, 6 dB louder, matched only {:.0}% of the time", louder * 100.0);
     }
 
+    #[test]
+    fn a_brief_sound_learns_the_sound_or_says_too_short_never_the_room() {
+        let mut seed = 4;
+        let p = Params { gate: true, ..only("none") };
+        let n = (SR * 5.0) as usize;
+        // 5 s of a quiet room with one burst of hum `secs` long in the middle.
+        let mut learn = |secs: f32| {
+            let mut clip = noise(n, 0.003, &mut seed);
+            let start = (SR * 2.0) as usize;
+            let hum = tone(150.0, (SR * secs) as usize, 0.3);
+            clip[start..start + hum.len()].iter_mut().zip(&hum).for_each(|(s, h)| *s += h);
+            let mut chain = Chain::default();
+            chain.start_learning(Kind::Noise, 5.0);
+            for c in clip.chunks(FRAME) {
+                chain.process(&p, &Profiles::default(), &mut c.to_vec());
+            }
+            chain.take_learned().expect("finished").1
+        };
+        let profile = learn(0.25).expect("a quarter second is enough");
+        let profiles = Profiles { noises: vec![NoiseProfile { name: "bark".into(), enabled: true, profile }], keep: None };
+        let mut chain = Chain::default();
+        let room = noise(SR as usize, 0.003, &mut 77);
+        let hits = room.chunks(FRAME).filter(|c| {
+            chain.process(&p, &profiles, &mut c.to_vec());
+            chain.meters.noise_match.is_some()
+        });
+        assert!(hits.count() < 5, "the room counts as the burst");
+        assert!(learn(0.04).unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn a_learned_noise_right_after_you_stop_does_not_ride_the_hold() {
+        let mut seed = 9;
+        let p = Params { gate: true, gate_hold_ms: 400.0, vad_threshold: 0.99, ..only("none") };
+        let learn = |x: &[f32]| {
+            let mut c = Chain::default();
+            c.start_learning(Kind::Noise, x.len() as f32 / SR);
+            for f in x.chunks(FRAME) {
+                c.process(&p, &Profiles::default(), &mut f.to_vec());
+            }
+            c.take_learned().expect("finished").1.expect("learned")
+        };
+        let (hiss, note) = (noise(FRAME * 200, 0.1, &mut seed), tone(200.0, FRAME * 200, 0.3));
+        let keys = NoiseProfile { name: "keys".into(), enabled: true, profile: learn(&hiss) };
+        let profiles = Profiles { noises: vec![keys], keep: Some(learn(&note)) };
+        let mut chain = Chain::default();
+        for f in note.chunks(FRAME) {
+            chain.process(&p, &profiles, &mut f.to_vec());
+        }
+        assert!(chain.meters.gate_open, "the learned voice didn't open it: {}", chain.meters.reason);
+        // Without the fix all 40 frames (the 400 ms hold) pass. The analysis window still
+        // holds some of the note for the first few.
+        let open = hiss.chunks(FRAME).take(40).filter(|f| {
+            chain.process(&p, &profiles, &mut f.to_vec());
+            chain.meters.gate_open
+        });
+        assert!(open.count() < 10);
+    }
+
+    #[test]
+    fn bypass_keeps_the_clip_guard_and_switching_never_replays_old_sound() {
+        // A quiet mic turned up 30 dB, then a shout.
+        let p = Params { bypass: true, input_gain_db: 30.0, ..Params::default() };
+        let (y, chain) = run(&p, &Profiles::default(), &sine(300.0, FRAME * 20, 0.5));
+        assert!(y.iter().all(|s| s.abs() <= LIMIT_CEIL + 1e-4), "Bypass clipped");
+        assert!(chain.meters.gate_open && chain.meters.reason == "bypassed");
+
+        // Talk with noise removal on, switch it off through a pause, then on again in silence:
+        // nothing from before the pause may come out.
+        let (on, off) = (Params { denoise: true, ..only("none") }, only("none"));
+        let mut chain = Chain::default();
+        let mut feed = |p: &Params, x: &[f32]| {
+            let mut peak = 0.0f32;
+            for c in x.chunks(FRAME) {
+                let mut f = c.to_vec();
+                chain.process(p, &Profiles::default(), &mut f);
+                peak = f.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            peak
+        };
+        feed(&on, &tone(220.0, FRAME * 50, 0.3));
+        feed(&off, &tone(220.0, FRAME * 5, 0.3));
+        feed(&off, &vec![0.0; FRAME * 2]);
+        let back_on = feed(&on, &vec![0.0; FRAME * 2]);
+        assert!(back_on < 1e-3, "an old frame came back at {:.1} dB", 20.0 * back_on.log10());
+    }
+
     /// Learns your voice from a recording through the real chain (noise removal on): 2 s of a
     /// room, then the recording over it, the way people use "Learn your voice". Then counts
     /// how often the room alone and the talking match it:
@@ -1135,7 +1237,7 @@ mod tests {
         for c in clip.chunks(FRAME) {
             chain.process(&p, &Profiles::default(), &mut c.to_vec());
         }
-        let keep = chain.take_learned().and_then(|l| l.1).expect("learned");
+        let keep = chain.take_learned().and_then(|l| l.1.ok()).expect("learned");
         let profiles = Profiles { noises: vec![], keep: Some(keep) };
         let (mut room, mut talk) = ((0, 0), (0, 0));
         for (i, c) in clip.chunks(FRAME).enumerate() {

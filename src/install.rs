@@ -76,26 +76,98 @@ fn message(title: &str, text: &str, question: bool) -> bool {
     unsafe { MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide(title).as_ptr(), style) == IDYES }
 }
 
-/// Copies the exe in, adds the Start menu shortcut and the Settings -> Apps entry. Safe to run
-/// over an existing install (it's the upgrade path too).
-pub fn install(exe_bytes: &[u8]) -> Result<PathBuf, String> {
-    let dir = install_dir()?;
-    let exe = dir.join(EXE);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
-    stop_running(&exe, 0);
-    std::fs::write(&exe, exe_bytes).map_err(|e| format!("couldn't write {}: {e}", exe.display()))?;
+/// Where the updater downloads setup to, and where setup leaves word of a failed update.
+pub fn update_dir() -> PathBuf {
+    std::env::temp_dir().join("MicClean-update")
+}
 
-    let link = start_link()?;
-    let made = powershell(&format!(
-        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut({}); $s.TargetPath = {}; $s.WorkingDirectory = {}; \
-         $s.IconLocation = {}; $s.Description = 'MicClean mic cleaner'; $s.Save()",
-        q(&link),
-        q(&exe),
-        q(&dir),
-        q(format!("{},0", exe.display()))
-    ));
+/// Why an update didn't install, for the copy setup starts again.
+pub fn failure_note() -> PathBuf {
+    update_dir().join("failed.txt")
+}
+
+/// Setup writes this first thing, so the updating copy only closes once setup really runs.
+pub fn setup_started() -> PathBuf {
+    update_dir().join("started")
+}
+
+/// Closes MicClean before it's replaced. `wait_pid` is an updating copy, which closes itself;
+/// without it (setup run by hand, or by an updater from before 0.7.0) any copy running from
+/// the install folder is closed. Done before anything else, so even a setup that fails at once
+/// starts MicClean again only after the old copy is gone.
+pub fn close_running(wait_pid: Option<u32>) {
+    let Ok(exe) = install_dir().map(|d| d.join(EXE)) else { return };
+    match wait_pid {
+        Some(pid) => wait_for_exit(pid, &exe),
+        None => stop_running(&exe, 0),
+    }
+}
+
+/// Same file, whatever way the paths are spelled (case, 8.3 names, junctions).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()),
+    }
+}
+
+/// The copy an update replaced. It can't be deleted while it's still closing, so the next
+/// start (or the next update) clears it.
+pub fn old_exe() -> Result<PathBuf, String> {
+    Ok(install_dir()?.join("micclean.old.exe"))
+}
+
+/// Waits up to 10 s for the copy that started this update to close itself (it saves your
+/// settings on the way out), then closes it the hard way. Only ever a process running our exe:
+/// if `pid` already exited, Windows may have given the number to something else.
+fn wait_for_exit(pid: u32, exe: &Path) {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    };
+    // SAFETY: the handle is checked for null and closed before returning; the name buffer
+    // outlives the call, which writes at most `len` UTF-16 units into it.
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return; // already gone
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ours = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0
+            && same_file(Path::new(&String::from_utf16_lossy(&buf[..len as usize])), exe);
+        if ours && WaitForSingleObject(h, 10_000) == WAIT_TIMEOUT {
+            TerminateProcess(h, 1);
+            WaitForSingleObject(h, 5_000);
+        }
+        CloseHandle(h);
+    }
+}
+
+/// Copies the exe in, adds the Start menu shortcut and the Settings -> Apps entry. Safe to run
+/// over an existing install (it's the upgrade path too); `close_running` goes first.
+///
+/// The new exe goes in beside the old one and is swapped in by renaming, and is undone if it
+/// fails: a full disk or a locked file leaves the working copy in place. The shortcut and the
+/// Settings -> Apps entry are extras: if those fail, the returned notes say so, and MicClean is
+/// still installed.
+pub fn install(exe_bytes: &[u8]) -> Result<(PathBuf, Vec<String>), String> {
+    let dir = install_dir()?;
+    let exe = swap(&dir, exe_bytes)?;
+    let mut notes = Vec::new();
+    let made = start_link().is_ok_and(|link| {
+        powershell(&format!(
+            "$s = (New-Object -ComObject WScript.Shell).CreateShortcut({}); $s.TargetPath = {}; $s.WorkingDirectory = {}; \
+             $s.IconLocation = {}; $s.Description = 'MicClean mic cleaner'; $s.Save()",
+            q(&link),
+            q(&exe),
+            q(&dir),
+            q(format!("{},0", exe.display()))
+        ))
+    });
     if !made {
-        return Err("couldn't create the Start menu shortcut".into());
+        notes.push("couldn't create the Start menu shortcut".to_string());
     }
 
     let exe_s = exe.to_string_lossy().to_string();
@@ -109,15 +181,35 @@ pub fn install(exe_bytes: &[u8]) -> Result<PathBuf, String> {
         ("NoRepair", "REG_DWORD", "1".to_string()),
         ("EstimatedSize", "REG_DWORD", (exe_bytes.len() / 1024).to_string()),
     ];
-    for (name, kind, data) in &values {
-        if !reg(&["add", UNINSTALL_KEY, "/v", name, "/t", kind, "/d", data, "/f"]) {
-            return Err("couldn't register with Settings -> Apps".into());
-        }
+    if !values.iter().all(|(name, kind, data)| reg(&["add", UNINSTALL_KEY, "/v", name, "/t", kind, "/d", data, "/f"])) {
+        notes.push("couldn't add MicClean to Settings -> Apps".to_string());
     }
     // "Start with Windows" was on for an older copy: point it at this one.
     if reg(&["query", RUN_KEY, "/v", "MicClean"]) {
         reg(&["add", RUN_KEY, "/v", "MicClean", "/t", "REG_SZ", "/d", &format!("\"{exe_s}\" --minimized"), "/f"]);
     }
+    Ok((exe, notes))
+}
+
+/// Puts `exe_bytes` in place as `dir`\micclean.exe, undoing it on failure (see `install`).
+/// Renaming works even if the old copy still runs.
+fn swap(dir: &Path, exe_bytes: &[u8]) -> Result<PathBuf, String> {
+    let exe = dir.join(EXE);
+    let (new, old) = (dir.join("micclean.new.exe"), dir.join("micclean.old.exe"));
+    std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    std::fs::write(&new, exe_bytes).map_err(|e| format!("couldn't write {}: {e}", new.display()))?;
+    let _ = std::fs::remove_file(&old);
+    if exe.exists()
+        && let Err(e) = std::fs::rename(&exe, &old)
+    {
+        let _ = std::fs::remove_file(&new);
+        return Err(format!("couldn't move the old version aside: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&new, &exe) {
+        let _ = std::fs::rename(&old, &exe);
+        return Err(format!("couldn't put the new version in place: {e}"));
+    }
+    let _ = std::fs::remove_file(&old);
     Ok(exe)
 }
 
@@ -151,12 +243,16 @@ pub fn uninstall(silent: bool) {
         (true, Ok(a)) => format!("Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue;", q(a.join("MicClean"))),
         _ => String::new(),
     };
-    // Only our own exe goes; the folder only if nothing else is in it.
+    // Only our own exes go (and an update's leftovers); the folder only if nothing else is in it.
     let script = format!(
-        "Wait-Process -Id {} -ErrorAction SilentlyContinue; Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue; \
+        "Wait-Process -Id {} -ErrorAction SilentlyContinue; Remove-Item -LiteralPath {}, {}, {} -Force -ErrorAction SilentlyContinue; \
+         Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue; \
          if (-not (Get-ChildItem -LiteralPath {} -Force)) {{ Remove-Item -LiteralPath {} -ErrorAction SilentlyContinue }}; {settings}",
         std::process::id(),
         q(&exe),
+        q(dir.join("micclean.old.exe")),
+        q(dir.join("micclean.new.exe")),
+        q(update_dir()),
         q(&dir),
         q(&dir)
     );
@@ -170,5 +266,54 @@ pub fn uninstall(silent: bool) {
         .spawn();
     if !silent {
         info(TITLE, "MicClean was removed.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("micclean-swap-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The updating copy hangs instead of closing: setup waits, closes it, and swaps. The path
+    /// is spelled differently from how Windows reports it, as an 8.3 name or junction would be.
+    /// Takes the 10 s wait: `cargo test -- --ignored swap_over_a_copy_that_wont_close`.
+    #[test]
+    #[ignore]
+    fn swap_over_a_copy_that_wont_close() {
+        let dir = temp("running");
+        let exe = dir.join(EXE);
+        // A stand-in that runs for a minute: Windows' own ping.
+        fs::copy(r"C:\Windows\System32\PING.EXE", &exe).unwrap();
+        let mut child = hidden(Command::new(&exe).args(["-n", "60", "127.0.0.1"])).spawn().unwrap();
+        let other_spelling = dir.join(".").join(EXE.to_uppercase());
+        wait_for_exit(child.id(), &other_spelling);
+        assert!(child.try_wait().unwrap().is_some(), "the old copy still runs");
+        let got = swap(&dir, b"new version").unwrap();
+        assert_eq!(fs::read(&got).unwrap(), b"new version");
+        assert!(!dir.join("micclean.new.exe").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_swap_that_cant_move_the_old_copy_leaves_it_working() {
+        let dir = temp("locked");
+        let exe = dir.join(EXE);
+        fs::write(&exe, b"working").unwrap();
+        // Opened without sharing, so it can't be renamed (what antivirus sometimes does).
+        let lock = fs::OpenOptions::new().read(true).share_mode(0).open(&exe).unwrap();
+        let err = swap(&dir, b"new version").unwrap_err();
+        drop(lock);
+        assert!(err.contains("aside"), "{err}");
+        assert_eq!(fs::read(&exe).unwrap(), b"working");
+        assert!(!dir.join("micclean.new.exe").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

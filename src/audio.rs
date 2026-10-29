@@ -25,8 +25,8 @@ pub struct Shared {
     pub profiles_ver: u64,
     /// Learn request from the GUI: what, and for how many seconds.
     pub learn: Option<(Kind, f32)>,
-    /// Finished learn run for the GUI to store (None profile = clip too quiet).
-    pub learned: Option<(Kind, Option<Profile>)>,
+    /// Finished learn run for the GUI to store, or why it couldn't be learned.
+    pub learned: Option<(Kind, Result<Profile, &'static str>)>,
     /// Zeroed buffer from the GUI to record the mic into (before the chain), returned when full.
     pub record: Option<Vec<f32>>,
     pub recorded: Option<Vec<f32>>,
@@ -120,8 +120,22 @@ fn on_error(shared: Arc<Mutex<Shared>>, dev: String) -> impl FnMut(cpal::Error) 
 pub struct Engine {
     _streams: Vec<cpal::Stream>,
     pub info: String,
-    /// Optional devices (monitor, echo reference) that weren't plugged in at start.
+    /// Optional devices (monitor, echo reference) that weren't plugged in at start. The GUI
+    /// restarts audio when one comes back.
     pub missing: Vec<String>,
+    /// Optional devices that are plugged in but wouldn't open (held in exclusive mode by
+    /// another app, an odd rate), and why. Not retried on their own: they'd fail the same way
+    /// every time and take the Discord feed down with them.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Sorts an optional device that didn't open into unplugged or failed.
+fn skipped(name: &str, err: String, missing: &mut Vec<String>, failed: &mut Vec<(String, String)>) {
+    if find(false, name).is_err() {
+        missing.push(name.to_string());
+    } else {
+        failed.push((name.to_string(), err));
+    }
 }
 
 pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String> {
@@ -137,7 +151,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
         info += &format!(" (input {})", c + 1);
     }
 
-    let mut missing = Vec::new();
+    let (mut missing, mut failed) = (Vec::new(), Vec::new());
     let mut outs = Vec::new(); // (ring, is_monitor)
     let latency = shared.lock().map_err(es)?.latency.clone();
     let (stream, prod) = open_output(&dev.output, shared.clone(), Some(latency.clone()))?;
@@ -150,7 +164,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
                 streams.push(stream);
                 outs.push((prod, true));
             }
-            Err(_) => missing.push(name.clone()),
+            Err(e) => skipped(name, e, &mut missing, &mut failed),
         }
     }
 
@@ -162,11 +176,14 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
                 info += &format!(", echo ref {ref_rate} Hz");
                 echo = Some((cons, ref_rate));
             }
-            Err(_) => missing.push(name.clone()),
+            Err(e) => skipped(name, e, &mut missing, &mut failed),
         }
     }
     if !missing.is_empty() {
         info += &format!(" (not plugged in: {})", missing.join(", "));
+    }
+    for (name, why) in &failed {
+        info += &format!(" (couldn't open {name}: {why})");
     }
 
     let mut apm = AudioProcessing::builder()
@@ -281,7 +298,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
         }
     })?);
 
-    Ok(Engine { _streams: streams, info, missing })
+    Ok(Engine { _streams: streams, info, missing, failed })
 }
 
 fn open_echo_ref(

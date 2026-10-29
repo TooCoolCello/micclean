@@ -1,6 +1,6 @@
 [package]
 name = "micclean"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 default-run = "micclean"
 
@@ -18,9 +18,10 @@ nnnoiseless = "0.5"
 raw-window-handle = "0.6"
 realfft = "3.5.1"
 ringbuf = "0.5.3"
+ron = "0.12"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sonora = "0.2"
 tray-icon = "0.26.1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

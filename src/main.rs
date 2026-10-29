@@ -2,6 +2,7 @@
 
 mod appicon;
 mod audio;
+mod backup;
 mod dsp;
 mod graphs;
 mod install;
@@ -37,7 +38,18 @@ fn main() -> eframe::Result {
         install::uninstall(std::env::args().any(|a| a == "--silent"));
         return Ok(());
     }
-    match TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT)) {
+    let mut lock = TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT));
+    if std::env::args().any(|a| a == "--updated") {
+        // Started by setup after an update: the old copy may still be letting go of the lock.
+        for _ in 0..50 {
+            if lock.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            lock = TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT));
+        }
+    }
+    match lock {
         Ok(listener) => {
             std::thread::spawn(move || {
                 for mut c in listener.incoming().flatten() {
@@ -62,6 +74,9 @@ fn main() -> eframe::Result {
         }
     }
 
+    if let Some(dir) = eframe::storage_dir("MicClean") {
+        backup::run(&dir);
+    }
     let hidden = std::env::args().any(|a| a == "--minimized");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -209,6 +224,8 @@ fn load(storage: &dyn eframe::Storage) -> Saved {
         saved.presets = starter_presets(&saved.params);
         saved.presets_seeded = true;
     }
+    // A listening aid: left on, it would send the raw mic after the next reboot.
+    saved.params.bypass = false;
     saved
 }
 
@@ -234,6 +251,7 @@ enum Fix {
     BypassOff,
     SoundSettings,
     Quieter,
+    HearMyselfOff,
 }
 
 /// Levels while you talk, averaged over about a second, for the Home verdicts and banners.
@@ -414,6 +432,10 @@ struct App {
     pitch_hist: graphs::History<(f32, bool), 180>,
     /// Frames until a --minimized start hides the window.
     hide_in: u8,
+    /// The window is hidden in the tray, so an update starts the new copy there too.
+    hidden: bool,
+    /// Last time you were talking, so an automatic update waits for a pause.
+    last_voice: Instant,
     page: Page,
     /// The chain box whose settings are open on Home.
     node: Option<Node>,
@@ -517,6 +539,8 @@ impl App {
             agc_hist: graphs::History::new(0.0, 100),                    // 30 s
             pitch_hist: graphs::History::new((f32::NAN, false), 33), // 6 s
             hide_in: 0,
+            hidden: false,
+            last_voice: now,
             page: Page::Home,
             node: None,
             calib: None,
@@ -537,6 +561,22 @@ impl App {
             hwnd,
             title_dark: None,
         };
+        if app.installed {
+            if let Ok(old) = install::old_exe() {
+                let _ = std::fs::remove_file(old); // what the last update replaced
+            }
+            // An update to this version didn't take: it isn't installed on its own again or
+            // offered in a popup (Settings can still try).
+            if let Some(version) = update::failed_version() {
+                if let Some(why) = update::take_failure() {
+                    // Setup started this copy again just now: say why.
+                    logfile::line(&format!("Update to {version} failed: {why}"));
+                    app.updater.set(update::State::Failed(why));
+                    app.next_update_check = now + Duration::from_secs(24 * 3600);
+                }
+                app.update_dismissed = Some(version);
+            }
+        }
         app.refresh_devices();
         // A save with a mic in it is from before Setup existed: that person is set up.
         app.saved.setup_done |= !app.saved.devices.input.is_empty();
@@ -634,12 +674,12 @@ impl App {
         self.latency_us = (sh.latency.capture_us.load(Ordering::Relaxed), sh.latency.output_us.load(Ordering::Relaxed));
         if let Some((kind, prof)) = sh.learned.take() {
             match prof {
-                None => self.learn_msg = "That clip was too quiet, nothing saved.".into(),
-                Some(profile) if kind == Kind::Keep => {
+                Err(why) => self.learn_msg = why.into(),
+                Ok(profile) if kind == Kind::Keep => {
                     self.saved.profiles.keep = Some(profile);
                     self.learn_msg = "Learned your voice.".into();
                 }
-                Some(profile) => {
+                Ok(profile) => {
                     let name = std::mem::take(&mut self.pending_noise_name);
                     self.learn_msg = format!("Learned \"{name}\".");
                     let noises = &mut self.saved.profiles.noises;
@@ -724,6 +764,7 @@ impl App {
             match update {
                 update::State::Available(r) => logfile::line(&format!("Update {} available", r.version)),
                 update::State::Installing => logfile::line("Installing the update"),
+                update::State::Restarting => logfile::line("Closing so setup can install the update"),
                 update::State::Failed(e) => logfile::line(&format!("Update failed: {e}")),
                 _ => {}
             }
@@ -739,6 +780,9 @@ impl App {
         self.raw_hold = raw.max(self.raw_hold - 0.5);
         self.out_hold = out.max(self.out_hold - 0.5);
         let talking = running && m.vad >= 0.5 && m.gate_open && !self.saved.params.bypass;
+        if running && m.vad >= 0.5 && m.gate_level_db > self.saved.params.gate_threshold_db {
+            self.last_voice = Instant::now();
+        }
         let (new, lim) = (m.frames != self.stats.frame, m.lim_db > 0.5);
         let s = &mut self.stats;
         s.frame = m.frames;
@@ -766,9 +810,19 @@ impl App {
         if self.engine.is_none() {
             return Some(("stopped", "Audio isn't running".into(), self.status.clone(), Some(Fix::Restart)));
         }
-        if self.saved.params.bypass && open("bypass") {
-            let desc = "Your raw mic is being sent, without any cleaning.".into();
+        if self.saved.params.bypass {
+            let desc = "Your mic is being sent without any cleaning.".into();
             return Some(("bypass", "Bypass is on".into(), desc, Some(Fix::BypassOff)));
+        }
+        if let Some((name, why)) = self.engine.as_ref().and_then(|e| e.failed.first())
+            && open("failed")
+        {
+            let desc = format!("It's plugged in but wouldn't start: {why}. Close other apps using it, then Restart.");
+            return Some(("failed", format!("Couldn't open {name}"), desc, Some(Fix::Restart)));
+        }
+        if d.monitor.is_some() && d.monitor == d.echo_ref && open("echo_monitor") {
+            let desc = "Echo cancellation hears your own voice played back on the same device, and removes part of it. Turn one of them off.".into();
+            return Some(("echo_monitor", "Hear myself is cutting into your voice".into(), desc, Some(Fix::HearMyselfOff)));
         }
         let names = [Some(&d.input), Some(&d.output), d.monitor.as_ref()];
         if let Some((name, r)) = names.iter().zip(self.rates).find_map(|(n, r)| Some((n.as_ref()?, r.filter(|&r| r != dsp::SR as u32)?)))
@@ -790,10 +844,14 @@ impl App {
 
     fn banner(&mut self, ui: &mut egui::Ui) {
         let Some((id, title, desc, fix)) = self.problem() else { return };
+        // Home shows every problem; the other pages only the one that changes what's sent.
+        if self.page != Page::Home && id != "bypass" {
+            return;
+        }
         let (mut act, mut close) = (false, false);
         ui::setting(ui, icon::WARNING, &title, &desc, |ui| {
-            // Missing devices and stopped audio can't be put off.
-            if !matches!(id, "no_input" | "no_output" | "stopped") {
+            // Missing devices, stopped audio and Bypass can't be put off.
+            if !matches!(id, "no_input" | "no_output" | "stopped" | "bypass") {
                 close = ui::icon_button(ui, true, icon::CLOSE, "Hide").on_hover_text("Until MicClean restarts").clicked();
             }
             let label = match fix {
@@ -802,6 +860,7 @@ impl App {
                 Some(Fix::BypassOff) => "Turn it off",
                 Some(Fix::SoundSettings) => "Sound settings",
                 Some(Fix::Quieter) => "3 dB quieter",
+                Some(Fix::HearMyselfOff) => "Turn off Hear myself",
                 None => "",
             };
             if fix.is_some() {
@@ -821,6 +880,7 @@ impl App {
                 *g = (*g - 3.0).max(-20.0);
                 self.stats = Stats::default(); // measure again at the new level
             }
+            Some(Fix::HearMyselfOff) => self.saved.devices.monitor = None,
             None => {}
         }
     }
@@ -903,17 +963,25 @@ impl eframe::App for App {
         }
         let st = self.updater.state();
         self.log_changes(&st, now);
-        if let update::State::Available(r) = st
+        if let update::State::Available(r) = &st
             && self.update_dismissed.as_deref() != Some(&r.version)
         {
             if self.saved.auto_update {
-                // Never in the middle of a sentence: wait until the gate has closed.
-                if self.installed && !self.meters.gate_open {
-                    self.updater.install(r);
+                // Never in the middle of a sentence, nor while Smart setup, a recording, a learn
+                // or a playback is going.
+                let quiet = now - self.last_voice > Duration::from_secs(10);
+                let busy = self.calib.is_some() || self.record_progress.is_some() || self.meters.learning.is_some() || self.playback.is_some();
+                if self.installed && quiet && !busy {
+                    self.start_update(r.clone());
                 }
             } else if !self.saved.update_popup_off {
                 self.update_prompt = true;
             }
+        }
+        if st == update::State::Restarting && !self.quitting {
+            // Setup waits for this copy to close; closing normally saves your settings first.
+            self.quitting = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
         }
         if self.saved.devices != self.engine_devices {
             self.restart();
@@ -931,6 +999,7 @@ impl eframe::App for App {
             self.hide_in -= 1;
             if self.hide_in == 0 {
                 ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                self.hidden = true;
             }
         }
         let mut show = SHOW.swap(false, Ordering::Relaxed);
@@ -950,6 +1019,7 @@ impl eframe::App for App {
             }
         }
         if show {
+            self.hidden = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -975,6 +1045,7 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_some() && !self.quitting {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.hidden = true;
         }
 
         self.viz = true;
@@ -1010,6 +1081,7 @@ impl eframe::App for App {
                     // narrower windows and pushed every card's controls off the right edge.
                     ui.set_max_width(ui.available_width().min(1000.0));
                     ui.spacing_mut().item_spacing.y = 4.0;
+                    self.banner(ui);
                     match self.page {
                         Page::Home => self.home(ui),
                         Page::Setup => self.setup(ui),
@@ -1097,7 +1169,6 @@ impl App {
     /// and a before/after recording. Everything else is in Advanced.
     fn home(&mut self, ui: &mut egui::Ui) {
         let p = ui::pal(ui);
-        self.banner(ui);
         let running = self.engine.is_some();
         let status = match &self.glitches {
             (0, _) => self.status.clone(),
@@ -1343,8 +1414,7 @@ impl App {
     fn chain_rack(&mut self, ui: &mut egui::Ui, m: &Meters) {
         let p = ui::pal(ui);
         let (cap, out) = (self.latency_us.0 as f32 / 1000.0, self.latency_us.1 as f32 / 1000.0);
-        let pr = &self.saved.params;
-        let rnn = if pr.denoise && !pr.bypass { 10.0 } else { 0.0 }; // RNNoise's one frame
+        let rnn = 10.0; // RNNoise's one frame, there even with noise removal off
         let running = self.engine.is_some();
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -1409,7 +1479,8 @@ impl App {
         match () {
             _ if device.is_some_and(|d| d.is_empty()) => return (Empty, "pick one".into()),
             _ if self.engine.is_none() => return (Empty, "-".into()),
-            _ if pr.bypass && device.is_none() => return (Empty, "bypassed".into()),
+            // Echo cancellation and the clip guard still work during Bypass.
+            _ if pr.bypass && device.is_none() && !matches!(n, Node::Echo | Node::Limiter) => return (Empty, "bypassed".into()),
             _ if !on => return (Empty, "off".into()),
             _ => {}
         }
@@ -1998,8 +2069,12 @@ impl App {
             self.update_dismissed = Some(r.version.clone());
         }
         if now {
-            self.updater.install(r);
+            self.start_update(r);
         }
+    }
+
+    fn start_update(&self, r: update::Release) {
+        self.updater.install(r, self.hidden);
     }
 
     fn updates(&mut self, ui: &mut egui::Ui) {
@@ -2012,6 +2087,7 @@ impl App {
             State::UpToDate => format!("You're up to date ({})", update::VERSION),
             State::Available(r) => format!("Version {} is available. Installing closes MicClean for a few seconds, so your voice drops out briefly", r.version),
             State::Installing => "Downloading and installing. MicClean restarts by itself".into(),
+            State::Restarting => "Restarting into the new version".into(),
             State::Failed(e) => format!("Couldn't update: {e}"),
         };
         let (mut install_rel, mut check) = (None, false);
@@ -2022,7 +2098,7 @@ impl App {
                     install_rel = Some(r.clone());
                 }
             }
-            State::Checking | State::Installing => {
+            State::Checking | State::Installing | State::Restarting => {
                 ui.spinner();
             }
             _ => check = ui.add_enabled(installed, egui::Button::new("Check now")).clicked(),
@@ -2039,7 +2115,7 @@ impl App {
         });
         (self.saved.update_check_off, self.saved.update_popup_off) = (!check_on, !popup_on);
         if let Some(r) = install_rel {
-            self.updater.install(r);
+            self.start_update(r);
         }
         if check {
             self.updater.check();

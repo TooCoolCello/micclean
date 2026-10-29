@@ -2,8 +2,14 @@
 //! MicClean-Setup.exe. build-installer.ps1 appends micclean.exe, its length and a marker to this
 //! program; running it copies that exe in and adds the Start menu entry. `--silent` skips every
 //! prompt and doesn't start the app.
+//!
+//! The updater runs it as `--silent --launch [--wait <pid>] [--minimized]`: wait for that copy
+//! to close, install, then start whatever MicClean is in place, the new one or (if installing
+//! failed) the old one, so an update never leaves you without your mic. Every step goes to
+//! micclean.log, since nobody sees a silent setup.
 
 mod install;
+mod logfile;
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -29,27 +35,58 @@ fn payload() -> Result<Vec<u8>, String> {
 }
 
 fn main() {
-    let silent = std::env::args().any(|a| a == "--silent");
-    let launch = std::env::args().any(|a| a == "--launch"); // the updater: start the new copy afterwards
+    let args: Vec<String> = std::env::args().collect();
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let (silent, launch, minimized) = (flag("--silent"), flag("--launch"), flag("--minimized"));
+    let wait_pid = args.iter().position(|a| a == "--wait").and_then(|i| args.get(i + 1)?.parse().ok());
     if !silent && !install::ask(TITLE, "Install MicClean for your Windows account?\n\nIt adds a Start menu entry and needs no admin rights.") {
         return;
     }
-    match payload().and_then(|exe| install::install(&exe)) {
-        Ok(exe) if !silent => {
-            if install::ask(TITLE, "MicClean is installed.\n\nStart it now?") {
-                let _ = std::process::Command::new(exe).spawn();
-            }
-        }
-        Ok(exe) => {
-            if launch {
-                let _ = std::process::Command::new(exe).spawn();
-            }
+    let version = env!("CARGO_PKG_VERSION");
+    if launch {
+        // The updater closes itself only once this exists.
+        let _ = std::fs::write(install::setup_started(), version);
+    }
+    install::close_running(wait_pid);
+    let result = std::panic::catch_unwind(|| payload().and_then(|exe| install::install(&exe)))
+        .unwrap_or_else(|_| Err("setup crashed".into()));
+    match &result {
+        Ok((_, notes)) => {
+            logfile::line(&format!("Setup installed MicClean {version}"));
+            notes.iter().for_each(|n| logfile::line(&format!("Setup: {n}")));
         }
         Err(e) => {
-            if !silent {
-                install::info(TITLE, &format!("Setup failed: {e}"));
+            logfile::line(&format!("Setup couldn't install MicClean {version}: {e}"));
+            if launch {
+                let _ = std::fs::write(install::failure_note(), e);
             }
-            std::process::exit(1);
         }
+    }
+
+    if launch {
+        if let Ok(exe) = install::install_dir().map(|d| d.join(install::EXE)) {
+            let mut cmd = std::process::Command::new(exe);
+            // Waits for the old copy's single-instance lock instead of taking it as "running".
+            cmd.arg("--updated");
+            if minimized {
+                cmd.arg("--minimized");
+            }
+            if let Err(e) = cmd.spawn() {
+                logfile::line(&format!("Setup couldn't start MicClean again: {e}"));
+            }
+        }
+    } else if !silent {
+        match &result {
+            Ok((exe, notes)) => {
+                let extra = if notes.is_empty() { String::new() } else { format!("\n\nBut it {}.", notes.join(", and ")) };
+                if install::ask(TITLE, &format!("MicClean is installed.{extra}\n\nStart it now?")) {
+                    let _ = std::process::Command::new(exe).spawn();
+                }
+            }
+            Err(e) => install::info(TITLE, &format!("Setup failed: {e}")),
+        }
+    }
+    if result.is_err() {
+        std::process::exit(1);
     }
 }
