@@ -301,8 +301,7 @@ struct Calib {
     start: Instant,
     /// Last meters frame sampled, so a frame isn't counted twice.
     frame: u64,
-    /// Gate level and raw peak of each quiet frame.
-    quiet: Vec<(f32, f32)>,
+    quiet: Vec<smart::Quiet>,
     talk: Vec<smart::Take>,
 }
 
@@ -668,7 +667,8 @@ impl App {
                         self.smart_report.push("Your settings already suit your voice. Nothing changed.".into());
                     }
                     self.smart_report.extend(o.notes);
-                    self.saved.smart = Some(o.params);
+                    // Suggest offers the full EQ, even where setup kept your own bands.
+                    self.saved.smart = Some(Params { bands: o.full_eq, ..o.params });
                     self.smart_undo = Some(old);
                 }
                 Err(e) => self.smart_report = vec![e],
@@ -683,7 +683,8 @@ impl App {
         c.frame = m.frames;
         if t < CALIB_QUIET {
             if t > 0.5 {
-                c.quiet.push((m.gate_level_db, m.in_db)); // past the click of the button
+                // Past the click of the button.
+                c.quiet.push(smart::Quiet { level: m.gate_level_db, peak: m.in_db, bands: m.bands_db });
             }
         } else if m.vad >= 0.5 {
             // Talking, not the pauses between words.
