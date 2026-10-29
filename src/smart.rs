@@ -39,7 +39,13 @@ pub struct Outcome {
     /// The full EQ for your voice, for the Equalizer's Suggest button.
     pub full_eq: [Option<Band>; dsp::BANDS],
     pub notes: Vec<String>,
+    /// What it measured, for the log file.
+    pub measured: String,
 }
+
+/// Your loudest peaks while reading stay this far under clipping (dBFS), leaving room for
+/// louder talking and singing.
+const PEAK_ROOM: f32 = -12.0;
 
 /// Your voice's level going into noise removal and the gate: about -26 dBFS RMS, so peaks
 /// land near -12 dBFS. Auto level then takes it to its own target, whatever that is.
@@ -122,8 +128,17 @@ pub fn analyse(p: &Params, quiet: &[Quiet], talk: &[Take]) -> Result<Outcome, St
     let voice = pct(&mut col(|t| t.level), 0.5);
     let mut s = p.clone();
 
-    // Input gain puts your normal voice at a healthy fixed level; auto level does the rest.
-    s.input_gain_db = step((p.input_gain_db + INPUT_LEVEL - voice).clamp(-20.0, 30.0));
+    // Input gain puts your normal voice at a healthy fixed level (auto level does the rest),
+    // but never so high that your loudest peaks come within 12 dB of clipping.
+    let mut peaks_in = col(|t| t.peak);
+    let (peak50, peak99) = (pct(&mut peaks_in, 0.5), pct(&mut peaks_in, 0.99));
+    let (by_level, by_peak) = (p.input_gain_db + INPUT_LEVEL - voice, p.input_gain_db + PEAK_ROOM - peak99);
+    s.input_gain_db = step(by_level.min(by_peak).clamp(-20.0, 30.0));
+    let measured = format!(
+        "measured at {:+.1} dB input gain: voice {voice:.1} dB RMS, peaks {peak50:.1} typical / {peak99:.1} loudest dBFS, room {noise:.1} dB, {} voiced frames",
+        p.input_gain_db,
+        talk.len()
+    );
     let shift = s.input_gain_db - p.input_gain_db;
     let (noise_s, voice_s) = (noise + shift, voice + shift);
 
@@ -138,7 +153,7 @@ pub fn analyse(p: &Params, quiet: &[Quiet], talk: &[Take]) -> Result<Outcome, St
 
     // Noise removal: a quiet room needs less, and less means fewer watery artifacts. Both are
     // raw peaks, measured before noise removal.
-    let snr = pct(&mut col(|t| t.peak), 0.5) - room_peak;
+    let snr = peak50 - room_peak;
     s.denoise_strength = if snr > 45.0 {
         0.7
     } else if snr > 35.0 {
@@ -188,7 +203,7 @@ pub fn analyse(p: &Params, quiet: &[Quiet], talk: &[Take]) -> Result<Outcome, St
     };
     s.comp_threshold_db = (c50 - 6.0).clamp(-50.0, 0.0).round();
     s.comp_makeup_db = step((c50 - s.comp_threshold_db).max(0.0) * (1.0 - 1.0 / s.comp_ratio)).clamp(0.0, 12.0);
-    Ok(Outcome { params: s, full_eq, notes })
+    Ok(Outcome { params: s, full_eq, notes, measured })
 }
 
 /// Never below your current low cut. Otherwise 3/4 of your lowest notes, or higher (up to
@@ -355,6 +370,18 @@ mod tests {
     }
 
     #[test]
+    fn gain_never_takes_the_loudest_peaks_within_12_db_of_clipping() {
+        // A quiet average (would want +14 dB) with sharp peaks at -10 dBFS: only -2 dB allowed.
+        let mut talk = vec![take(-40.0, -20.0, -40.0); 200];
+        for t in talk.iter_mut().skip(190) {
+            t.peak = -10.0;
+        }
+        let o = analyse(&Params { input_gain_db: 16.0, ..Params::default() }, &quiet(-70.0), &talk).unwrap();
+        assert_eq!(o.params.input_gain_db, 14.0, "16 dB now, loudest peaks -10: 2 dB less");
+        assert!(o.measured.contains("-10.0 loudest"), "{}", o.measured);
+    }
+
+    #[test]
     fn your_eq_stays_and_the_low_cut_only_goes_up() {
         let bell = Band { kind: BandKind::Bell, freq: 300.0, gain_db: 2.5, q: 1.0, on: true };
         let cut = Band { kind: BandKind::LowCut, freq: 120.0, gain_db: 0.0, q: 0.707, on: true };
@@ -462,7 +489,7 @@ mod tests {
                 }
             }
             let o = analyse(&base, &quiet, &talk).unwrap();
-            println!("== {name}: {} quiet frames, {} talking frames", quiet.len(), talk.len());
+            println!("== {name}: {}", o.measured);
             for line in changes(&base, &o.params).iter().chain(&o.notes) {
                 println!("{line}");
             }

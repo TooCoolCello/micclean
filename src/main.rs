@@ -658,6 +658,7 @@ impl App {
             let c = self.calib.take().expect("checked above");
             match smart::analyse(&self.saved.params, &c.quiet, &c.talk) {
                 Ok(o) => {
+                    logfile::line(&format!("Smart setup {}", o.measured));
                     let old = self.saved.params.clone();
                     for n in Node::SMART {
                         n.suggest(&mut self.saved.params, &o.params);
