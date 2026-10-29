@@ -33,6 +33,8 @@ pub mod icon {
     pub const WARNING: &str = "\u{E7BA}";
     pub const FOLDER: &str = "\u{E838}";
     pub const SMART: &str = "\u{E82F}"; // light bulb
+    pub const SETUP: &str = "\u{E90F}"; // wrench
+    pub const CHECK: &str = "\u{E73E}";
 }
 
 pub struct Palette {

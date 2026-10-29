@@ -105,6 +105,8 @@ struct Saved {
     nav_compact: bool,
     /// What the last Smart setup chose, for each box's Suggest button.
     smart: Option<Params>,
+    /// Setup has been seen, so the app opens on Home.
+    setup_done: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -213,16 +215,51 @@ fn load(storage: &dyn eframe::Storage) -> Saved {
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Home,
-    Teach,
-    Test,
+    Setup,
+    Advanced,
     Settings,
 }
 
 const NAV: [(Page, &str, &str); 3] = [
     (Page::Home, icon::HOME, "Home"),
-    (Page::Teach, icon::LEARN, "Learn sounds"),
-    (Page::Test, icon::RECORD, "Test recording"),
+    (Page::Setup, icon::SETUP, "Setup"),
+    (Page::Advanced, icon::EQ, "Advanced"),
 ];
+
+/// What a problem banner's button does.
+#[derive(Clone, Copy)]
+enum Fix {
+    Setup,
+    Restart,
+    BypassOff,
+    SoundSettings,
+    Quieter,
+}
+
+/// Levels while you talk, averaged over about a second, for the Home verdicts and banners.
+#[derive(Default)]
+struct Stats {
+    /// Last meters frame counted, and how many talking frames so far.
+    frame: u64,
+    voiced: u32,
+    /// Typical peak before MicClean's input gain, and at the output (dBFS).
+    raw_peak: f32,
+    out_peak: f32,
+    /// Share of talking frames the limiter worked on.
+    lim_busy: f32,
+}
+
+/// What you listen on: Windows' default playback device, unless that's VB-Cable.
+fn listen_device(outputs: &[String]) -> Option<String> {
+    audio::default_output_name()
+        .filter(|n| !n.contains("CABLE"))
+        .or_else(|| outputs.iter().find(|n| !n.contains("CABLE")).cloned())
+}
+
+/// Windows' classic Sound dialog, where Properties → Advanced sets a device's rate.
+fn open_sound_settings() {
+    let _ = std::process::Command::new("control").arg("mmsys.cpl").spawn();
+}
 
 /// A box in the signal chain; clicking one opens its settings under the chain.
 #[derive(Clone, Copy, PartialEq)]
@@ -245,12 +282,12 @@ impl Node {
             Node::Input => "Input",
             Node::Echo => "Echo cancellation",
             Node::Noise => "Noise removal",
-            Node::Gate => "Voice gate",
-            Node::Level => "Auto level",
-            Node::Eq => "Equalizer",
-            Node::Deess => "De-esser",
-            Node::Comp => "Compressor",
-            Node::Limiter => "Limiter",
+            Node::Gate => "Mute between words",
+            Node::Level => "Even out volume",
+            Node::Eq => "Tone",
+            Node::Deess => "Soften S sounds",
+            Node::Comp => "Tame loud parts",
+            Node::Limiter => "Clip guard",
             Node::Output => "Output",
         }
     }
@@ -375,6 +412,14 @@ struct App {
     rates: [Option<u32>; 3],
     /// How many channels the input device has, for its channel picker.
     in_channels: u16,
+    /// Falling peak holds for the meters (dBFS): each input channel and the input before
+    /// MicClean's gain, and what gets sent.
+    chan_hold: [f32; audio::MAX_CH],
+    raw_hold: f32,
+    out_hold: f32,
+    stats: Stats,
+    /// Problem banners closed until the next start.
+    dismissed: Vec<&'static str>,
     show_notices: bool,
     /// What the log file already has, so it gets changes only.
     logged_status: String,
@@ -466,6 +511,11 @@ impl App {
             smart_undo: None,
             rates: [None; 3],
             in_channels: 1,
+            chan_hold: [-120.0; audio::MAX_CH],
+            raw_hold: -120.0,
+            out_hold: -120.0,
+            stats: Stats::default(),
+            dismissed: Vec::new(),
             show_notices: false,
             logged_status: String::new(),
             logged_glitches: 0,
@@ -475,6 +525,9 @@ impl App {
             title_dark: None,
         };
         app.refresh_devices();
+        // A save with a mic in it is from before Setup existed: that person is set up.
+        app.saved.setup_done |= !app.saved.devices.input.is_empty();
+        app.page = if app.saved.setup_done { Page::Home } else { Page::Setup };
         let d = &mut app.saved.devices;
         if d.input.is_empty() {
             d.input = app.inputs.first().cloned().unwrap_or_default();
@@ -484,9 +537,6 @@ impl App {
             d.output = app.outputs.iter().find(|n| n.contains("CABLE Input")).cloned().unwrap_or_default();
         }
         app.restart();
-        if app.engine.is_none() {
-            app.node = Some(Node::Input); // first run or a missing mic: start where it gets fixed
-        }
         app
     }
 
@@ -498,6 +548,7 @@ impl App {
     fn restart(&mut self) {
         self.engine = None; // stop old streams before opening the devices again
         self.engine_devices = self.saved.devices.clone();
+        self.stats = Stats::default();
         self.last_beat = Instant::now();
         self.needs_restart = false;
         let d = &self.saved.devices;
@@ -602,6 +653,9 @@ impl App {
             }
         }
         self.record_progress = sh.record_progress;
+        for (h, p) in self.chan_hold.iter_mut().zip(std::mem::take(&mut sh.channel_peak)) {
+            *h = (20.0 * p.max(1e-6).log10()).max(*h - 0.5);
+        }
         if let Some(e) = sh.error.take() {
             self.status = format!("Audio error: {e} (reconnecting)");
             self.needs_restart = true;
@@ -660,6 +714,101 @@ impl App {
                 update::State::Failed(e) => logfile::line(&format!("Update failed: {e}")),
                 _ => {}
             }
+        }
+    }
+
+    /// Falling peak holds for the meters, and your levels while talking for Home's verdict and
+    /// the problem banners.
+    fn watch(&mut self) {
+        let m = &self.meters;
+        let running = self.engine.is_some();
+        let (raw, out) = if running { (m.in_db - self.saved.params.input_gain_db, m.out_db) } else { (-120.0, -120.0) };
+        self.raw_hold = raw.max(self.raw_hold - 0.5);
+        self.out_hold = out.max(self.out_hold - 0.5);
+        let talking = running && m.vad >= 0.5 && m.gate_open && !self.saved.params.bypass;
+        let (new, lim) = (m.frames != self.stats.frame, m.lim_db > 0.5);
+        let s = &mut self.stats;
+        s.frame = m.frames;
+        if new && talking {
+            // A plain average over the first second, then a moving one over about a second.
+            let k = 1.0 / (s.voiced.min(99) + 1) as f32;
+            s.voiced += 1;
+            s.raw_peak += (raw - s.raw_peak) * k;
+            s.out_peak += (out - s.out_peak) * k;
+            s.lim_busy += (lim as u8 as f32 - s.lim_busy) * k;
+        }
+    }
+
+    /// The most pressing thing to fix, if any: id (for dismissing), title, detail, button.
+    fn problem(&self) -> Option<(&'static str, String, String, Option<Fix>)> {
+        let (d, s) = (&self.saved.devices, &self.stats);
+        let open = |id| !self.dismissed.contains(&id);
+        if d.input.is_empty() {
+            return Some(("no_input", "Pick your mic".into(), "Setup walks you through it.".into(), Some(Fix::Setup)));
+        }
+        if d.output.is_empty() {
+            let desc = "Pick where the cleaned sound goes, like VB-Cable for Discord.".into();
+            return Some(("no_output", "Nothing is being sent".into(), desc, Some(Fix::Setup)));
+        }
+        if self.engine.is_none() {
+            return Some(("stopped", "Audio isn't running".into(), self.status.clone(), Some(Fix::Restart)));
+        }
+        if self.saved.params.bypass && open("bypass") {
+            let desc = "Your raw mic is being sent, without any cleaning.".into();
+            return Some(("bypass", "Bypass is on".into(), desc, Some(Fix::BypassOff)));
+        }
+        let names = [Some(&d.input), Some(&d.output), d.monitor.as_ref()];
+        if let Some((name, r)) = names.iter().zip(self.rates).find_map(|(n, r)| Some((n.as_ref()?, r.filter(|&r| r != dsp::SR as u32)?)))
+            && open("rate")
+        {
+            let desc = "That adds delay. In Sound settings, set it to 48000 Hz under Properties → Advanced.".into();
+            return Some(("rate", format!("{name} runs at {r} Hz"), desc, Some(Fix::SoundSettings)));
+        }
+        if s.voiced >= 300 && s.raw_peak < -42.0 && open("quiet") {
+            let desc = "Turn up the gain knob on your mic or audio interface. It's cleaner than adding gain here.".into();
+            return Some(("quiet", "Your mic is very quiet".into(), desc, None));
+        }
+        if s.voiced >= 300 && s.lim_busy > 0.15 && open("limiter") {
+            let desc = "The clip guard is squashing them, which sounds like clipping. Turn Loudness down.".into();
+            return Some(("limiter", "Your loud words are too loud".into(), desc, Some(Fix::Quieter)));
+        }
+        None
+    }
+
+    fn banner(&mut self, ui: &mut egui::Ui) {
+        let Some((id, title, desc, fix)) = self.problem() else { return };
+        let (mut act, mut close) = (false, false);
+        ui::setting(ui, icon::WARNING, &title, &desc, |ui| {
+            // Missing devices and stopped audio can't be put off.
+            if !matches!(id, "no_input" | "no_output" | "stopped") {
+                close = ui::icon_button(ui, true, icon::CLOSE, "Hide").on_hover_text("Until MicClean restarts").clicked();
+            }
+            let label = match fix {
+                Some(Fix::Setup) => "Open Setup",
+                Some(Fix::Restart) => "Restart",
+                Some(Fix::BypassOff) => "Turn it off",
+                Some(Fix::SoundSettings) => "Sound settings",
+                Some(Fix::Quieter) => "3 dB quieter",
+                None => "",
+            };
+            if fix.is_some() {
+                act = ui::accent_button(ui, true, label).clicked();
+            }
+        });
+        if close {
+            self.dismissed.push(id);
+        }
+        match fix.filter(|_| act) {
+            Some(Fix::Setup) => self.page = Page::Setup,
+            Some(Fix::Restart) => self.restart(),
+            Some(Fix::BypassOff) => self.saved.params.bypass = false,
+            Some(Fix::SoundSettings) => open_sound_settings(),
+            Some(Fix::Quieter) => {
+                let g = &mut self.saved.params.output_gain_db;
+                *g = (*g - 3.0).max(-20.0);
+                self.stats = Stats::default(); // measure again at the new level
+            }
+            None => {}
         }
     }
 
@@ -734,6 +883,7 @@ impl eframe::App for App {
         self.agc_hist.push(self.meters.agc_db, now);
         self.pitch_hist.push((self.meters.pitch_hz.unwrap_or(f32::NAN), self.meters.gate_open), now);
         self.smart_step();
+        self.watch();
         if self.installed && !self.saved.update_check_off && now >= self.next_update_check {
             self.next_update_check = now + Duration::from_secs(24 * 3600);
             self.updater.check();
@@ -849,8 +999,8 @@ impl eframe::App for App {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     match self.page {
                         Page::Home => self.home(ui),
-                        Page::Teach => self.teach(ui),
-                        Page::Test => self.test(ui),
+                        Page::Setup => self.setup(ui),
+                        Page::Advanced => self.advanced(ui),
                         Page::Settings => self.settings(ui),
                     }
                     ui.add_space(24.0);
@@ -906,14 +1056,17 @@ impl App {
             self.saved.nav_compact = !compact;
         }
         ui.add_space(4.0);
+        // Going anywhere counts as having seen Setup: it won't open on it again.
         for (page, ic, label) in NAV {
             if ui::nav_item(ui, ic, label, self.page == page, compact).clicked() {
                 self.page = page;
+                self.saved.setup_done = true;
             }
         }
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             if ui::nav_item(ui, icon::SETTINGS, "Settings", self.page == Page::Settings, compact).clicked() {
                 self.page = Page::Settings;
+                self.saved.setup_done = true;
             }
         });
     }
@@ -927,20 +1080,243 @@ impl App {
         }
     }
 
+    /// The everyday view: anything to fix, what friends hear, the main switches, Smart setup
+    /// and a before/after recording. Everything else is in Advanced.
     fn home(&mut self, ui: &mut egui::Ui) {
-        let mut restart = false;
-        let title = if self.engine.is_some() { "Running" } else { "Not running" };
+        let p = ui::pal(ui);
+        self.banner(ui);
+        let running = self.engine.is_some();
         let status = match &self.glitches {
             (0, _) => self.status.clone(),
             (n, dev) => format!("{} · {n} glitch{} (last on {dev})", self.status, if *n == 1 { "" } else { "es" }),
         };
-        ui::setting(ui, icon::MIC, title, &status, |ui| {
-            restart = ui::icon_button(ui, true, icon::REFRESH, "Restart").clicked();
+        let d = &self.saved.devices;
+        let or = |s: &str, none: &str| if s.is_empty() { none.to_string() } else { s.to_string() };
+        let route = format!("{} → {}", or(&d.input, "no mic"), or(&d.output, "nowhere"));
+        let mut restart = false;
+        ui::setting(ui, icon::MIC, if running { "On" } else { "Not running" }, &route, |ui| {
+            restart = ui::icon_button(ui, true, icon::REFRESH, "Restart").on_hover_text(&status).clicked();
         });
         if restart {
             self.restart();
         }
 
+        let (m, s) = (self.live_meters(), &self.stats);
+        // Typical peaks while talking: the zone below is where the loud ones should land.
+        let verdict = match () {
+            _ if !running => "Not running",
+            _ if s.voiced < 100 => "Talk to see your level",
+            _ if s.out_peak < -26.0 => "Quiet. Turn Loudness up, or run Smart setup",
+            _ if s.out_peak > -8.0 => "Loud. Turn Loudness down",
+            _ => "A good level",
+        };
+        ui::card(ui, |ui| {
+            ui::header(ui, icon::SPEAKERS, "What your friends hear", verdict, |ui| {
+                if m.gate_open {
+                    ui::pill(ui, "Sending", p.good, p.on_accent);
+                } else {
+                    ui::pill(ui, "Muted while you're quiet", p.control_stroke, p.text2);
+                }
+            });
+            graphs::zone_meter(ui, ui.available_width(), self.out_hold, -60.0, 0.0, (-20.0, -6.0), p.accent);
+            ui.add_space(8.0);
+        });
+
+        let (pr, d, outputs) = (&mut self.saved.params, &mut self.saved.devices, &self.outputs);
+        ui::group(ui, icon::VOLUME, "Your sound", "The main switches. Every setting is in Advanced", None, |ui| {
+            ui::row(ui, "Remove background noise", |ui| {
+                // Normal covers Smart setup's gentler strengths for quiet rooms.
+                let mut level = if !pr.denoise { 0 } else if pr.denoise_strength < 0.95 { 1 } else { 2 };
+                let before = level;
+                for (v, label) in [(2, "Strong"), (1, "Normal"), (0, "Off")] {
+                    ui.selectable_value(&mut level, v, label);
+                }
+                if level != before {
+                    pr.denoise = level > 0;
+                    if level > 0 {
+                        pr.denoise_strength = if level == 2 { 1.0 } else { 0.8 };
+                    }
+                }
+            });
+            ui::row(ui, "Mute me when I'm not talking", |ui| {
+                ui::toggle(ui, &mut pr.gate);
+            });
+            ui::row(ui, "Loudness", |ui| {
+                slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
+            });
+            ui::row(ui, "Hear myself", |ui| {
+                let mut on = d.monitor.is_some();
+                if ui::toggle(ui, &mut on).changed() {
+                    d.monitor = if on { listen_device(outputs) } else { None };
+                }
+                if let Some(mon) = &d.monitor {
+                    ui.add(egui::Label::new(RichText::new(mon).small().color(p.text2)).truncate());
+                }
+            });
+        });
+        self.smart_card(ui);
+        self.compare_card(ui);
+    }
+
+    /// Record 10 seconds of the raw mic, then play it back as it was and cleaned up.
+    fn compare_card(&mut self, ui: &mut egui::Ui) {
+        let recording = self.record_progress.is_some() && self.calib.is_none();
+        let has_clip = self.clip.is_some() && !recording;
+        let can_record = self.record_progress.is_none() && self.engine.is_some();
+        let (mut record, mut original, mut processed, mut stop) = (false, false, false, false);
+        let desc = "Record 10 seconds, then play it as it was and cleaned up, on Hear myself's device or your speakers";
+        ui::card(ui, |ui| {
+            ui::header(ui, icon::RECORD, "Hear the difference", desc, |ui| {
+                stop = ui::icon_button(ui, self.playback.is_some(), icon::STOP, "Stop").clicked();
+                processed = ui::icon_button(ui, has_clip, icon::PLAY, "Cleaned").clicked();
+                original = ui::icon_button(ui, has_clip, icon::PLAY, "Original").clicked();
+                record = ui::accent_button(ui, can_record, "Record").clicked();
+            });
+            if let Some(prog) = self.record_progress.filter(|_| recording) {
+                ui.add(egui::ProgressBar::new(prog).desired_height(4.0));
+            }
+        });
+        if record {
+            self.shared.lock().unwrap().record = Some(vec![0.0; RECORD_SECS * dsp::SR as usize]);
+        }
+        if original {
+            self.play(false);
+        }
+        if processed {
+            self.play(true);
+        }
+        if stop {
+            self.stop_playback();
+        }
+    }
+
+    /// Mic, where the sound goes, what you listen on, then Smart setup. Opens on first run;
+    /// any step can be changed again later.
+    fn setup(&mut self, ui: &mut egui::Ui) {
+        let p = ui::pal(ui);
+        let running = self.engine.is_some();
+        let (holds, raw_hold, n) = (self.chan_hold, self.raw_hold, self.in_channels);
+        let (voiced, raw_peak) = (self.stats.voiced, self.stats.raw_peak);
+        let out_rate = self.rates[1].filter(|&r| r != dsp::SR as u32);
+        let (d, inputs, outputs) = (&mut self.saved.devices, &self.inputs, &self.outputs);
+        let mut refresh = false;
+
+        step(ui, 1, "Your mic", running && !d.input.is_empty());
+        ui::card(ui, |ui| {
+            ui::header(ui, icon::MIC, "Mic", "Pick it, then talk for a few seconds to check it", |ui| {
+                let before = d.input.clone();
+                pick(ui, "setup_mic", &mut d.input, inputs);
+                if d.input != before {
+                    d.input_channel = None;
+                }
+                refresh |= ui.button("Refresh list").clicked();
+            });
+            let n = usize::from(n).min(audio::MAX_CH);
+            if n > 1 {
+                // Interfaces show up as one device for all their inputs: the one your voice is
+                // on is far louder than the others.
+                for (c, &db) in holds[..n].iter().enumerate() {
+                    graphs::meter_row(ui, &format!("Input {}", c + 1), db, -60.0, 0.0, None, p.accent, &format!("{db:.0} dB"));
+                }
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| holds[b].total_cmp(&holds[a]));
+                let top = order[0];
+                if holds[top] > -50.0 && holds[top] - holds[order[1]] >= 15.0 && d.input_channel != Some(top as u16) {
+                    ui::row(ui, &format!("Your voice is on Input {}", top + 1), |ui| {
+                        if ui::accent_button(ui, true, format!("Use Input {}", top + 1)).clicked() {
+                            d.input_channel = Some(top as u16);
+                        }
+                    });
+                }
+                ui::row(ui, "Use", |ui| channel_pick(ui, &mut d.input_channel, n as u16));
+            }
+            ui::row(ui, "Level", |ui| graphs::zone_meter(ui, 260.0, raw_hold, -60.0, 0.0, (-24.0, -9.0), p.accent));
+            let level = match () {
+                _ if !running => "Not running yet.",
+                _ if voiced < 100 => "Talk normally for a few seconds.",
+                _ if raw_peak < -42.0 => "Very quiet. Turn up the gain knob on your mic or audio interface: that's cleaner than adding gain here.",
+                _ if raw_peak > -8.0 => "Very loud. Turn the gain knob on your mic or interface down a little, or it may clip.",
+                _ => "Your level is good.",
+            };
+            ui.label(RichText::new(level).small().color(p.text2));
+            ui.add_space(4.0);
+        });
+
+        step(ui, 2, "Where it goes", !d.output.is_empty());
+        let cable = outputs.iter().find(|n| n.contains("CABLE Input")).cloned();
+        ui::card(ui, |ui| {
+            ui::header(ui, icon::SPEAKERS, "Send to", "For Discord and other apps, VB-Cable's CABLE Input. They then use CABLE Output as their mic", |ui| {
+                pick(ui, "setup_out", &mut d.output, outputs);
+            });
+            match &cable {
+                Some(c) if d.output != *c => ui::row(ui, "VB-Cable is installed", |ui| {
+                    if ui::accent_button(ui, true, "Use CABLE Input").clicked() {
+                        d.output.clone_from(c);
+                    }
+                }),
+                None => ui::row(ui, "VB-Cable isn't installed (free)", |ui| {
+                    refresh |= ui.button("Refresh list").clicked();
+                    if ui.button("Get VB-Cable").clicked() {
+                        let _ = std::process::Command::new("explorer").arg("https://vb-audio.com/Cable/").spawn();
+                    }
+                }),
+                _ => {}
+            }
+            if let Some(r) = out_rate {
+                ui::row(ui, &format!("Runs at {r} Hz, set it to 48000"), |ui| {
+                    if ui.button("Sound settings").clicked() {
+                        open_sound_settings();
+                    }
+                });
+            }
+            egui::CollapsingHeader::new("Then in Discord").show(ui, |ui| {
+                for line in [
+                    "1. Voice & Video → Input Device: CABLE Output.",
+                    "2. Turn off Noise Suppression, Echo Cancellation and Automatic Gain Control. MicClean does these.",
+                    "3. Turn off Automatic Input Sensitivity and drag its slider all the way left. MicClean mutes between words.",
+                    "4. In Windows Sound settings, set CABLE Input and CABLE Output to 48000 Hz (Properties → Advanced).",
+                    "5. Windows Settings → System → Sound → your mic: Audio enhancements off.",
+                ] {
+                    ui.label(RichText::new(line).color(p.text2));
+                }
+            });
+        });
+
+        step(ui, 3, "What you listen on", true);
+        let listen = listen_device(outputs);
+        ui::card(ui, |ui| {
+            let desc = "Speakers and open-back headphones leak into your mic, so friends hear themselves. MicClean can cancel that";
+            ui::header(ui, icon::HEADPHONE, "Headphones or speakers", desc, |_| {});
+            let mut open = d.echo_ref.is_some();
+            let before = open;
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut open, false, "Closed-back headphones");
+                ui.radio_value(&mut open, true, "Speakers or open-back headphones");
+            });
+            if open != before {
+                d.echo_ref = if open { listen } else { None };
+            }
+            if open {
+                ui::row(ui, "Playing on", |ui| pick_opt(ui, "setup_echo", &mut d.echo_ref, outputs, "Off"));
+            }
+            ui.add_space(4.0);
+        });
+        if refresh {
+            self.refresh_devices();
+        }
+
+        step(ui, 4, "Tune it to your voice", self.saved.smart.is_some());
+        self.smart_card(ui);
+        ui.add_space(14.0);
+        if ui::accent_button(ui, true, "Done").clicked() {
+            self.saved.setup_done = true;
+            self.page = Page::Home;
+        }
+    }
+
+    /// Every effect as a box in the signal chain with all of its settings, plus presets,
+    /// Bypass and learned sounds.
+    fn advanced(&mut self, ui: &mut egui::Ui) {
         let m = self.live_meters();
         self.chain_strip(ui, &m);
         match self.node {
@@ -987,6 +1363,7 @@ impl App {
             None => {
                 self.presets_card(ui);
                 self.overview(ui, &m);
+                self.teach(ui);
             }
         }
     }
@@ -1039,12 +1416,12 @@ impl App {
             (Node::Input, "Input", None, fill(m.in_db), input),
             (Node::Echo, "Echo", None, m.echo_erle_db.unwrap_or(0.0) / 30.0, echo),
             (Node::Noise, "Noise", Some(&mut pr.denoise), m.denoise_db / 20.0, db(m.denoise_db)),
-            (Node::Gate, "Gate", Some(&mut pr.gate), if m.gate_open { 1.0 } else { 0.0 }, if m.gate_open { "open" } else { "muted" }.into()),
-            (Node::Level, "Auto level", Some(&mut pr.agc), m.agc_db.abs() / 12.0, format!("{:+.1} dB", m.agc_db)),
-            (Node::Eq, "EQ", Some(&mut pr.eq), 0.5, format!("{bands} band{}", if bands == 1 { "" } else { "s" })),
-            (Node::Deess, "De-esser", Some(&mut pr.deess), m.deess_db / 8.0, db(m.deess_db)),
-            (Node::Comp, "Compressor", Some(&mut pr.comp), m.gr_db / 12.0, db(m.gr_db)),
-            (Node::Limiter, "Limiter", None, m.lim_db / 6.0, if m.lim_db > 0.1 { db(m.lim_db) } else { "idle".into() }),
+            (Node::Gate, "Auto-mute", Some(&mut pr.gate), if m.gate_open { 1.0 } else { 0.0 }, if m.gate_open { "open" } else { "muted" }.into()),
+            (Node::Level, "Even volume", Some(&mut pr.agc), m.agc_db.abs() / 12.0, format!("{:+.1} dB", m.agc_db)),
+            (Node::Eq, "Tone", Some(&mut pr.eq), 0.5, format!("{bands} band{}", if bands == 1 { "" } else { "s" })),
+            (Node::Deess, "Soft S", Some(&mut pr.deess), m.deess_db / 8.0, db(m.deess_db)),
+            (Node::Comp, "Loud parts", Some(&mut pr.comp), m.gr_db / 12.0, db(m.gr_db)),
+            (Node::Limiter, "Clip guard", None, m.lim_db / 6.0, if m.lim_db > 0.1 { db(m.lim_db) } else { "idle".into() }),
             (Node::Output, "Output", None, fill(m.out_db), output),
         ];
         // As many 100 px boxes per row as fit, then even rows (5 + 5, not 8 + 2) filling the width.
@@ -1171,10 +1548,9 @@ impl App {
         }
     }
 
-    /// Nothing selected in the chain: Smart setup, levels, spectrum and Bypass.
+    /// Nothing selected in the chain: levels, spectrum and Bypass.
     fn overview(&mut self, ui: &mut egui::Ui, m: &Meters) {
         let p = ui::pal(ui);
-        self.smart_card(ui);
         ui::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Levels").font(ui::semibold(14.0)));
@@ -1229,15 +1605,7 @@ impl App {
                 // Audio interfaces show up in Windows as one device for all their inputs.
                 if in_channels > 1 {
                     let desc = "Which of the device's inputs your mic is plugged into. Mixing them makes a mic on one input 6 dB quieter and adds the other's hiss";
-                    ui::setting(ui, icon::MIC, "Channel", desc, |ui| {
-                        let shown = d.input_channel.map_or("All, mixed".into(), |c| format!("Input {}", c + 1));
-                        egui::ComboBox::from_id_salt("mic_ch").selected_text(shown).show_ui(ui, |ui| {
-                            ui.selectable_value(&mut d.input_channel, None, "All, mixed");
-                            for c in 0..in_channels {
-                                ui.selectable_value(&mut d.input_channel, Some(c), format!("Input {}", c + 1));
-                            }
-                        });
-                    });
+                    ui::setting(ui, icon::MIC, "Channel", desc, |ui| channel_pick(ui, &mut d.input_channel, in_channels));
                 }
                 if let Some(r) = off_rate(0) {
                     let desc = "MicClean converts it to 48000 Hz. Setting the device to 48000 Hz in Windows skips that step";
@@ -1279,9 +1647,11 @@ impl App {
                 ui::row(ui, "Strength", |ui| {
                     ui.add(egui::Slider::new(&mut pr.denoise_strength, 0.0..=1.0));
                 });
-                ui::row(ui, "Back off while singing", |ui| {
-                    ui.add(egui::Slider::new(&mut pr.sing_protect, 0.0..=1.0))
-                        .on_hover_text("Raise this if held notes sound watery or thin.");
+                more(ui, "noise", |ui| {
+                    ui::row(ui, "Back off while singing", |ui| {
+                        ui.add(egui::Slider::new(&mut pr.sing_protect, 0.0..=1.0))
+                            .on_hover_text("Raise this if held notes sound watery or thin.");
+                    });
                 });
             }),
             Node::Gate => {
@@ -1294,24 +1664,26 @@ impl App {
                     ui::row(ui, "Minimum level", |ui| {
                         slider(ui, &mut pr.gate_threshold_db, -80.0..=-10.0, " dB");
                     });
-                    ui::row(ui, "Close below it by", |ui| {
-                        slider(ui, &mut pr.gate_hysteresis_db, 0.0..=20.0, " dB")
-                            .on_hover_text("Keeps fading notes open. 0 = opens and closes at the same level.");
-                    });
-                    ui::row(ui, "Voice confidence needed", |ui| {
-                        ui.add(egui::Slider::new(&mut pr.vad_threshold, 0.05..=0.95));
-                    });
                     ui::row(ui, "Hold open after you stop", |ui| {
                         slider(ui, &mut pr.gate_hold_ms, 0.0..=2000.0, " ms");
                     });
-                    ui::row(ui, "Fade in", |ui| {
-                        slider(ui, &mut pr.gate_attack_ms, 0.5..=50.0, " ms").on_hover_text("How fast it opens. Too fast can click.");
-                    });
-                    ui::row(ui, "Fade out", |ui| {
-                        slider(ui, &mut pr.gate_release_ms, 10.0..=500.0, " ms").on_hover_text("How fast it closes once muting.");
-                    });
-                    ui::row(ui, "Volume while muted", |ui| {
-                        slider(ui, &mut pr.gate_floor_db, -90.0..=0.0, " dB");
+                    more(ui, "gate", |ui| {
+                        ui::row(ui, "Close below it by", |ui| {
+                            slider(ui, &mut pr.gate_hysteresis_db, 0.0..=20.0, " dB")
+                                .on_hover_text("Keeps fading notes open. 0 = opens and closes at the same level.");
+                        });
+                        ui::row(ui, "Voice confidence needed", |ui| {
+                            ui.add(egui::Slider::new(&mut pr.vad_threshold, 0.05..=0.95));
+                        });
+                        ui::row(ui, "Fade in", |ui| {
+                            slider(ui, &mut pr.gate_attack_ms, 0.5..=50.0, " ms").on_hover_text("How fast it opens. Too fast can click.");
+                        });
+                        ui::row(ui, "Fade out", |ui| {
+                            slider(ui, &mut pr.gate_release_ms, 10.0..=500.0, " ms").on_hover_text("How fast it closes once muting.");
+                        });
+                        ui::row(ui, "Volume while muted", |ui| {
+                            slider(ui, &mut pr.gate_floor_db, -90.0..=0.0, " dB");
+                        });
                     });
                 });
                 ui::card(ui, |ui| {
@@ -1329,8 +1701,10 @@ impl App {
                     ui::row(ui, "Target level", |ui| {
                         slider(ui, &mut pr.agc_target_db, -36.0..=-10.0, " dB");
                     });
-                    ui::row(ui, "Max boost", |ui| {
-                        slider(ui, &mut pr.agc_max_gain_db, 0.0..=30.0, " dB");
+                    more(ui, "level", |ui| {
+                        ui::row(ui, "Max boost", |ui| {
+                            slider(ui, &mut pr.agc_max_gain_db, 0.0..=30.0, " dB");
+                        });
                     });
                 });
             }
@@ -1365,14 +1739,16 @@ impl App {
                     ui::row(ui, "Ratio", |ui| {
                         ui.add(egui::Slider::new(&mut pr.comp_ratio, 1.0..=20.0).logarithmic(true).suffix(":1"));
                     });
-                    ui::row(ui, "Attack", |ui| {
-                        slider(ui, &mut pr.comp_attack_ms, 0.5..=50.0, " ms");
-                    });
-                    ui::row(ui, "Release", |ui| {
-                        slider(ui, &mut pr.comp_release_ms, 20.0..=1000.0, " ms");
-                    });
-                    ui::row(ui, "Makeup gain", |ui| {
-                        slider(ui, &mut pr.comp_makeup_db, 0.0..=24.0, " dB");
+                    more(ui, "comp", |ui| {
+                        ui::row(ui, "Attack", |ui| {
+                            slider(ui, &mut pr.comp_attack_ms, 0.5..=50.0, " ms");
+                        });
+                        ui::row(ui, "Release", |ui| {
+                            slider(ui, &mut pr.comp_release_ms, 20.0..=1000.0, " ms");
+                        });
+                        ui::row(ui, "Makeup gain", |ui| {
+                            slider(ui, &mut pr.comp_makeup_db, 0.0..=24.0, " dB");
+                        });
                     });
                 });
             }
@@ -1384,9 +1760,7 @@ impl App {
                 graphs::meter_row(ui, "Output peak", m.out_db, -60.0, 0.0, Some(ceil), if limiting { red } else { p.accent }, &peak);
                 let amount = if limiting { format!("-{:.1} dB", m.lim_db) } else { "idle".into() };
                 graphs::meter_row(ui, "Limiting", m.lim_db, 0.0, 12.0, None, red, &amount);
-                ui::row(ui, "Output gain", |ui| {
-                    slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
-                });
+                ui.label(RichText::new("Working on every word sounds like clipping: turn Loudness down (Home or Output).").small().color(p.text2));
             }),
             Node::Output => {
                 ui::setting(ui, icon::SPEAKERS, "Send to", "Where the cleaned sound goes. For Discord or other apps, pick CABLE Input; they then use CABLE Output as their mic", |ui| {
@@ -1403,24 +1777,11 @@ impl App {
                 if let (Some(r), Some(mon)) = (off_rate(2), &d.monitor) {
                     rate_note(ui, mon, r, convert);
                 }
-                ui::group(ui, icon::SPEAKERS, "What gets sent", "After every effect and the limiter", None, |ui| {
+                ui::group(ui, icon::SPEAKERS, "What gets sent", "After every effect and the clip guard. Setup has the steps for Discord", None, |ui| {
                     level_row(ui, "Out", m.out_db);
-                    ui::row(ui, "Output gain", |ui| {
+                    ui::row(ui, "Loudness (output gain)", |ui| {
                         slider(ui, &mut pr.output_gain_db, -20.0..=30.0, " dB");
                     });
-                });
-                section(ui, "Using it with Discord");
-                ui::card(ui, |ui| {
-                    for step in [
-                        "1. Install VB-Cable (free, vb-audio.com) and set Send to = CABLE Input above.",
-                        "2. In Windows Sound settings, set CABLE Input and CABLE Output to 48000 Hz (Properties → Advanced). Optional: rename CABLE Output to MicClean.",
-                        "3. Windows Settings → System → Sound → your mic: Audio enhancements = Off.",
-                        "4. In Discord, Voice & Video: Input Device = CABLE Output (or MicClean).",
-                        "5. Turn off Discord's Noise Suppression, Echo Cancellation and Automatic Gain Control.",
-                        "6. Turn off Automatic Input Sensitivity and drag its slider all the way left.",
-                    ] {
-                        ui.label(RichText::new(step).color(p.text2));
-                    }
                 });
             }
         }
@@ -1503,41 +1864,6 @@ impl App {
         if !self.learn_msg.is_empty() {
             ui.label(RichText::new(&self.learn_msg).color(p.text2));
         }
-    }
-
-    fn test(&mut self, ui: &mut egui::Ui) {
-        let p = ui::pal(ui);
-        let recording = self.record_progress.is_some();
-        let mut record = false;
-        ui::card(ui, |ui| {
-            ui::header(ui, icon::RECORD, "Record a test", "10 seconds of your raw mic. Talk, then sing a long note", |ui| {
-                record = ui::accent_button(ui, !recording && self.engine.is_some(), "Record").clicked();
-            });
-            if let Some(prog) = self.record_progress {
-                ui.add(egui::ProgressBar::new(prog).desired_height(4.0));
-            }
-        });
-        if record {
-            self.shared.lock().unwrap().record = Some(vec![0.0; RECORD_SECS * dsp::SR as usize]);
-        }
-
-        let has_clip = self.clip.is_some() && !recording;
-        let (mut original, mut processed, mut stop) = (false, false, false);
-        ui::setting(ui, icon::PLAY, "Play it back", "Processed runs the clip through your current settings: tweak, replay", |ui| {
-            stop = ui::icon_button(ui, self.playback.is_some(), icon::STOP, "Stop").clicked();
-            processed = ui::icon_button(ui, has_clip, icon::PLAY, "Processed").clicked();
-            original = ui::icon_button(ui, has_clip, icon::PLAY, "Original").clicked();
-        });
-        if original {
-            self.play(false);
-        }
-        if processed {
-            self.play(true);
-        }
-        if stop {
-            self.stop_playback();
-        }
-        ui.label(RichText::new("Plays on the Monitor device, or your default speakers if Monitor is off.").small().color(p.text2));
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
@@ -1746,6 +2072,36 @@ fn pick(ui: &mut egui::Ui, id: &str, v: &mut String, list: &[String]) {
             ui.selectable_value(v, n.clone(), n);
         }
     });
+}
+
+/// The less used settings of a box, folded away.
+fn more(ui: &mut egui::Ui, id: &str, body: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new("More settings").id_salt(id).show(ui, body);
+}
+
+/// Which input of a multi-channel device to use, or all of them mixed.
+fn channel_pick(ui: &mut egui::Ui, v: &mut Option<u16>, channels: u16) {
+    let shown = v.map_or("All, mixed".into(), |c| format!("Input {}", c + 1));
+    egui::ComboBox::from_id_salt("mic_ch").selected_text(shown).show_ui(ui, |ui| {
+        ui.selectable_value(v, None, "All, mixed");
+        for c in 0..channels {
+            ui.selectable_value(v, Some(c), format!("Input {}", c + 1));
+        }
+    });
+}
+
+/// "2  Where it goes  ✓": a Setup step's heading, above its card.
+fn step(ui: &mut egui::Ui, n: u32, title: &str, done: bool) {
+    let p = ui::pal(ui);
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(n.to_string()).font(ui::semibold(14.0)).color(p.accent));
+        ui.label(RichText::new(title).font(ui::semibold(14.0)));
+        if done {
+            ui.label(RichText::new(icon::CHECK).font(ui::icon_font(12.0)).color(p.good));
+        }
+    });
+    ui.add_space(2.0);
 }
 
 fn pick_opt(ui: &mut egui::Ui, id: &str, v: &mut Option<String>, list: &[String], none: &str) {

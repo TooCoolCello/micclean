@@ -10,7 +10,9 @@ A small Windows app that cleans up your microphone before Discord (or anything e
   get tried on that recording so your loudest words stay clear of the limiter. Undo, and a
   Suggest button in each effect
 - Record 10 seconds, then compare the original with the processed version
-- Picks one input of an audio interface (Windows shows e.g. "Analogue 1 + 2" as one device)
+- Setup walks you through your mic (and which input of an audio interface it's on), VB-Cable,
+  headphones or speakers, then Smart setup. Home keeps the everyday switches and says what to
+  fix when something's off; every effect and setting is under Advanced
 - Lives in the tray, can start with Windows, reconnects if the mic is unplugged
 
 ## Install

@@ -408,6 +408,20 @@ pub fn meter(ui: &mut egui::Ui, width: f32, value: f32, lo: f32, hi: f32, mark: 
     }
 }
 
+/// Full-width level bar over a shaded band for where it should sit, e.g. a good talking level.
+pub fn zone_meter(ui: &mut egui::Ui, width: f32, value: f32, lo: f32, hi: f32, zone: (f32, f32), color: Color32) {
+    let pal = ui::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 12.0), Sense::hover());
+    let x = |v: f32| rect.left() + rect.width() * ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, pal.control_stroke);
+    painter.rect_filled(Rect::from_x_y_ranges(x(zone.0)..=x(zone.1), rect.y_range()), 0.0, pal.good.gamma_multiply(0.35));
+    let y = rect.center().y;
+    if value > lo {
+        painter.rect_filled(Rect::from_x_y_ranges(rect.left()..=x(value), y - 3.0..=y + 3.0), 3.0, color);
+    }
+}
+
 /// A row with a meter and a readout, e.g. "Sibilance  [=====|   ]  -18 dB".
 #[allow(clippy::too_many_arguments)]
 pub fn meter_row(ui: &mut egui::Ui, label: &str, value: f32, lo: f32, hi: f32, mark: Option<f32>, color: Color32, text: &str) {

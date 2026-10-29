@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Input channels with their own level meter.
+pub const MAX_CH: usize = 8;
+
 /// GUI <-> mic callback mailbox. The callback only ever try_locks it.
 #[derive(Default)]
 pub struct Shared {
@@ -34,6 +37,9 @@ pub struct Shared {
     pub viz: bool,
     pub latency: Arc<Latency>,
     pub meters: Meters,
+    /// Peak (linear) of each input channel since the GUI last looked, before one is picked,
+    /// so Setup can show which input your voice is on.
+    pub channel_peak: [f32; MAX_CH],
     /// Dropped or late capture buffers (cpal Xrun). The stream keeps running, so these are
     /// only counted, with the device that reported the last one.
     pub glitches: u32,
@@ -61,6 +67,12 @@ pub struct Devices {
     /// What you listen on (speakers, or open-back headphones), cancelled out of the mic.
     /// None = no echo cancellation.
     pub echo_ref: Option<String>,
+}
+
+/// Windows' default playback device: usually what you listen on.
+pub fn default_output_name() -> Option<String> {
+    let d = cpal::default_host().default_output_device()?;
+    d.description().ok().map(|d| d.name().to_string())
 }
 
 pub fn device_names(input: bool) -> Vec<String> {
@@ -180,10 +192,12 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     let mut starved = 0;
     let (mut rec, mut rec_pos) = (None::<Vec<f32>>, 0);
     let mut mute_monitor = false;
+    let mut ch_peak = [0.0f32; MAX_CH];
     let sh = shared.clone();
 
-    streams.push(open_input(&mic, &mic_cfg, dev.input_channel, shared, move |mono, lag| {
+    streams.push(open_input(&mic, &mic_cfg, dev.input_channel, shared, move |mono, peaks, lag| {
         latency.capture_us.store(lag.as_micros() as u32, Relaxed);
+        ch_peak.iter_mut().zip(peaks).for_each(|(a, p)| *a = a.max(*p));
         for &s in mono {
             acc.push(s);
             if acc.len() < frame_in {
@@ -209,6 +223,8 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
                     rec = Some(buf);
                     rec_pos = 0;
                 }
+                // The GUI empties these when it reads them.
+                sh.channel_peak.iter_mut().zip(std::mem::take(&mut ch_peak)).for_each(|(a, p)| *a = a.max(p));
                 sh.record_progress = rec.as_ref().map(|r| rec_pos as f32 / r.len() as f32);
                 if rec.as_ref().is_some_and(|r| rec_pos == r.len()) {
                     sh.recorded = rec.take();
@@ -280,7 +296,7 @@ fn open_echo_ref(
     }
     let (mut prod, cons) = HeapRb::<f32>::new(ref_rate as usize).split();
     // Input stream on an output device = WASAPI loopback of what it plays.
-    let stream = open_input(&spk, &cfg, None, shared, move |mono, _| {
+    let stream = open_input(&spk, &cfg, None, shared, move |mono, _, _| {
         prod.push_slice(mono);
     })?;
     Ok((stream, cons, ref_rate))
@@ -312,19 +328,20 @@ pub fn play(name: Option<&str>, clip: Vec<f32>) -> Result<cpal::Stream, String> 
 }
 
 /// Opens a capture stream in the device's native format and hands the callback mono f32 (one
-/// `channel`, or all of them mixed), plus how long ago the device captured it.
+/// `channel`, or all of them mixed), each channel's peak, and how long ago the device
+/// captured it.
 fn open_input(
     dev: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
     channel: Option<u16>,
     shared: Arc<Mutex<Shared>>,
-    f: impl FnMut(&[f32], Duration) + Send + 'static,
+    f: impl FnMut(&[f32], &[f32; MAX_CH], Duration) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
     fn build<T>(
         dev: &cpal::Device,
         sc: cpal::StreamConfig,
         channel: Option<u16>,
-        mut f: impl FnMut(&[f32], Duration) + Send + 'static,
+        mut f: impl FnMut(&[f32], &[f32; MAX_CH], Duration) + Send + 'static,
         err: impl FnMut(cpal::Error) + Send + 'static,
     ) -> Result<cpal::Stream, cpal::Error>
     where
@@ -338,13 +355,17 @@ fn open_input(
         dev.build_input_stream(
             sc,
             move |d: &[T], info: &cpal::InputCallbackInfo| {
+                let mut peaks = [0.0f32; MAX_CH];
                 mono.clear();
-                mono.extend(d.chunks(ch).map(|fr| match channel {
-                    Some(c) => fr[c].to_sample::<f32>(),
-                    None => fr.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / ch as f32,
+                mono.extend(d.chunks(ch).map(|fr| {
+                    peaks.iter_mut().zip(fr).for_each(|(p, s)| *p = p.max(s.to_sample::<f32>().abs()));
+                    match channel {
+                        Some(c) => fr[c].to_sample::<f32>(),
+                        None => fr.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / ch as f32,
+                    }
                 }));
                 let ts = info.timestamp();
-                f(&mono, ts.callback.duration_since(ts.capture));
+                f(&mono, &peaks, ts.callback.duration_since(ts.capture));
             },
             err,
             None,
