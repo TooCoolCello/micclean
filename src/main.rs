@@ -373,6 +373,8 @@ struct App {
     smart_undo: Option<Params>,
     /// Windows' rate for the input, output and monitor devices, looked up on each restart.
     rates: [Option<u32>; 3],
+    /// How many channels the input device has, for its channel picker.
+    in_channels: u16,
     show_notices: bool,
     /// What the log file already has, so it gets changes only.
     logged_status: String,
@@ -463,6 +465,7 @@ impl App {
             smart_report: Vec::new(),
             smart_undo: None,
             rates: [None; 3],
+            in_channels: 1,
             show_notices: false,
             logged_status: String::new(),
             logged_glitches: 0,
@@ -498,8 +501,11 @@ impl App {
         self.last_beat = Instant::now();
         self.needs_restart = false;
         let d = &self.saved.devices;
-        let rate = |input, name: &str| if name.is_empty() { None } else { audio::device_rate(input, name) };
-        self.rates = [rate(true, &d.input), rate(false, &d.output), d.monitor.as_deref().and_then(|n| rate(false, n))];
+        let format = |input, name: &str| if name.is_empty() { None } else { audio::device_format(input, name) };
+        let mic = format(true, &d.input);
+        self.in_channels = mic.map_or(1, |f| f.1);
+        let rate = |name: &str| format(false, name).map(|f| f.0);
+        self.rates = [mic.map(|f| f.0), rate(&d.output), d.monitor.as_deref().and_then(rate)];
         if self.saved.devices.input.is_empty() || self.saved.devices.output.is_empty() {
             self.status = "Click Input and Output in the signal chain to pick your devices.".into();
             return;
@@ -1205,7 +1211,7 @@ impl App {
         let (shown, hold) = (self.ab_shown, &mut self.ab_hold);
         let (agc_hist, pitch_hist, eq_ui) = (&self.agc_hist, &self.pitch_hist, &mut self.eq_ui);
         let (d, inputs, outputs) = (&mut self.saved.devices, &self.inputs, &self.outputs);
-        let rates = self.rates;
+        let (rates, in_channels) = (self.rates, self.in_channels);
         let off_rate = |i: usize| rates[i].filter(|&r| r != dsp::SR as u32);
         let pr = &mut self.saved.params;
         let mut refresh = false;
@@ -1214,8 +1220,25 @@ impl App {
             Node::Input => {
                 ui::setting(ui, icon::MIC, "Input device", "The mic or line input to clean up", |ui| {
                     refresh |= refresh_button(ui);
+                    let before = d.input.clone();
                     pick(ui, "mic", &mut d.input, inputs);
+                    if d.input != before {
+                        d.input_channel = None;
+                    }
                 });
+                // Audio interfaces show up in Windows as one device for all their inputs.
+                if in_channels > 1 {
+                    let desc = "Which of the device's inputs your mic is plugged into. Mixing them makes a mic on one input 6 dB quieter and adds the other's hiss";
+                    ui::setting(ui, icon::MIC, "Channel", desc, |ui| {
+                        let shown = d.input_channel.map_or("All, mixed".into(), |c| format!("Input {}", c + 1));
+                        egui::ComboBox::from_id_salt("mic_ch").selected_text(shown).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut d.input_channel, None, "All, mixed");
+                            for c in 0..in_channels {
+                                ui.selectable_value(&mut d.input_channel, Some(c), format!("Input {}", c + 1));
+                            }
+                        });
+                    });
+                }
                 if let Some(r) = off_rate(0) {
                     let desc = "MicClean converts it to 48000 Hz. Setting the device to 48000 Hz in Windows skips that step";
                     rate_note(ui, &d.input, r, desc);

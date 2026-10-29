@@ -53,6 +53,9 @@ pub struct Latency {
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Devices {
     pub input: String,
+    /// The one input channel to use (0 = input 1), for interfaces Windows shows as a single
+    /// stereo device like "Analogue 1 + 2". None = all channels mixed together.
+    pub input_channel: Option<u16>,
     pub output: String,
     pub monitor: Option<String>,
     /// What you listen on (speakers, or open-back headphones), cancelled out of the mic.
@@ -67,11 +70,11 @@ pub fn device_names(input: bool) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The rate Windows runs a device at (its shared-mode mix format).
-pub fn device_rate(input: bool, name: &str) -> Option<u32> {
+/// The rate and channel count Windows runs a device at (its shared-mode mix format).
+pub fn device_format(input: bool, name: &str) -> Option<(u32, u16)> {
     let d = find(input, name).ok()?;
     let cfg = if input { d.default_input_config() } else { d.default_output_config() };
-    cfg.ok().map(|c| c.sample_rate())
+    cfg.ok().map(|c| (c.sample_rate(), c.channels()))
 }
 
 fn find(input: bool, name: &str) -> Result<cpal::Device, String> {
@@ -118,6 +121,9 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     }
     let mut streams = Vec::new();
     let mut info = format!("mic {} Hz {} ch", rate, mic_cfg.channels());
+    if let Some(c) = dev.input_channel {
+        info += &format!(" (input {})", c + 1);
+    }
 
     let mut missing = Vec::new();
     let mut outs = Vec::new(); // (ring, is_monitor)
@@ -176,7 +182,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     let mut mute_monitor = false;
     let sh = shared.clone();
 
-    streams.push(open_input(&mic, &mic_cfg, shared, move |mono, lag| {
+    streams.push(open_input(&mic, &mic_cfg, dev.input_channel, shared, move |mono, lag| {
         latency.capture_us.store(lag.as_micros() as u32, Relaxed);
         for &s in mono {
             acc.push(s);
@@ -274,7 +280,7 @@ fn open_echo_ref(
     }
     let (mut prod, cons) = HeapRb::<f32>::new(ref_rate as usize).split();
     // Input stream on an output device = WASAPI loopback of what it plays.
-    let stream = open_input(&spk, &cfg, shared, move |mono, _| {
+    let stream = open_input(&spk, &cfg, None, shared, move |mono, _| {
         prod.push_slice(mono);
     })?;
     Ok((stream, cons, ref_rate))
@@ -305,17 +311,19 @@ pub fn play(name: Option<&str>, clip: Vec<f32>) -> Result<cpal::Stream, String> 
     Ok(stream)
 }
 
-/// Opens a capture stream in the device's native format and hands the callback mono f32,
-/// plus how long ago the device captured it.
+/// Opens a capture stream in the device's native format and hands the callback mono f32 (one
+/// `channel`, or all of them mixed), plus how long ago the device captured it.
 fn open_input(
     dev: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
+    channel: Option<u16>,
     shared: Arc<Mutex<Shared>>,
     f: impl FnMut(&[f32], Duration) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
     fn build<T>(
         dev: &cpal::Device,
         sc: cpal::StreamConfig,
+        channel: Option<u16>,
         mut f: impl FnMut(&[f32], Duration) + Send + 'static,
         err: impl FnMut(cpal::Error) + Send + 'static,
     ) -> Result<cpal::Stream, cpal::Error>
@@ -324,12 +332,17 @@ fn open_input(
         f32: FromSample<T>,
     {
         let ch = sc.channels as usize;
+        // A channel the device no longer has (set to fewer in Windows) mixes them all.
+        let channel = channel.map(usize::from).filter(|&c| c < ch);
         let mut mono = Vec::new();
         dev.build_input_stream(
             sc,
             move |d: &[T], info: &cpal::InputCallbackInfo| {
                 mono.clear();
-                mono.extend(d.chunks(ch).map(|fr| fr.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / ch as f32));
+                mono.extend(d.chunks(ch).map(|fr| match channel {
+                    Some(c) => fr[c].to_sample::<f32>(),
+                    None => fr.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / ch as f32,
+                }));
                 let ts = info.timestamp();
                 f(&mono, ts.callback.duration_since(ts.capture));
             },
@@ -340,9 +353,9 @@ fn open_input(
     let err = on_error(shared, dev.description().map(|d| d.name().to_string()).unwrap_or_default());
     let sc = cfg.config();
     let stream = match cfg.sample_format() {
-        cpal::SampleFormat::F32 => build::<f32>(dev, sc, f, err),
-        cpal::SampleFormat::I16 => build::<i16>(dev, sc, f, err),
-        cpal::SampleFormat::I32 => build::<i32>(dev, sc, f, err),
+        cpal::SampleFormat::F32 => build::<f32>(dev, sc, channel, f, err),
+        cpal::SampleFormat::I16 => build::<i16>(dev, sc, channel, f, err),
+        cpal::SampleFormat::I32 => build::<i32>(dev, sc, channel, f, err),
         other => return Err(format!("unsupported sample format {other}")),
     }
     .map_err(es)?;
@@ -435,7 +448,7 @@ mod tests {
         let input = name(host.default_input_device()).expect("no input device");
         let output = name(host.default_output_device()).expect("no output device");
         println!("in: {input}\nout: {output}");
-        let dev = Devices { input, output: output.clone(), monitor: None, echo_ref: Some(output) };
+        let dev = Devices { input, output: output.clone(), echo_ref: Some(output), ..Devices::default() };
         let shared = Arc::new(Mutex::new(Shared::default()));
         let engine = start(&dev, shared.clone()).expect("start");
         println!("{}", engine.info);
