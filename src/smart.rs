@@ -51,6 +51,10 @@ const PEAK_ROOM: f32 = -12.0;
 /// land near -12 dBFS. Auto level then takes it to its own target, whatever that is.
 const INPUT_LEVEL: f32 = -26.0;
 
+/// Your loudest peaks while reading reach at most this (dBFS) at the output, so the limiter
+/// is left for shouts. Working on every word, it squashes the voice and sounds like clipping.
+const OUT_PEAK: f32 = -6.0;
+
 /// The highest Smart setup raises the low cut for room rumble. It never lowers yours.
 const MAX_LOW_CUT: f32 = 170.0;
 
@@ -139,6 +143,12 @@ pub fn analyse(p: &Params, quiet: &[Quiet], talk: &[Take]) -> Result<Outcome, St
         p.input_gain_db,
         talk.len()
     );
+    let raw = voice - p.input_gain_db;
+    if raw < -50.0 {
+        notes.push(format!(
+            "Your voice arrives very quiet ({raw:.0} dB before any gain here). If your mic or audio interface has a gain knob, turning it up there is cleaner than adding gain here."
+        ));
+    }
     let shift = s.input_gain_db - p.input_gain_db;
     let (noise_s, voice_s) = (noise + shift, voice + shift);
 
@@ -204,6 +214,32 @@ pub fn analyse(p: &Params, quiet: &[Quiet], talk: &[Take]) -> Result<Outcome, St
     s.comp_threshold_db = (c50 - 6.0).clamp(-50.0, 0.0).round();
     s.comp_makeup_db = step((c50 - s.comp_threshold_db).max(0.0) * (1.0 - 1.0 / s.comp_ratio)).clamp(0.0, 12.0);
     Ok(Outcome { params: s, full_eq, notes, measured })
+}
+
+/// Output gain for `p` that keeps your loudest peaks while reading at OUT_PEAK or under, found
+/// by playing the setup recording (`audio`, before input gain) through it. Gains set by hand
+/// to make up for a quiet input would otherwise push every word into the limiter once the
+/// input gain is right. Measured rather than worked out from the compressor's curve: the
+/// compressor lets the first few ms of each peak through, up to 6 dB over its curve. Only
+/// ever turns the output down.
+pub fn output_gain(p: &Params, prof: &dsp::Profiles, audio: &[f32]) -> f32 {
+    // 20 dB down, so the limiter never touches what is measured.
+    let quiet = Params { output_gain_db: -20.0, ..p.clone() };
+    let mut chain = dsp::Chain::default();
+    let mut peaks = Vec::new();
+    // Twice, so auto level has settled the second time as it has in use.
+    for pass in 0..2 {
+        for f in audio.to_vec().chunks_exact_mut(dsp::FRAME) {
+            chain.process(&quiet, prof, f);
+            if pass == 1 && chain.meters.vad >= 0.5 {
+                peaks.push(chain.meters.out_db + 20.0);
+            }
+        }
+    }
+    if peaks.len() < 60 {
+        return p.output_gain_db;
+    }
+    p.output_gain_db.min(step(OUT_PEAK - pct(&mut peaks, 0.99))).max(-20.0)
 }
 
 /// Never below your current low cut. Otherwise 3/4 of your lowest notes, or higher (up to
@@ -328,6 +364,7 @@ pub fn changes(old: &Params, new: &Params) -> Vec<String> {
         "Compressor",
         &[db("threshold ", old.comp_threshold_db, new.comp_threshold_db), ratio, db("makeup ", old.comp_makeup_db, new.comp_makeup_db)],
     );
+    line("Output", &[db("gain ", old.output_gain_db, new.output_gain_db)]);
     out
 }
 
@@ -438,11 +475,26 @@ mod tests {
     /// Smart setup on a recording, through the real chain:
     /// `MC_WAV=voice.wav cargo test smart_on_wav -- --ignored --nocapture` (16-bit PCM, 48 kHz).
     /// 3 s of faint noise go first as the room, and the same noise stays under the voice. Runs
-    /// with the defaults, then with hand-tuned settings and a quiet mic, without and with fan
-    /// rumble (120 + 160 Hz).
+    /// with the defaults, with hand-tuned settings and a quiet mic, without and with fan rumble
+    /// (120 + 160 Hz), and with settings tuned by hand around a very quiet input (voice -61 dB
+    /// raw, as measured on a real one). Each run then plays the recording through the settings
+    /// from before and after, to show what the limiter does.
     #[test]
     #[ignore]
     fn smart_on_wav() {
+        /// Plays `x` through `p` twice, so auto level has settled the second time as it has in
+        /// use, and shows each frame's meters from the second time.
+        fn play(x: &[f32], p: &Params, mut each: impl FnMut(usize, &dsp::Meters)) {
+            let (mut chain, prof) = (dsp::Chain::default(), dsp::Profiles::default());
+            for pass in 0..2 {
+                for (i, f) in x.to_vec().chunks_exact_mut(dsp::FRAME).enumerate() {
+                    chain.process(p, &prof, f);
+                    if pass == 1 {
+                        each(i, &chain.meters);
+                    }
+                }
+            }
+        }
         let bytes = std::fs::read(std::env::var("MC_WAV").expect("set MC_WAV")).unwrap();
         assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 48_000, "needs 48 kHz");
         let ch = u16::from_le_bytes([bytes[22], bytes[23]]) as usize;
@@ -461,39 +513,78 @@ mod tests {
             ],
             ..Params::default()
         };
-        let runs = [("defaults", Params::default(), 0.0, false), ("tuned, quiet mic", tuned.clone(), -24.0, false), ("tuned, quiet mic, rumble", tuned, -24.0, true)];
-        for (name, base, voice_db, rumble) in runs {
-            let (k, mut seed) = (10f32.powf(voice_db / 20.0), 1u32);
-            let mut x: Vec<f32> = std::iter::repeat_n(0.0, 3 * 48_000)
+        // As saved when a real Smart setup measured voice -45 dB RMS at +16 dB input gain.
+        let quiet_input = Params {
+            input_gain_db: 16.0,
+            gate_threshold_db: -74.0,
+            agc_target_db: -14.0,
+            bands: [band(BandKind::LowCut, 170.0, 0.0, 0.707), None, None, band(BandKind::Bell, 3200.0, 1.0, 1.0), None],
+            deess_threshold_db: -23.0,
+            comp_threshold_db: -14.0,
+            output_gain_db: 4.0,
+            ..Params::default()
+        };
+        // Name, settings, voice and noise level (dB), rumble.
+        let runs = [
+            ("defaults", Params::default(), 0.0, 0.0, false),
+            ("tuned, quiet mic", tuned.clone(), -24.0, 0.0, false),
+            ("tuned, quiet mic, rumble", tuned, -24.0, 0.0, true),
+            ("tuned around a very quiet input", quiet_input, -41.0, -41.0, false),
+        ];
+        for (name, base, voice_db, noise_db, rumble) in runs {
+            let (k, kn, mut seed) = (10f32.powf(voice_db / 20.0), 10f32.powf(noise_db / 20.0), 1u32);
+            let x: Vec<f32> = std::iter::repeat_n(0.0, 3 * 48_000)
                 .chain(voice.iter().map(|s| s * k))
                 .enumerate()
                 .map(|(n, s)| {
                     seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                     let t = std::f32::consts::TAU * n as f32 / 48_000.0;
                     let hum = if rumble { 0.0015 * ((120.0 * t).sin() + (160.0 * t).sin()) } else { 0.0 };
-                    s + ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.002 + hum // noise about -65 dBFS
+                    s + ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.002 * kn + hum // noise about -65 dBFS
                 })
                 .collect();
             // What the app runs during setup: the gate open, the de-esser and compressor on.
             let p = Params { gate: false, deess: true, comp: true, ..base.clone() };
-            let (mut chain, prof) = (dsp::Chain::default(), dsp::Profiles::default());
             let (mut quiet, mut talk) = (Vec::new(), Vec::new());
-            for (i, f) in x.chunks_exact_mut(dsp::FRAME).enumerate() {
-                chain.process(&p, &prof, f);
-                let m = &chain.meters;
+            play(&x, &p, |i, m| {
                 if (50..300).contains(&i) {
                     quiet.push(Quiet { level: m.gate_level_db, peak: m.in_db, bands: m.bands_db });
                 } else if i >= 300 && m.vad >= 0.5 {
                     let (level, peak, agc, deess, comp) = (m.gate_level_db, m.in_db, m.agc_db, m.deess_level_db, m.comp_in_db);
                     talk.push(Take { level, peak, agc, deess, comp, pitch: m.pitch_hz, bands: m.bands_db });
                 }
-            }
-            let o = analyse(&base, &quiet, &talk).unwrap();
-            println!("== {name}: {}", o.measured);
+            });
+            let mut o = analyse(&base, &quiet, &talk).unwrap();
+            let t0 = std::time::Instant::now();
+            o.params.output_gain_db = output_gain(&o.params, &dsp::Profiles::default(), &x[..(17 * 48_000).min(x.len()) / dsp::FRAME * dsp::FRAME]);
+            println!("== {name}: {} (output gain found in {:.2} s)", o.measured, t0.elapsed().as_secs_f32());
             for line in changes(&base, &o.params).iter().chain(&o.notes) {
                 println!("{line}");
             }
+            for (when, p) in [("before", &base), ("after", &o.params)] {
+                let (mut lim, mut out) = (Vec::new(), Vec::new());
+                play(&x, p, |i, m| {
+                    if i >= 300 && m.vad >= 0.5 {
+                        lim.push(m.lim_db);
+                        out.push(m.out_db);
+                    }
+                });
+                let busy = lim.iter().filter(|&&l| l > 0.5).count() * 100 / lim.len();
+                let (out50, out99, lim95) = (pct(&mut out, 0.5), pct(&mut out, 0.99), pct(&mut lim, 0.95));
+                println!("  {when}: output peaks {out50:.1} typical / {out99:.1} loudest dBFS, limiter on {busy}% of words, {lim95:.1} dB at most on 95%");
+            }
         }
+    }
+
+    #[test]
+    fn output_gain_keeps_the_loudest_peaks_at_minus_6_and_never_turns_up() {
+        // Every effect off: what goes in comes out, so peaks are the recording's own.
+        let p = Params { denoise: false, gate: false, agc: false, eq: false, deess: false, comp: false, output_gain_db: 4.0, ..Params::default() };
+        let tone = |amp: f32| -> Vec<f32> { (0..200 * dsp::FRAME).map(|n| amp * (n as f32 * 0.05).sin()).collect() };
+        let prof = dsp::Profiles::default();
+        assert_eq!(output_gain(&p, &prof, &tone(1.0)), -6.0, "peaks at 0 dBFS: 6 dB down");
+        assert_eq!(output_gain(&p, &prof, &tone(0.1)), 4.0, "peaks at -20 dBFS: left at +4, not raised");
+        assert_eq!(output_gain(&p, &prof, &tone(1.0)[..30 * dsp::FRAME]), 4.0, "too short to judge");
     }
 
     #[test]

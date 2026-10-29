@@ -279,7 +279,7 @@ impl Node {
     }
 
     /// The boxes Smart setup chooses settings for.
-    const SMART: [Node; 6] = [Node::Input, Node::Noise, Node::Gate, Node::Eq, Node::Deess, Node::Comp];
+    const SMART: [Node; 8] = [Node::Input, Node::Noise, Node::Gate, Node::Eq, Node::Deess, Node::Comp, Node::Limiter, Node::Output];
 
     /// Copies what Smart setup chose (`s`) for this box. Other boxes are left alone.
     fn suggest(self, p: &mut Params, s: &Params) {
@@ -291,7 +291,8 @@ impl Node {
             Node::Eq => p.bands = s.bands,
             Node::Deess => p.deess_threshold_db = s.deess_threshold_db,
             Node::Comp => (p.comp_threshold_db, p.comp_ratio, p.comp_makeup_db) = (s.comp_threshold_db, s.comp_ratio, s.comp_makeup_db),
-            Node::Echo | Node::Level | Node::Limiter | Node::Output => {}
+            Node::Limiter | Node::Output => p.output_gain_db = s.output_gain_db,
+            Node::Echo | Node::Level => {}
         }
     }
 }
@@ -303,6 +304,8 @@ struct Calib {
     frame: u64,
     quiet: Vec<smart::Quiet>,
     talk: Vec<smart::Take>,
+    /// Your mic before the chain, to try the chosen settings on. Arrives just before the end.
+    audio: Option<Vec<f32>>,
 }
 
 const CALIB_QUIET: f32 = 3.0;
@@ -584,8 +587,13 @@ impl App {
             sh.profiles = self.saved.profiles.clone();
             sh.profiles_ver += 1;
         }
-        if let Some(clip) = sh.recorded.take() {
-            self.clip = Some(clip);
+        // Smart setup's own recording while it runs, otherwise the test page's. Empty ones
+        // were stopped.
+        if let Some(clip) = sh.recorded.take().filter(|c| !c.is_empty()) {
+            match &mut self.calib {
+                Some(c) => c.audio = Some(clip),
+                None => self.clip = Some(clip),
+            }
         }
         self.record_progress = sh.record_progress;
         if let Some(e) = sh.error.take() {
@@ -649,6 +657,11 @@ impl App {
         }
     }
 
+    /// An empty buffer ends a recording at once.
+    fn stop_recording(&self) {
+        self.shared.lock().unwrap().record = Some(Vec::new());
+    }
+
     /// Samples the meters once per audio frame while Smart setup runs, then applies what it
     /// chose and keeps the old settings for Undo.
     fn smart_step(&mut self) {
@@ -656,9 +669,20 @@ impl App {
         let t = c.start.elapsed().as_secs_f32();
         if t >= CALIB_END {
             let c = self.calib.take().expect("checked above");
+            if c.audio.is_none() {
+                // Not back in time (the audio restarted?): it mustn't turn up as a test clip.
+                self.stop_recording();
+            }
             match smart::analyse(&self.saved.params, &c.quiet, &c.talk) {
-                Ok(o) => {
+                Ok(mut o) => {
                     logfile::line(&format!("Smart setup {}", o.measured));
+                    if let Some(audio) = &c.audio {
+                        let before = o.params.output_gain_db;
+                        o.params.output_gain_db = smart::output_gain(&o.params, &self.saved.profiles, audio);
+                        if o.params.output_gain_db < before {
+                            o.notes.push("Output turned down so your loudest words stay 6 dB under the limiter. Working on every word, it squashes them and sounds like clipping.".into());
+                        }
+                    }
                     let old = self.saved.params.clone();
                     for n in Node::SMART {
                         n.suggest(&mut self.saved.params, &o.params);
@@ -1092,18 +1116,16 @@ impl App {
     /// the passage and a progress bar show here; afterwards what changed, with Undo.
     fn smart_card(&mut self, ui: &mut egui::Ui) {
         let p = ui::pal(ui);
-        let can_start = self.engine.is_some() && !self.saved.params.bypass;
-        let (calib, report, has_undo) = (&mut self.calib, &self.smart_report, self.smart_undo.is_some());
-        let (mut start, mut undo) = (false, false);
+        let can_start = self.engine.is_some() && !self.saved.params.bypass && self.record_progress.is_none();
+        let (calib, report, has_undo) = (&self.calib, &self.smart_report, self.smart_undo.is_some());
+        let (mut start, mut cancel, mut undo) = (false, false, false);
         ui::card(ui, |ui| {
             let desc = "Listens to your room for 3 seconds and to you reading for 15, then sets each effect for your voice";
             ui::header(ui, icon::SMART, "Smart setup", desc, |ui| {
                 if calib.is_some() {
-                    if ui.button("Cancel").clicked() {
-                        *calib = None;
-                    }
+                    cancel = ui.button("Cancel").clicked();
                 } else {
-                    start = ui::accent_button(ui, can_start, "Start").on_disabled_hover_text("Needs audio running and Bypass off").clicked();
+                    start = ui::accent_button(ui, can_start, "Start").on_disabled_hover_text("Needs audio running, Bypass off and no test recording running").clicked();
                 }
             });
             if let Some(c) = calib {
@@ -1128,8 +1150,14 @@ impl App {
             }
         });
         if start {
-            self.calib = Some(Calib { start: Instant::now(), frame: 0, quiet: Vec::new(), talk: Vec::new() });
+            self.calib = Some(Calib { start: Instant::now(), frame: 0, quiet: Vec::new(), talk: Vec::new(), audio: None });
+            // A second shorter than setup, so it's back in time.
+            self.shared.lock().unwrap().record = Some(vec![0.0; (CALIB_END as usize - 1) * dsp::SR as usize]);
             self.smart_report.clear();
+        }
+        if cancel {
+            self.calib = None;
+            self.stop_recording();
         }
         if undo && let Some(old) = self.smart_undo.take() {
             self.saved.params = Params { bypass: self.saved.params.bypass, ..old };
