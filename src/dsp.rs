@@ -144,17 +144,42 @@ pub enum Kind {
     Keep,
 }
 
-/// Diagonal-Gaussian model of log band energies for one learned sound.
+/// Diagonal-Gaussian model of one learned sound's spectral shape (log band energies minus
+/// their mean, so the same sound louder or quieter still matches), plus how quiet it gets.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Profile {
     pub mean: [f32; NB],
     pub var: [f32; NB],
+    /// Frames quieter than this (band level, dB) aren't this sound: the room around it. None
+    /// for profiles from before 0.6.2, which learned the room too and so matched everything.
+    #[serde(default)]
+    pub floor_db: Option<f32>,
+}
+
+/// A frame's spectral shape and level. Bands over 40 dB under its loudest one count as empty
+/// and sit at that floor: how empty they are is just noise. The level is the bands' mean and
+/// the shape is each band minus it.
+fn shape(f: &[f32; NB]) -> ([f32; NB], f32) {
+    let top = f.iter().fold(f32::MIN, |a, &b| a.max(b));
+    let g: [f32; NB] = std::array::from_fn(|i| f[i].max(top - 40.0));
+    let level = g.iter().sum::<f32>() / NB as f32;
+    (std::array::from_fn(|i| g[i] - level), level)
 }
 
 impl Profile {
-    /// Mean squared z-score: ~1 for a typical frame of this sound, large for others.
+    /// Mean squared z-score of the frame's shape: ~1 for a typical frame of this sound, large
+    /// for others, INFINITY when it's quieter than the sound ever was.
     fn dist(&self, f: &[f32; NB]) -> f32 {
-        (0..NB).map(|i| (f[i] - self.mean[i]).powi(2) / self.var[i]).sum::<f32>() / NB as f32
+        let (s, level) = shape(f);
+        match self.floor_db {
+            Some(floor) if level >= floor => (0..NB).map(|i| (s[i] - self.mean[i]).powi(2) / self.var[i]).sum::<f32>() / NB as f32,
+            _ => f32::INFINITY,
+        }
+    }
+
+    /// Learned before 0.6.2: it never matches, and the app asks for it to be learned again.
+    pub fn outdated(&self) -> bool {
+        self.floor_db.is_none()
     }
 }
 
@@ -272,9 +297,11 @@ pub struct Chain {
     an_out: Analyzer,
     an_clean: Analyzer,
     /// The window is on screen: compute the display-only spectra. Hidden in the tray, the
-    /// only FFT left is the one the learned-sound classifier needs.
+    /// FFTs left are the input bands (Smart setup) and the cleaned ones (learned sounds).
     pub viz: bool,
     learner: Option<Learner>,
+    /// Last frame's learned-sound match.
+    class: Option<Match>,
     learned: Option<(Kind, Option<Profile>)>,
     hold: u32,
     gate_gain: f32,
@@ -298,6 +325,7 @@ impl Default for Chain {
             an_clean: Analyzer::new(),
             viz: false,
             learner: None,
+            class: None,
             learned: None,
             hold: 0,
             gate_gain: 1.0,
@@ -371,22 +399,9 @@ impl Chain {
         self.learned.take()
     }
 
-    pub fn process(&mut self, p: &Params, prof: &Profiles, x: &mut [f32]) {
-        assert_eq!(x.len(), FRAME);
-        self.meters.frames += 1;
-        let g = db2lin(p.input_gain_db);
-        x.iter_mut().for_each(|s| *s *= g);
-        self.meters.in_db = peak_db(x);
-
-        // Analysis runs on the raw frame so learning still works while bypassed.
-        self.an_in.push(x);
-        if self.viz {
-            self.an_in.display(&mut self.meters.spec_in);
-        }
-        let bands = self.an_in.features();
-        self.meters.bands_db = bands;
+    fn learn_step(&mut self, f: &[f32; NB]) {
         if let Some(l) = &mut self.learner {
-            l.add(&bands, rms_db(x));
+            l.add(f);
             self.meters.learning = Some((l.kind, l.progress()));
             if l.left == 0 {
                 self.learned = Some((l.kind, l.finish()));
@@ -394,15 +409,26 @@ impl Chain {
                 self.meters.learning = None;
             }
         }
+    }
+
+    pub fn process(&mut self, p: &Params, prof: &Profiles, x: &mut [f32]) {
+        assert_eq!(x.len(), FRAME);
+        self.meters.frames += 1;
+        let g = db2lin(p.input_gain_db);
+        x.iter_mut().for_each(|s| *s *= g);
+        self.meters.in_db = peak_db(x);
+
+        self.an_in.push(x);
+        if self.viz {
+            self.an_in.display(&mut self.meters.spec_in);
+        }
+        self.meters.bands_db = self.an_in.features();
         let f0 = self.pitch.push(x);
-        let class = prof.classify(&bands, p.learn_match, &mut self.meters);
         self.meters.pitch_hz = f0;
-        self.meters.noise_match = match class {
-            Some(Match::Noise(i)) => Some(i),
-            _ => None,
-        };
 
         if p.bypass {
+            // Nothing is cleaned: a learn run takes the raw sound rather than stall.
+            self.learn_step(&self.meters.bands_db.clone());
             self.meters.out_db = peak_db(x);
             self.meters.gr_db = 0.0;
             self.meters.reason = "bypassed";
@@ -419,8 +445,9 @@ impl Chain {
             }
             vad = self.rnn.process_frame(&mut wet, &inp);
             // Pitch decides before the denoised frame comes out, so this is a free 10 ms lookahead.
+            // Learned sounds are matched after noise removal, so it goes by last frame's match.
             let singing = self.pitch.track(f0, vad >= p.vad_threshold);
-            let protect = if singing || class == Some(Match::Keep) { p.sing_protect } else { 0.0 };
+            let protect = if singing || self.class == Some(Match::Keep) { p.sing_protect } else { 0.0 };
             let target = p.denoise_strength * (1.0 - protect);
             // Energy in vs out over the same (delayed) frame: what noise removal took away.
             let (mut e_in, mut e_out) = (1e-12f32, 1e-12f32);
@@ -434,15 +461,26 @@ impl Chain {
             self.mix = target;
             let cut = (10.0 * (e_in / e_out).log10()).max(0.0);
             self.meters.denoise_db += (cut - self.meters.denoise_db) * 0.1;
-            if self.viz {
-                self.an_clean.push(x);
-                self.an_clean.display(&mut self.meters.spec_clean);
-            }
         } else {
             self.pitch.track(f0, false);
             self.meters.denoise_db = 0.0;
         }
         self.meters.vad = vad;
+
+        // Learned sounds are learned and told apart after noise removal: the room it takes out
+        // is neither part of a sound nor mistaken for one.
+        self.an_clean.push(x);
+        if self.viz && p.denoise {
+            self.an_clean.display(&mut self.meters.spec_clean);
+        }
+        let clean = self.an_clean.features();
+        self.learn_step(&clean);
+        let class = prof.classify(&clean, p.learn_match, &mut self.meters);
+        self.class = class;
+        self.meters.noise_match = match class {
+            Some(Match::Noise(i)) => Some(i),
+            _ => None,
+        };
 
         let singing = self.pitch.singing();
         let level = rms_db(x);
@@ -693,26 +731,19 @@ struct Learner {
     kind: Kind,
     total: u32,
     left: u32,
-    n: u32,
-    sum: [f64; NB],
-    sumsq: [f64; NB],
+    /// Every frame's band levels, kept so the quiet room around the sound can be left out at
+    /// the end. Allocated once when learning starts.
+    frames: Vec<[f32; NB]>,
 }
 
 impl Learner {
     fn new(kind: Kind, frames: u32) -> Self {
-        Self { kind, total: frames, left: frames, n: 0, sum: [0.0; NB], sumsq: [0.0; NB] }
+        Self { kind, total: frames, left: frames, frames: Vec::with_capacity(frames as usize) }
     }
 
-    fn add(&mut self, f: &[f32; NB], level_db: f32) {
+    fn add(&mut self, f: &[f32; NB]) {
         self.left = self.left.saturating_sub(1);
-        if level_db < -70.0 {
-            return; // digital silence teaches nothing
-        }
-        self.n += 1;
-        for i in 0..NB {
-            self.sum[i] += f[i] as f64;
-            self.sumsq[i] += (f[i] as f64).powi(2);
-        }
+        self.frames.push(*f);
     }
 
     fn progress(&self) -> f32 {
@@ -720,14 +751,32 @@ impl Learner {
     }
 
     fn finish(&self) -> Option<Profile> {
-        if self.n < 20 {
+        let pct = |mut v: Vec<f32>, q: f32| {
+            v.sort_by(f32::total_cmp);
+            v[((v.len() - 1) as f32 * q) as usize]
+        };
+        let frames: Vec<([f32; NB], f32)> = self.frames.iter().map(shape).collect();
+        if frames.is_empty() {
             return None;
         }
-        let n = self.n as f64;
-        let mean = std::array::from_fn(|i| (self.sum[i] / n) as f32);
+        // The sound is the louder half between the room (quietest 10%) and its loud parts. A
+        // steady sound like a fan has no quiet part, so all of it counts.
+        let levels = || frames.iter().map(|f| f.1).collect::<Vec<f32>>();
+        let (lo, hi) = (pct(levels(), 0.1), pct(levels(), 0.95));
+        let cut = if hi - lo < 10.0 { f32::NEG_INFINITY } else { (lo + hi) / 2.0 };
+        // Below -110 dB is digital silence, which teaches nothing.
+        let kept: Vec<&([f32; NB], f32)> = frames.iter().filter(|f| f.1 >= cut && f.1 > -110.0).collect();
+        if kept.len() < 20 {
+            return None;
+        }
+        let n = kept.len() as f32;
+        let mean: [f32; NB] = std::array::from_fn(|i| kept.iter().map(|f| f.0[i]).sum::<f32>() / n);
         // 4 dB^2 floor so a perfectly steady hum doesn't make the match razor thin.
-        let var = std::array::from_fn(|i| ((self.sumsq[i] / n - (self.sum[i] / n).powi(2)) as f32).max(4.0));
-        Some(Profile { mean, var })
+        let var = std::array::from_fn(|i| (kept.iter().map(|f| (f.0[i] - mean[i]).powi(2)).sum::<f32>() / n).max(4.0));
+        // 6 dB under its quietest tenth, so it still matches as it fades, but never down in the
+        // room it was left out of.
+        let floor = (pct(kept.iter().map(|f| f.1).collect(), 0.1) - 6.0).max(cut);
+        Some(Profile { mean, var, floor_db: Some(floor) })
     }
 }
 
@@ -1008,7 +1057,8 @@ mod tests {
         }
         let (kind, prof) = chain.take_learned().expect("finished");
         assert_eq!(kind, Kind::Noise);
-        let other = Profile { mean: [0.0; NB], var: [4.0; NB] }; // a sound nothing like hiss
+        // A sound nothing like hiss: all lows, no highs.
+        let other = Profile { mean: std::array::from_fn(|i| if i < NB / 2 { 15.0 } else { -15.0 }), var: [4.0; NB], floor_db: Some(-200.0) };
         let noises = vec![
             NoiseProfile { name: "dog".into(), enabled: true, profile: other },
             NoiseProfile { name: "fan".into(), enabled: true, profile: prof.expect("loud enough") },
@@ -1027,6 +1077,76 @@ mod tests {
         profiles.noises[1].enabled = false;
         chain.process(&p, &profiles, &mut hiss[..FRAME].to_vec());
         assert_eq!(chain.meters.noise_match, None, "disabled profile still matched");
+    }
+
+    #[test]
+    fn a_learned_sound_matches_itself_but_not_the_quiet_room_around_it() {
+        // What "stay quiet, then make the sound" records: 1 s of a quiet room, then a hum that
+        // starts and stops every 0.3 s over it.
+        let mut seed = 3;
+        let p = Params { gate: true, ..only("none") };
+        let n = (SR * 5.0) as usize;
+        let hum = tone(150.0, n, 0.3);
+        let on = |i: usize| i >= SR as usize && (i - SR as usize) / (SR * 0.3) as usize % 2 == 0;
+        let mut clip = noise(n, 0.003, &mut seed);
+        clip.iter_mut().enumerate().filter(|(i, _)| on(*i)).for_each(|(i, s)| *s += hum[i]);
+        let mut chain = Chain::default();
+        chain.start_learning(Kind::Noise, 5.0);
+        for c in clip.chunks(FRAME) {
+            chain.process(&p, &Profiles::default(), &mut c.to_vec());
+        }
+        let (_, prof) = chain.take_learned().expect("finished");
+        let profile = prof.expect("loud enough");
+        let profiles = Profiles { noises: vec![NoiseProfile { name: "hum".into(), enabled: true, profile }], keep: None };
+
+        // Share of frames that count as the hum.
+        let mut matched = |x: &[f32]| {
+            let frames = x.chunks(FRAME).filter(|c| {
+                chain.process(&p, &profiles, &mut c.to_vec());
+                chain.meters.noise_match.is_some()
+            });
+            frames.count() as f32 / (x.len() / FRAME) as f32
+        };
+        let room = matched(&noise(SR as usize, 0.003, &mut seed));
+        let louder = matched(&tone(150.0, SR as usize, 0.6));
+        assert!(room < 0.05, "the quiet room counts as the hum {:.0}% of the time", room * 100.0);
+        assert!(louder > 0.9, "the hum itself, 6 dB louder, matched only {:.0}% of the time", louder * 100.0);
+    }
+
+    /// Learns your voice from a recording through the real chain (noise removal on): 2 s of a
+    /// room, then the recording over it, the way people use "Learn your voice". Then counts
+    /// how often the room alone and the talking match it:
+    /// `MC_WAV=voice.wav cargo test learning_on_wav -- --ignored --nocapture` (16-bit, 48 kHz).
+    #[test]
+    #[ignore]
+    fn learning_on_wav() {
+        let bytes = std::fs::read(std::env::var("MC_WAV").expect("set MC_WAV")).unwrap();
+        let ch = u16::from_le_bytes([bytes[22], bytes[23]]) as usize;
+        let data = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
+        let voice = bytes[data..].chunks_exact(2 * ch).map(|f| i16::from_le_bytes([f[0], f[1]]) as f32 / 32768.0);
+        let mut seed = 5;
+        let mut clip: Vec<f32> = std::iter::repeat_n(0.0, 2 * SR as usize).chain(voice).collect();
+        clip.truncate(clip.len() / FRAME * FRAME);
+        let room = noise(clip.len(), 0.004, &mut seed);
+        clip.iter_mut().zip(room).for_each(|(s, n)| *s += n);
+        let p = Params::default();
+        let mut chain = Chain::default();
+        chain.start_learning(Kind::Keep, clip.len() as f32 / SR);
+        for c in clip.chunks(FRAME) {
+            chain.process(&p, &Profiles::default(), &mut c.to_vec());
+        }
+        let keep = chain.take_learned().and_then(|l| l.1).expect("learned");
+        let profiles = Profiles { noises: vec![], keep: Some(keep) };
+        let (mut room, mut talk) = ((0, 0), (0, 0));
+        for (i, c) in clip.chunks(FRAME).enumerate() {
+            chain.process(&p, &profiles, &mut c.to_vec());
+            let hit = (chain.meters.keep_dist < p.learn_match) as u32;
+            let slot = if i < 200 { &mut room } else if chain.meters.vad >= 0.5 { &mut talk } else { continue };
+            *slot = (slot.0 + hit, slot.1 + 1);
+        }
+        let share = |(hit, all): (u32, u32)| 100.0 * hit as f32 / all.max(1) as f32;
+        println!("room alone matched {:.0}% of {} frames, talking {:.0}% of {}", share(room), room.1, share(talk), talk.1);
+        assert!(share(room) < 5.0 && share(talk) > 60.0);
     }
 
     #[test]

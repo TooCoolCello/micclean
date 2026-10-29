@@ -1815,14 +1815,16 @@ impl App {
     fn teach(&mut self, ui: &mut egui::Ui) {
         let p = ui::pal(ui);
         let learning = self.meters.learning;
-        let busy = learning.is_some() || self.engine.is_none();
+        // Sounds are learned after noise removal, which Bypass skips.
+        let busy = learning.is_some() || self.engine.is_none() || self.saved.params.bypass;
+        let why = "Needs audio running and Bypass off";
 
         section(ui, "Sounds to remove");
         let mut learn_noise = false;
         let mut forget = None;
         ui::card(ui, |ui| {
-            ui::header(ui, icon::LEARN, "Learn a noise", "Name it, stay quiet, then make the sound for 5 seconds", |ui| {
-                learn_noise = ui::accent_button(ui, !busy, "Learn (5 s)").clicked();
+            ui::header(ui, icon::LEARN, "Learn a noise", "Name it, then make the sound for 5 seconds. Quiet moments are left out", |ui| {
+                learn_noise = ui::accent_button(ui, !busy, "Learn (5 s)").on_disabled_hover_text(why).clicked();
                 ui.add(egui::TextEdit::singleline(&mut self.noise_name).hint_text("e.g. keyboard").desired_width(140.0));
             });
             if let Some((Kind::Noise, prog)) = learning {
@@ -1836,7 +1838,10 @@ impl App {
                         forget = Some(i);
                     }
                     ui::toggle(ui, &mut n.enabled).on_hover_text("Off lets this sound through for now");
-                    if let Some(&d) = self.meters.match_dist.get(i) {
+                    if n.profile.outdated() {
+                        let tip = "Learned by an older version that took in the room too, so it matched almost anything. Learning it again under the same name replaces it";
+                        ui.label(RichText::new("Learn it again").small().color(p.text2)).on_hover_text(tip);
+                    } else if let Some(&d) = self.meters.match_dist.get(i) {
                         match_bar(ui, d, looseness);
                     }
                 });
@@ -1855,21 +1860,22 @@ impl App {
 
         section(ui, "Your voice");
         let learned = self.saved.profiles.keep.is_some();
-        let desc = if learned {
-            "Learned. Sounds like this are never muted"
-        } else {
-            "Talk and sing for 10 seconds so it never cuts you"
+        let outdated = self.saved.profiles.keep.as_ref().is_some_and(|k| k.outdated());
+        let desc = match (learned, outdated) {
+            (_, true) => "Learned by an older version that took in the room too, so it matched almost anything. Learn it again",
+            (true, _) => "Learned. Sounds like this are never muted",
+            _ => "Talk and sing for 10 seconds so it never cuts you. Pauses are left out",
         };
         let (mut learn_voice, mut forget_voice) = (false, false);
         ui::card(ui, |ui| {
             ui::header(ui, icon::MUSIC, "Learn your voice", desc, |ui| {
-                learn_voice = ui::accent_button(ui, !busy, "Learn (10 s)").clicked();
+                learn_voice = ui::accent_button(ui, !busy, "Learn (10 s)").on_disabled_hover_text(why).clicked();
                 forget_voice = learned && ui.button("Forget").clicked();
             });
             if let Some((Kind::Keep, prog)) = learning {
                 ui.add(egui::ProgressBar::new(prog).desired_height(4.0));
             }
-            if learned {
+            if learned && !outdated {
                 let looseness = self.saved.params.learn_match;
                 ui::row(ui, "Sounds like you right now", |ui| match_bar(ui, self.meters.keep_dist, looseness));
             }
