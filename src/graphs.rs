@@ -1,12 +1,11 @@
 //! Interactive graphs and visualizers: the parametric EQ editor, compressor and gate curves,
-//! meters, histories and the signal-chain boxes. They only run while their page is on screen,
+//! meters, histories and the signal-chain rows. They only run while their page is on screen,
 //! and the EQ curve is cached between frames.
 
 use crate::dsp::{self, BANDS, Band, BandKind, Meters, Params, SPEC_BINS, SPEC_LO, SPEC_SPAN, Spec};
 use crate::ui;
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, Mesh, PointerButton, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, UiBuilder,
-    Vec2,
+    self, Align2, Color32, CursorIcon, FontId, Mesh, PointerButton, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2,
 };
 use std::time::{Duration, Instant};
 
@@ -525,34 +524,79 @@ pub fn pitch_view<const N: usize>(ui: &mut egui::Ui, h: &History<(f32, bool), N>
     });
 }
 
-/// One box of the signal-chain strip: name, activity light, live value and (if it can be
-/// switched) its on/off toggle. Clicking the box elsewhere opens its settings; the open one
-/// gets an accent outline.
-pub fn stage_box(
-    ui: &mut egui::Ui,
-    w: f32,
-    name: &str,
-    on: Option<&mut bool>,
-    selected: bool,
-    active: bool,
-    level: f32,
-    value: &str,
-) -> egui::Response {
+/// What a signal-chain row's bar shows.
+pub enum RowBar {
+    Empty,
+    /// A level, filled from the left over -60..0 dB.
+    Level(f32),
+    /// What a step adds (right of the centre) or cuts (left), up to 12 dB each way.
+    Change(f32),
+    /// An EQ curve over 60 Hz..16 kHz, +-12 dB.
+    Curve(Vec<f32>),
+}
+
+/// One step of the signal chain: its switch (or an icon), name, live bar, value and a
+/// chevron. Clicking anywhere but the switch opens or closes its settings.
+pub fn rack_row(ui: &mut egui::Ui, on: Option<&mut bool>, icon: &str, name: &str, bar: &RowBar, value: &str, open: bool) -> egui::Response {
     let pal = ui::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 64.0), Sense::click());
-    let painter = ui.painter();
-    let fill = if resp.hovered() { pal.control_hover } else { pal.card };
-    let stroke = if selected { Stroke::new(2.0, pal.accent) } else { Stroke::new(1.0, pal.card_stroke) };
-    painter.rect(rect, 6.0, fill, stroke, StrokeKind::Inside);
-    let text = if active { pal.text } else { pal.text2 };
-    painter.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, name, ui::semibold(13.0), text);
-    let light = if active { pal.good.gamma_multiply(0.2 + 0.8 * level.clamp(0.0, 1.0)) } else { pal.control_stroke };
-    painter.circle_filled(Pos2::new(rect.right() - 12.0, rect.top() + 15.0), 5.0, light);
-    painter.text(rect.left_bottom() + Vec2::new(10.0, -9.0), Align2::LEFT_BOTTOM, value, FontId::proportional(11.0), pal.text2);
-    if let Some(on) = on {
-        let r = Rect::from_min_size(Pos2::new(rect.right() - 50.0, rect.bottom() - 28.0), Vec2::new(40.0, 20.0));
-        // A child that isn't allocated in the row, so the toggle doesn't push the next box.
-        ui::toggle(&mut ui.new_child(UiBuilder::new().max_rect(r)), on);
+    ui.horizontal(|ui| {
+        match on {
+            Some(on) => {
+                ui::toggle(ui, on);
+            }
+            None => {
+                ui.add_sized([40.0, 20.0], egui::Label::new(RichText::new(icon).font(ui::icon_font(16.0))));
+            }
+        }
+        ui.add_space(6.0);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
+        let painter = ui.painter();
+        if resp.hovered() {
+            painter.rect_filled(rect.expand2(Vec2::new(4.0, 2.0)), 4.0, pal.nav_hover);
+        }
+        let y = rect.center().y;
+        let chevron = if open { ui::icon::CHEVRON_DOWN } else { ui::icon::CHEVRON_RIGHT };
+        painter.text(Pos2::new(rect.right(), y), Align2::RIGHT_CENTER, chevron, ui::icon_font(10.0), pal.text2);
+        let value_right = rect.right() - 22.0;
+        painter.text(Pos2::new(value_right, y), Align2::RIGHT_CENTER, value, FontId::proportional(12.5), pal.text2);
+        let name = painter.layout_no_wrap(name.to_string(), FontId::proportional(14.0), pal.text);
+        let bar_right = value_right - 74.0;
+        let bar_left = (rect.left() + name.size().x + 16.0).max(bar_right - 220.0);
+        painter.galley(Pos2::new(rect.left(), y - name.size().y / 2.0), name, pal.text);
+        if bar_right - bar_left >= 40.0 {
+            row_bar(painter, Rect::from_x_y_ranges(bar_left..=bar_right, y - 4.0..=y + 4.0), bar, &pal);
+        }
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+    })
+    .inner
+}
+
+fn row_bar(painter: &egui::Painter, r: Rect, bar: &RowBar, pal: &ui::Palette) {
+    let x = |v: f32, lo: f32, hi: f32| r.left() + r.width() * ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+    if !matches!(bar, RowBar::Curve(_)) {
+        painter.rect_filled(r, 4.0, pal.control_stroke);
     }
-    resp.on_hover_cursor(CursorIcon::PointingHand)
+    match bar {
+        RowBar::Empty => {}
+        RowBar::Level(db) => {
+            let col = if *db > -1.0 { Color32::from_rgb(232, 72, 72) } else { pal.accent };
+            painter.rect_filled(Rect::from_x_y_ranges(r.left()..=x(*db, -60.0, 0.0), r.y_range()), 4.0, col);
+        }
+        RowBar::Change(db) => {
+            let (c, e) = (r.center().x, x(*db, -12.0, 12.0));
+            if (e - c).abs() >= 1.0 {
+                let col = if *db < 0.0 { AMBER } else { pal.good };
+                painter.rect_filled(Rect::from_x_y_ranges(c.min(e)..=c.max(e), r.y_range()), 4.0, col);
+            }
+            painter.vline(c, r.y_range().expand(3.0), Stroke::new(1.0, pal.text2));
+        }
+        RowBar::Curve(g) => {
+            // Taller than the bars: a curve needs the room.
+            let (mid, half) = (r.center().y, 10.0);
+            painter.hline(r.x_range(), mid, Stroke::new(1.0, pal.control_stroke));
+            let step = r.width() / (g.len().max(2) - 1) as f32;
+            let pts = g.iter().enumerate().map(|(i, v)| Pos2::new(r.left() + i as f32 * step, mid - (v / 12.0).clamp(-1.0, 1.0) * half)).collect();
+            painter.add(Shape::line(pts, Stroke::new(2.0, pal.accent)));
+        }
+    }
 }

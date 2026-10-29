@@ -35,6 +35,8 @@ pub mod icon {
     pub const SMART: &str = "\u{E82F}"; // light bulb
     pub const SETUP: &str = "\u{E90F}"; // wrench
     pub const CHECK: &str = "\u{E73E}";
+    pub const CHEVRON_DOWN: &str = "\u{E70D}";
+    pub const CHEVRON_RIGHT: &str = "\u{E76C}";
 }
 
 pub struct Palette {
@@ -256,12 +258,21 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
 
 /// Rounded card on the window background.
 pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    card_with(ui, Margin::symmetric(16, 10), add)
+}
+
+/// A card with less padding, for rows of a list.
+pub fn slim_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    card_with(ui, Margin::symmetric(12, 4), add)
+}
+
+fn card_with<R>(ui: &mut Ui, margin: Margin, add: impl FnOnce(&mut Ui) -> R) -> R {
     let p = pal(ui);
     egui::Frame::new()
         .fill(p.card)
         .stroke(Stroke::new(1.0, p.card_stroke))
         .corner_radius(6)
-        .inner_margin(Margin::symmetric(16, 10))
+        .inner_margin(margin)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)

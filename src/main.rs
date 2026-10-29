@@ -279,7 +279,7 @@ enum Node {
 impl Node {
     fn title(self) -> &'static str {
         match self {
-            Node::Input => "Input",
+            Node::Input => "Your mic",
             Node::Echo => "Echo cancellation",
             Node::Noise => "Noise removal",
             Node::Gate => "Mute between words",
@@ -288,7 +288,20 @@ impl Node {
             Node::Deess => "Soften S sounds",
             Node::Comp => "Tame loud parts",
             Node::Limiter => "Clip guard",
-            Node::Output => "Output",
+            Node::Output => "What gets sent",
+        }
+    }
+
+    /// The step's on/off switch, for those that have one.
+    fn switch(self, p: &mut Params) -> Option<&mut bool> {
+        match self {
+            Node::Noise => Some(&mut p.denoise),
+            Node::Gate => Some(&mut p.gate),
+            Node::Level => Some(&mut p.agc),
+            Node::Eq => Some(&mut p.eq),
+            Node::Deess => Some(&mut p.deess),
+            Node::Comp => Some(&mut p.comp),
+            Node::Input | Node::Echo | Node::Limiter | Node::Output => None,
         }
     }
 
@@ -1314,23 +1327,124 @@ impl App {
         }
     }
 
-    /// Every effect as a box in the signal chain with all of its settings, plus presets,
-    /// Bypass and learned sounds.
+    /// Presets, then every step of the signal chain with its settings opening in place, then
+    /// levels, Bypass and learned sounds.
     fn advanced(&mut self, ui: &mut egui::Ui) {
         let m = self.live_meters();
-        self.chain_strip(ui, &m);
-        match self.node {
-            Some(n) => {
-                ui.add_space(10.0);
-                let (mut close, mut reset, mut suggest) = (false, false, false);
+        self.presets_card(ui);
+        self.chain_rack(ui, &m);
+        self.overview(ui, &m);
+        self.teach(ui);
+    }
+
+    /// The signal chain top to bottom in the order the sound goes through it: your mic, three
+    /// groups of steps, what gets sent. Each row shows what its step does to your voice right
+    /// now; clicking one opens its settings right under it.
+    fn chain_rack(&mut self, ui: &mut egui::Ui, m: &Meters) {
+        let p = ui::pal(ui);
+        let (cap, out) = (self.latency_us.0 as f32 / 1000.0, self.latency_us.1 as f32 / 1000.0);
+        let pr = &self.saved.params;
+        let rnn = if pr.denoise && !pr.bypass { 10.0 } else { 0.0 }; // RNNoise's one frame
+        let running = self.engine.is_some();
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Signal chain").font(ui::semibold(14.0)));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if running {
+                    let text = format!("≈ {:.0} ms delay  ·  DSP {:.1}%", cap + rnn + out, m.dsp_load * 100.0);
+                    ui.label(RichText::new(text).small().color(p.text2)).on_hover_text(format!(
+                        "Input buffer {cap:.0} ms · noise removal {rnn:.0} ms · output buffer {out:.0} ms.\nThe app you send to adds its own delay on top.\n\nDSP: time spent cleaning each 10 ms of sound, as a share of one CPU core."
+                    ));
+                }
+            });
+        });
+        let groups: [(&str, &[Node]); 5] = [
+            ("", &[Node::Input]),
+            ("Clean up", &[Node::Echo, Node::Noise, Node::Gate]),
+            ("Shape", &[Node::Level, Node::Eq, Node::Deess]),
+            ("Protect", &[Node::Comp, Node::Limiter]),
+            ("", &[Node::Output]),
+        ];
+        for (group, nodes) in groups {
+            if !group.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(group).small().color(p.text2));
+            }
+            for &n in nodes {
+                let (bar, value) = self.row_state(n, m);
+                let open = self.node == Some(n);
+                // Echo cancellation is on when it has something to cancel.
+                let mut echo_on = self.saved.devices.echo_ref.is_some();
+                let on = if n == Node::Echo { Some(&mut echo_on) } else { n.switch(&mut self.saved.params) };
+                let icon = match n {
+                    Node::Input => icon::MIC,
+                    Node::Output => icon::SPEAKERS,
+                    _ => icon::VOLUME,
+                };
+                if ui::slim_card(ui, |ui| graphs::rack_row(ui, on, icon, n.title(), &bar, &value, open)).clicked() {
+                    self.node = if open { None } else { Some(n) };
+                }
+                if echo_on != self.saved.devices.echo_ref.is_some() {
+                    self.saved.devices.echo_ref = if echo_on { listen_device(&self.outputs) } else { None };
+                }
+                if self.node == Some(n) {
+                    self.expanded(ui, n, m);
+                }
+            }
+        }
+    }
+
+    /// A chain row's bar and value: what that step is doing right now.
+    fn row_state(&self, n: Node, m: &Meters) -> (graphs::RowBar, String) {
+        use graphs::RowBar::{Change, Curve, Empty, Level};
+        let (pr, d) = (&self.saved.params, &self.saved.devices);
+        let device = match n {
+            Node::Input => Some(&d.input),
+            Node::Output => Some(&d.output),
+            _ => None,
+        };
+        // Read through the same switch the row toggles.
+        let on = if n == Node::Echo { d.echo_ref.is_some() } else { n.switch(&mut pr.clone()).is_none_or(|on| *on) };
+        let cut = |v: f32| format!("-{v:.1} dB");
+        match () {
+            _ if device.is_some_and(|d| d.is_empty()) => return (Empty, "pick one".into()),
+            _ if self.engine.is_none() => return (Empty, "-".into()),
+            _ if pr.bypass && device.is_none() => return (Empty, "bypassed".into()),
+            _ if !on => return (Empty, "off".into()),
+            _ => {}
+        }
+        match n {
+            Node::Input => (Level(m.in_db), format!("{:.0} dB", m.in_db)),
+            Node::Echo => (Change(-m.echo_erle_db.unwrap_or(0.0)), m.echo_erle_db.map_or("listening".into(), |e| cut(e))),
+            Node::Noise => (Change(-m.denoise_db), cut(m.denoise_db)),
+            Node::Gate => (Change(m.gate_gain_db), if m.gate_open { "open" } else { "muted" }.into()),
+            Node::Level => (Change(m.agc_db), format!("{:+.1} dB", m.agc_db)),
+            Node::Eq => {
+                let freqs: Vec<f32> = (0..32).map(|i| 60.0 * (16_000f32 / 60.0).powf(i as f32 / 31.0)).collect();
+                let bands = pr.bands.iter().flatten().filter(|b| b.on).count();
+                (Curve(dsp::eq_curve(pr, &freqs)), format!("{bands} band{}", if bands == 1 { "" } else { "s" }))
+            }
+            Node::Deess => (Change(-m.deess_db), cut(m.deess_db)),
+            Node::Comp => (Change(-m.gr_db), cut(m.gr_db)),
+            Node::Limiter => (Change(-m.lim_db), if m.lim_db > 0.1 { cut(m.lim_db) } else { "idle".into() }),
+            Node::Output => match self.rates[1] {
+                Some(r) if r != dsp::SR as u32 => (Level(m.out_db), "set 48 kHz".into()),
+                _ => (Level(m.out_db), format!("{:.0} dB", m.out_db)),
+            },
+        }
+    }
+
+    /// An open row's settings, right under it: Suggest and Reset, then the step's panel.
+    fn expanded(&mut self, ui: &mut egui::Ui, n: Node, m: &Meters) {
+        ui.indent(n.title(), |ui| {
+            let (mut reset, mut suggest) = (false, false);
+            {
                 let (params, smart) = (&self.saved.params, self.saved.smart.as_ref().filter(|_| Node::SMART.contains(&n)));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(n.title()).font(ui::semibold(20.0)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        close = ui::icon_button(ui, true, icon::CLOSE, "Close").clicked();
                         if n != Node::Echo {
                             reset = ui::icon_button(ui, true, icon::REFRESH, "Reset")
-                                .on_hover_text("Back to the defaults for this box. On/off stays as it is")
+                                .on_hover_text("Back to the defaults for this step. On/off stays as it is")
                                 .clicked();
                         }
                         if let Some(s) = smart {
@@ -1348,107 +1462,16 @@ impl App {
                         }
                     });
                 });
-                ui.add_space(4.0);
-                self.panel(ui, n, &m);
-                if reset {
-                    n.reset(&mut self.saved.params);
-                }
-                if suggest && let Some(s) = self.saved.smart.clone() {
-                    n.suggest(&mut self.saved.params, &s);
-                }
-                if close {
-                    self.node = None;
-                }
             }
-            None => {
-                self.presets_card(ui);
-                self.overview(ui, &m);
-                self.teach(ui);
+            self.panel(ui, n, m);
+            if reset {
+                n.reset(&mut self.saved.params);
             }
-        }
-    }
-
-    /// Every stage in the order Discord hears them: on/off, a light that glows with how hard it
-    /// is working, the live amount, and the delay end to end. Click a box for its settings.
-    fn chain_strip(&mut self, ui: &mut egui::Ui, m: &Meters) {
-        let p = ui::pal(ui);
-        let (cap, out) = (self.latency_us.0 as f32 / 1000.0, self.latency_us.1 as f32 / 1000.0);
-        let pr = &mut self.saved.params;
-        let off = pr.bypass;
-        let rnn = if pr.denoise && !off { 10.0 } else { 0.0 }; // RNNoise's one frame
-        let running = self.engine.is_some();
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Signal chain").font(ui::semibold(14.0)));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if running {
-                    let text = format!("≈ {:.0} ms delay  ·  DSP {:.1}%", cap + rnn + out, m.dsp_load * 100.0);
-                    ui.label(RichText::new(text).small().color(p.text2)).on_hover_text(format!(
-                        "Input buffer {cap:.0} ms · noise removal {rnn:.0} ms · output buffer {out:.0} ms.\nThe app you send to adds its own delay on top.\n\nDSP: time spent cleaning each 10 ms of sound, as a share of one CPU core."
-                    ));
-                }
-            });
-        });
-        ui.add_space(2.0);
-
-        let d = &self.saved.devices;
-        let echo_on = d.echo_ref.is_some();
-        let bands = pr.bands.iter().flatten().filter(|b| b.on).count();
-        // Input and Output carry sound whenever audio runs, Bypass or not.
-        let active = [running, echo_on, pr.denoise, pr.gate, pr.agc, pr.eq, pr.deess, pr.comp, true, running]
-            .into_iter()
-            .enumerate()
-            .map(|(i, a)| a && running && (!off || i == 0 || i == 9));
-        let db = |v: f32| format!("-{v:.1} dB");
-        let fill = |v: f32| (v + 60.0) / 60.0;
-        let echo = if echo_on { m.echo_erle_db.map_or("listening".into(), |e| format!("-{e:.0} dB")) } else { "off".into() };
-        let device = |name: &str, db: f32, none: &str| match (name.is_empty(), running) {
-            (true, _) => none.to_string(),
-            (_, false) => "-".into(),
-            _ => format!("{db:.0} dB"),
-        };
-        let input = device(&d.input, m.in_db, "pick input");
-        let output = match self.rates[1] {
-            Some(r) if r != dsp::SR as u32 && !d.output.is_empty() => "set 48 kHz".into(),
-            _ => device(&d.output, m.out_db, "pick output"),
-        };
-        let stages: [(Node, &str, Option<&mut bool>, f32, String); 10] = [
-            (Node::Input, "Input", None, fill(m.in_db), input),
-            (Node::Echo, "Echo", None, m.echo_erle_db.unwrap_or(0.0) / 30.0, echo),
-            (Node::Noise, "Noise", Some(&mut pr.denoise), m.denoise_db / 20.0, db(m.denoise_db)),
-            (Node::Gate, "Auto-mute", Some(&mut pr.gate), if m.gate_open { 1.0 } else { 0.0 }, if m.gate_open { "open" } else { "muted" }.into()),
-            (Node::Level, "Even volume", Some(&mut pr.agc), m.agc_db.abs() / 12.0, format!("{:+.1} dB", m.agc_db)),
-            (Node::Eq, "Tone", Some(&mut pr.eq), 0.5, format!("{bands} band{}", if bands == 1 { "" } else { "s" })),
-            (Node::Deess, "Soft S", Some(&mut pr.deess), m.deess_db / 8.0, db(m.deess_db)),
-            (Node::Comp, "Loud parts", Some(&mut pr.comp), m.gr_db / 12.0, db(m.gr_db)),
-            (Node::Limiter, "Clip guard", None, m.lim_db / 6.0, if m.lim_db > 0.1 { db(m.lim_db) } else { "idle".into() }),
-            (Node::Output, "Output", None, fill(m.out_db), output),
-        ];
-        // As many 100 px boxes per row as fit, then even rows (5 + 5, not 8 + 2) filling the width.
-        let avail = ui.available_width();
-        let rows = stages.len().div_ceil((((avail + 6.0) / 106.0) as usize).clamp(1, stages.len()));
-        let per = stages.len().div_ceil(rows);
-        let w = (avail - 6.0 * (per - 1) as f32) / per as f32 - 0.5;
-        let mut go = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-            for ((node, name, on, level, value), active) in stages.into_iter().zip(active) {
-                let value = match (active, off, running) {
-                    (true, ..) => value,
-                    _ if matches!(node, Node::Input | Node::Output) => value, // "pick input" or "-"
-                    (_, true, _) => "bypassed".into(),
-                    (_, _, false) => "-".into(),
-                    _ if node == Node::Echo => value,
-                    _ => "off".into(),
-                };
-                if graphs::stage_box(ui, w, name, on, self.node == Some(node), active, level, &value).clicked() {
-                    go = Some(node);
-                }
+            if suggest && let Some(s) = self.saved.smart.clone() {
+                n.suggest(&mut self.saved.params, &s);
             }
         });
-        if let Some(node) = go {
-            self.node = if self.node == Some(node) { None } else { Some(node) };
-        }
+        ui.add_space(6.0);
     }
 
     /// Save and recall whole settings. Picking one keeps Bypass as it is.
@@ -1576,7 +1599,6 @@ impl App {
         ui::setting(ui, icon::POWER, "Bypass", "Send the raw mic to compare (echo cancellation stays on)", |ui| {
             ui::toggle(ui, &mut self.saved.params.bypass);
         });
-        ui.label(RichText::new("Click a box in the signal chain to open its settings here.").small().color(p.text2));
     }
 
     /// The settings of one chain box, shown right under the chain: its graph or meters, the
