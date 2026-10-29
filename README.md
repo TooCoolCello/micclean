@@ -2,7 +2,7 @@
 
 A small Windows app that cleans up your microphone before Discord (or anything else) hears it.
 
-- Noise removal (RNNoise) and echo cancellation (WebRTC AEC3, for speakers instead of headphones)
+- Noise removal (RNNoise) and echo cancellation (WebRTC AEC3, for speakers or open-back headphones)
 - A voice gate that knows the difference between singing and fan hum, so long held notes aren't cut off
 - Teach it sounds to remove (keyboard, fan) and your own voice to keep
 - 5-band parametric EQ, de-esser, auto level and compressor, with live graphs

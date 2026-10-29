@@ -55,7 +55,8 @@ pub struct Devices {
     pub input: String,
     pub output: String,
     pub monitor: Option<String>,
-    /// Speakers to cancel out of the mic. None = headphones, no echo cancellation.
+    /// What you listen on (speakers, or open-back headphones), cancelled out of the mic.
+    /// None = no echo cancellation.
     pub echo_ref: Option<String>,
 }
 

@@ -992,7 +992,7 @@ impl App {
             .map(|(i, a)| a && running && (!off || i == 0 || i == 9));
         let db = |v: f32| format!("-{v:.1} dB");
         let fill = |v: f32| (v + 60.0) / 60.0;
-        let echo = if echo_on { m.echo_erle_db.map_or("listening".into(), |e| format!("-{e:.0} dB")) } else { "headphones".into() };
+        let echo = if echo_on { m.echo_erle_db.map_or("listening".into(), |e| format!("-{e:.0} dB")) } else { "off".into() };
         let device = |name: &str, db: f32, none: &str| match (name.is_empty(), running) {
             (true, _) => none.to_string(),
             (_, false) => "-".into(),
@@ -1198,19 +1198,19 @@ impl App {
                 });
             }
             Node::Echo => {
-                ui::setting(ui, icon::SPEAKERS, "Cancel echo from", "Your speakers, if you don't wear headphones", |ui| {
+                ui::setting(ui, icon::SPEAKERS, "Cancel echo from", "What you listen on: speakers, or open-back headphones your mic can hear", |ui| {
                     refresh |= refresh_button(ui);
-                    pick_opt(ui, "echo", &mut d.echo_ref, outputs, "Off (headphones)");
+                    pick_opt(ui, "echo", &mut d.echo_ref, outputs, "Off");
                 });
                 match &d.echo_ref {
                     None => {
-                        let desc = "Off. Headphones don't leak into the mic, so there's nothing to cancel";
+                        let desc = "Off. Turn it on if your mic hears your speakers or open-back headphones (friends hear themselves echo). Closed-back headphones don't need it";
                         ui::setting(ui, icon::HEADPHONE, "Echo cancellation", desc, |_| {});
                     }
                     Some(spk) => ui::card(ui, |ui| {
                         ui::header(ui, icon::SPEAKERS, "Echo cancellation", &format!("Removing what {spk} plays from your mic"), |_| {});
                         let level = format!("{:.0} dB", m.echo_ref_db);
-                        graphs::meter_row(ui, "Speaker level", m.echo_ref_db, -60.0, 0.0, None, p.accent, &level);
+                        graphs::meter_row(ui, "Playback level", m.echo_ref_db, -60.0, 0.0, None, p.accent, &level);
                         let erle = m.echo_erle_db.map_or("learning...".into(), |e| format!("{e:.0} dB"));
                         graphs::meter_row(ui, "Echo removed", m.echo_erle_db.unwrap_or(0.0), 0.0, 40.0, None, p.good, &erle);
                         ui::row(ui, "Speaker delay it found", |ui| {
