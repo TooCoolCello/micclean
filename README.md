@@ -2,7 +2,11 @@
 
 A small Windows app that cleans up your microphone before Discord (or anything else) hears it.
 
-- Noise removal (RNNoise) and echo cancellation (WebRTC AEC3, for speakers or open-back headphones)
+- Noise removal (RNNoise) and echo cancellation (WebRTC AEC3, for speakers or open-back headphones).
+  Echo cancellation can listen to everything you hear except MicClean, so hearing yourself doesn't
+  cancel your own voice
+- Hidden from screen shares: MicClean takes VB-Cable for itself (exclusive mode), so a Discord
+  screen share with sound doesn't send your voice a second time
 - A voice gate that knows the difference between singing and fan hum, so long held notes aren't cut off
 - Teach it sounds to remove (keyboard, fan) and your own voice to keep
 - 5-band parametric EQ, de-esser, auto level and compressor, with live graphs

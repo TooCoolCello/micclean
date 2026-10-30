@@ -1,5 +1,7 @@
 //! Device I/O. All processing runs inside the mic callback. The speaker loopback (echo
-//! reference) and the output devices talk to it through lock-free rings.
+//! reference) and the output devices talk to it through lock-free rings. Most streams are
+//! cpal's; the two it can't open (exclusive output, every app but this one as the echo
+//! source) run on their own threads with the wasapi crate.
 
 use crate::dsp::{Chain, FRAME, Kind, Meters, Params, Profile, Profiles, SR};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -9,7 +11,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use serde::{Deserialize, Serialize};
 use sonora::config::{EchoCanceller, MaxProcessingRate, Pipeline};
 use sonora::{AudioProcessing, Config, StreamConfig};
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,7 +58,7 @@ pub struct Latency {
     pub output_us: AtomicU32,
 }
 
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Devices {
     pub input: String,
     /// The one input channel to use (0 = input 1), for interfaces Windows shows as a single
@@ -64,9 +66,33 @@ pub struct Devices {
     pub input_channel: Option<u16>,
     pub output: String,
     pub monitor: Option<String>,
-    /// What you listen on (speakers, or open-back headphones), cancelled out of the mic.
-    /// None = no echo cancellation.
+    /// What you listen on (speakers, or open-back headphones), cancelled out of the mic:
+    /// a device, or EVERYTHING. None = no echo cancellation.
     pub echo_ref: Option<String>,
+    /// Take the output for MicClean alone (exclusive mode) when it's a virtual cable, so a
+    /// screen share doesn't send your voice a second time.
+    #[serde(default = "yes")]
+    pub exclusive_output: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Devices {
+    fn default() -> Self {
+        Self { input: String::new(), input_channel: None, output: String::new(), monitor: None, echo_ref: None, exclusive_output: true }
+    }
+}
+
+/// The echo source that hears every app except MicClean itself (Windows' per-app loopback,
+/// Windows 10 2004 and later), so your own voice from Hear myself never lands in it.
+pub const EVERYTHING: &str = "Everything you hear (except MicClean)";
+
+/// Only virtual cables are taken in exclusive mode: on speakers it would silence every other app.
+// ponytail: VB-Cable's names (CABLE Input, CABLE-A Input, Hi-Fi CABLE Input); add others when asked.
+pub fn can_be_exclusive(name: &str) -> bool {
+    name.contains("CABLE")
 }
 
 /// Windows' default playback device: usually what you listen on.
@@ -119,7 +145,11 @@ fn on_error(shared: Arc<Mutex<Shared>>, dev: String) -> impl FnMut(cpal::Error) 
 /// Keeps the streams alive; dropping it stops everything.
 pub struct Engine {
     _streams: Vec<cpal::Stream>,
+    _workers: Vec<Worker>,
     pub info: String,
+    /// Why the output couldn't be taken in exclusive mode (and so plays through Windows'
+    /// mixer, where a screen share can pick it up), when it was meant to be.
+    pub shared_output: Option<String>,
     /// Optional devices (monitor, echo reference) that weren't plugged in at start. The GUI
     /// restarts audio when one comes back.
     pub missing: Vec<String>,
@@ -152,10 +182,26 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     }
 
     let (mut missing, mut failed) = (Vec::new(), Vec::new());
+    let (mut workers, mut shared_output) = (Vec::new(), None);
     let mut outs = Vec::new(); // (ring, is_monitor)
     let latency = shared.lock().map_err(es)?.latency.clone();
-    let (stream, prod) = open_output(&dev.output, shared.clone(), Some(latency.clone()))?;
-    streams.push(stream);
+    let exclusive = if dev.exclusive_output && can_be_exclusive(&dev.output) {
+        open_output_exclusive(&dev.output, shared.clone(), latency.clone()).map_err(|e| shared_output = Some(e)).ok()
+    } else {
+        None
+    };
+    let prod = match exclusive {
+        Some((worker, prod)) => {
+            workers.push(worker);
+            info += ", output exclusive";
+            prod
+        }
+        None => {
+            let (stream, prod) = open_output(&dev.output, shared.clone(), Some(latency.clone()))?;
+            streams.push(stream);
+            prod
+        }
+    };
     outs.push((prod, false));
     // Headphones unplugged shouldn't take the Discord feed down with them.
     if let Some(name) = &dev.monitor {
@@ -170,12 +216,23 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
 
     let mut echo = None;
     if let Some(name) = &dev.echo_ref {
-        match open_echo_ref(name, shared.clone()) {
-            Ok((stream, cons, ref_rate)) => {
-                streams.push(stream);
+        let opened = if name == EVERYTHING {
+            open_echo_everything(shared.clone()).map(|(w, cons, rate)| {
+                workers.push(w);
+                (cons, rate)
+            })
+        } else {
+            open_echo_ref(name, shared.clone()).map(|(s, cons, rate)| {
+                streams.push(s);
+                (cons, rate)
+            })
+        };
+        match opened {
+            Ok((cons, ref_rate)) => {
                 info += &format!(", echo ref {ref_rate} Hz");
                 echo = Some((cons, ref_rate));
             }
+            Err(e) if name == EVERYTHING => failed.push((name.clone(), e)),
             Err(e) => skipped(name, e, &mut missing, &mut failed),
         }
     }
@@ -298,7 +355,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
         }
     })?);
 
-    Ok(Engine { _streams: streams, info, missing, failed })
+    Ok(Engine { _streams: streams, _workers: workers, info, shared_output, missing, failed })
 }
 
 fn open_echo_ref(
@@ -476,6 +533,45 @@ mod tests {
         assert!((r.fill - 1440.0).abs() < 150.0, "fill {:.0}, want 1440", r.fill);
     }
 
+    #[test]
+    fn encode_writes_every_sample_width() {
+        let mut out = [0u8; 2 * 2 * 2];
+        encode(&[1.0, -0.5], 2, 2, false, &mut out);
+        assert_eq!(&out[..4], &[0xFF, 0x7F, 0xFF, 0x7F], "16-bit full scale, both channels");
+        assert_eq!(i16::from_le_bytes([out[4], out[5]]), -16384);
+        let mut out = [0u8; 3];
+        encode(&[0.5], 1, 3, false, &mut out);
+        assert_eq!(i32::from_le_bytes([0, out[0], out[1], out[2]]) >> 8, 0x3F_FFFF, "24-bit half scale");
+        let mut out = [0u8; 4];
+        encode(&[0.25], 1, 4, true, &mut out);
+        assert_eq!(f32::from_le_bytes(out), 0.25);
+    }
+
+    /// Needs real devices: `MC_EXCL=<output name> cargo test -- --ignored wasapi_streams --nocapture`.
+    /// Opens the echo source (every app but this one) and, if named, an output in exclusive mode
+    /// playing silence, for 2 s.
+    #[test]
+    #[ignore]
+    fn wasapi_streams() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (_echo, cons, rate) = open_echo_everything(shared.clone()).expect("echo source");
+        let excl = std::env::var("MC_EXCL").ok().map(|name| {
+            let lat = Arc::new(Latency::default());
+            let r = open_output_exclusive(&name, shared.clone(), lat.clone());
+            println!("exclusive on {name}: {}", r.as_ref().map_or_else(|e| e.clone(), |_| "open".into()));
+            (r.map(|(w, mut prod)| {
+                prod.push_slice(&vec![0.0; SR as usize * 2]);
+                w
+            }), lat)
+        });
+        std::thread::sleep(Duration::from_secs(2));
+        println!("echo source: {} samples at {rate} Hz in 2 s", cons.occupied_len());
+        if let Some((Ok(_), lat)) = &excl {
+            println!("exclusive delay {:.1} ms", lat.output_us.load(Relaxed) as f32 / 1000.0);
+        }
+        assert!(shared.lock().unwrap().error.is_none(), "{:?}", shared.lock().unwrap().error);
+    }
+
     /// Needs real devices: `cargo test -- --ignored`. Runs default mic -> default output with
     /// echo cancellation against that same output for 2 s and checks frames came through.
     #[test]
@@ -599,4 +695,196 @@ impl DriftReader {
             }
         }
     }
+}
+
+/// A WASAPI stream on its own thread, for what cpal can't open. Dropping it stops the thread.
+pub struct Worker {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+type Ready = std::sync::mpsc::SyncSender<Result<(), String>>;
+
+/// Runs `body` on its own thread; it sends Ok on `ready` once its stream runs, then loops until
+/// `stop`. An error before that is returned from here (so `start` can fall back); one after it
+/// asks the GUI to reconnect, like a cpal stream error.
+fn spawn_worker(
+    name: &str,
+    shared: Arc<Mutex<Shared>>,
+    body: impl FnOnce(&AtomicBool, &Ready) -> Result<(), String> + Send + 'static,
+) -> Result<Worker, String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let st = stop.clone();
+    let thread = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _ = wasapi::initialize_mta();
+            if let Err(e) = body(&st, &tx)
+                && tx.try_send(Err(e.clone())).is_err()
+                && let Ok(mut s) = shared.lock()
+            {
+                s.error = Some(e);
+            }
+        })
+        .map_err(es)?;
+    let worker = Worker { stop, thread: Some(thread) };
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(())) => Ok(worker),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("it didn't start".into()),
+    }
+}
+
+/// wasapi errors, with the ones people can fix in words.
+fn wasapi_err(e: wasapi::WasapiError) -> String {
+    let code = match &e {
+        wasapi::WasapiError::Windows(w) => w.code().0 as u32,
+        _ => 0,
+    };
+    match code {
+        0x8889_000A => "another app is using it".into(), // AUDCLNT_E_DEVICE_IN_USE
+        0x8889_000E => "exclusive control is turned off for it in Sound settings".into(), // AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED
+        0x8889_0008 => "it doesn't take MicClean's format in exclusive mode".into(), // AUDCLNT_E_UNSUPPORTED_FORMAT
+        _ => e.to_string(),
+    }
+}
+
+/// What cpal does for its own audio threads: MMCSS "Pro Audio", so other work can't starve it.
+fn pro_audio_priority() {
+    let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+    let mut index = 0u32;
+    // SAFETY: a NUL-terminated name that outlives the call; Windows drops the registration
+    // when the thread ends.
+    unsafe { windows_sys::Win32::System::Threading::AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index) };
+}
+
+/// Mono f32 out as `ch` interleaved channels of `width`-byte samples: float, or integers
+/// left-justified, so 24 valid bits in a 32-bit slot come out right too.
+fn encode(mono: &[f32], ch: usize, width: usize, float: bool, out: &mut [u8]) {
+    for (s, frame) in mono.iter().zip(out.chunks_exact_mut(ch * width)) {
+        let le = if float { s.to_le_bytes() } else { ((s.clamp(-1.0, 1.0) as f64 * i32::MAX as f64) as i32).to_le_bytes() };
+        for slot in frame.chunks_exact_mut(width) {
+            slot.copy_from_slice(&le[4 - width..]);
+        }
+    }
+}
+
+/// The Discord feed in exclusive mode. Windows' mixer never sees it, so a screen share, which
+/// records that mixer minus Discord itself, can't send your voice a second time; it also skips
+/// the mixer's buffer. There's no Windows rate conversion in exclusive mode, so the device
+/// has to run at 48 kHz.
+fn open_output_exclusive(
+    name: &str,
+    shared: Arc<Mutex<Shared>>,
+    latency: Arc<Latency>,
+) -> Result<(Worker, ringbuf::HeapProd<f32>), String> {
+    use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
+    let (prod, mut cons) = HeapRb::<f32>::new(SR as usize).split();
+    let name = name.to_string();
+    let worker = spawn_worker("micclean exclusive output", shared, move |stop, ready| {
+        let dev = wasapi::DeviceEnumerator::new()
+            .and_then(|e| e.get_device_collection(&Direction::Render))
+            .and_then(|c| c.get_device_with_name(&name))
+            .map_err(wasapi_err)?;
+        let mut client = dev.get_iaudioclient().map_err(wasapi_err)?;
+        let mix = client.get_mixformat().map_err(wasapi_err)?;
+        if mix.get_samplespersec() != SR as u32 {
+            return Err(format!("it runs at {} Hz; set it to 48000 Hz in Sound settings", mix.get_samplespersec()));
+        }
+        let kinds = [(32, 32, SampleType::Float), (32, 32, SampleType::Int), (32, 24, SampleType::Int), (24, 24, SampleType::Int), (16, 16, SampleType::Int)];
+        let fmt = kinds
+            .iter()
+            .find_map(|(store, valid, kind)| {
+                let want = WaveFormat::new(*store, *valid, kind, SR as usize, mix.get_nchannels() as usize, None);
+                client.is_supported_exclusive_with_quirks(&want).ok()
+            })
+            .ok_or_else(|| "it doesn't take a 48000 Hz format in exclusive mode".to_string())?;
+        let (period, _) = client.get_device_period().map_err(wasapi_err)?;
+        if let Err(e) = client.initialize_client(&fmt, &Direction::Render, &StreamMode::EventsExclusive { period_hns: period }) {
+            // AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED: Windows names the size it wants; start over with it.
+            if !matches!(&e, wasapi::WasapiError::Windows(w) if w.code().0 as u32 == 0x8889_0019) {
+                return Err(wasapi_err(e));
+            }
+            let period = wasapi::calculate_period_100ns(client.get_buffer_size().map_err(wasapi_err)? as i64, SR as i64);
+            client = dev.get_iaudioclient().map_err(wasapi_err)?;
+            client.initialize_client(&fmt, &Direction::Render, &StreamMode::EventsExclusive { period_hns: period }).map_err(wasapi_err)?;
+        }
+        let event = client.set_get_eventhandle().map_err(wasapi_err)?;
+        let render = client.get_audiorenderclient().map_err(wasapi_err)?;
+        // Exclusive and event driven: each wake fills the whole buffer.
+        let frames = client.get_buffer_size().map_err(wasapi_err)? as usize;
+        let (ch, width) = (fmt.get_nchannels() as usize, fmt.get_bitspersample() as usize / 8);
+        let float = matches!(fmt.get_subformat(), Ok(SampleType::Float));
+        let mut mono = vec![0.0f32; frames];
+        let mut bytes = vec![0u8; frames * ch * width];
+        let mut reader = DriftReader { period: frames, ..Default::default() };
+        render.write_to_device(frames, &bytes, None).map_err(wasapi_err)?; // silence until the ring fills
+        client.start_stream().map_err(wasapi_err)?;
+        let _ = ready.send(Ok(()));
+        pro_audio_priority();
+        let mut waits = 0;
+        while !stop.load(Relaxed) {
+            if event.wait_for_event(100).is_err() {
+                waits += 1;
+                if waits > 20 {
+                    return Err(format!("{name} stopped asking for sound"));
+                }
+                continue;
+            }
+            waits = 0;
+            reader.read(&mut cons, &mut mono);
+            encode(&mono, ch, width, float, &mut bytes);
+            render.write_to_device(frames, &bytes, None).map_err(wasapi_err)?;
+            latency.output_us.store(((frames as f64 + reader.fill) / SR as f64 * 1e6) as u32, Relaxed);
+        }
+        let _ = client.stop_stream();
+        Ok(())
+    })?;
+    Ok((worker, prod))
+}
+
+/// The echo source for EVERYTHING: what every app plays except this one (Windows' per-app
+/// loopback with this process excluded), as 48 kHz mono.
+fn open_echo_everything(shared: Arc<Mutex<Shared>>) -> Result<(Worker, ringbuf::HeapCons<f32>, u32), String> {
+    use wasapi::{AudioClient, Direction, SampleType, StreamMode, WaveFormat};
+    let (mut prod, cons) = HeapRb::<f32>::new(SR as usize).split();
+    let worker = spawn_worker("micclean echo source", shared, move |stop, ready| {
+        // false: every process except this one and the ones it started.
+        let mut client = AudioClient::new_application_loopback_client(std::process::id(), false).map_err(wasapi_err)?;
+        let fmt = WaveFormat::new(32, 32, &SampleType::Float, SR as usize, 1, None);
+        let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: 0 };
+        client.initialize_client(&fmt, &Direction::Capture, &mode).map_err(wasapi_err)?;
+        let event = client.set_get_eventhandle().map_err(wasapi_err)?;
+        let capture = client.get_audiocaptureclient().map_err(wasapi_err)?;
+        client.start_stream().map_err(wasapi_err)?;
+        let _ = ready.send(Ok(()));
+        let (mut bytes, mut mono) = (vec![0u8; SR as usize * 4], vec![0.0f32; SR as usize]);
+        while !stop.load(Relaxed) {
+            if event.wait_for_event(100).is_err() {
+                continue; // nothing playing; the echo canceller fills in silence itself
+            }
+            while let Some(n) = capture.get_next_packet_size().map_err(wasapi_err)?.filter(|&n| n > 0) {
+                let n = (n as usize).min(mono.len());
+                let (got, info) = capture.read_from_device(&mut bytes[..n * 4]).map_err(wasapi_err)?;
+                let got = got as usize;
+                for (m, b) in mono[..got].iter_mut().zip(bytes.chunks_exact(4)) {
+                    *m = if info.flags.silent { 0.0 } else { f32::from_le_bytes([b[0], b[1], b[2], b[3]]) };
+                }
+                prod.push_slice(&mono[..got]);
+            }
+        }
+        let _ = client.stop_stream();
+        Ok(())
+    })?;
+    Ok((worker, cons, SR as u32))
 }

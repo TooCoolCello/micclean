@@ -251,7 +251,7 @@ enum Fix {
     BypassOff,
     SoundSettings,
     Quieter,
-    HearMyselfOff,
+    EchoEverything,
 }
 
 /// Levels while you talk, averaged over about a second, for the Home verdicts and banners.
@@ -272,6 +272,11 @@ fn listen_device(outputs: &[String]) -> Option<String> {
     audio::default_output_name()
         .filter(|n| !n.contains("CABLE"))
         .or_else(|| outputs.iter().find(|n| !n.contains("CABLE")).cloned())
+}
+
+/// What echo cancellation can listen to: every app but MicClean (the default), or one device.
+fn echo_choices(outputs: &[String]) -> Vec<String> {
+    std::iter::once(audio::EVERYTHING.to_string()).chain(outputs.iter().cloned()).collect()
 }
 
 /// Windows' classic Sound dialog, where Properties → Advanced sets a device's rate.
@@ -821,8 +826,14 @@ impl App {
             return Some(("failed", format!("Couldn't open {name}"), desc, Some(Fix::Restart)));
         }
         if d.monitor.is_some() && d.monitor == d.echo_ref && open("echo_monitor") {
-            let desc = "Echo cancellation hears your own voice played back on the same device, and removes part of it. Turn one of them off.".into();
-            return Some(("echo_monitor", "Hear myself is cutting into your voice".into(), desc, Some(Fix::HearMyselfOff)));
+            let desc = "Echo cancellation hears your own voice played back on the same device, and removes part of it. \"Everything you hear\" leaves MicClean out.".into();
+            return Some(("echo_monitor", "Hear myself is cutting into your voice".into(), desc, Some(Fix::EchoEverything)));
+        }
+        if let Some(why) = self.engine.as_ref().and_then(|e| e.shared_output.as_ref())
+            && open("shared_output")
+        {
+            let desc = format!("MicClean couldn't take {} for itself: {why}. A screen share may send your voice twice.", d.output);
+            return Some(("shared_output", "Not hidden from screen share".into(), desc, Some(Fix::SoundSettings)));
         }
         let names = [Some(&d.input), Some(&d.output), d.monitor.as_ref()];
         if let Some((name, r)) = names.iter().zip(self.rates).find_map(|(n, r)| Some((n.as_ref()?, r.filter(|&r| r != dsp::SR as u32)?)))
@@ -860,7 +871,7 @@ impl App {
                 Some(Fix::BypassOff) => "Turn it off",
                 Some(Fix::SoundSettings) => "Sound settings",
                 Some(Fix::Quieter) => "3 dB quieter",
-                Some(Fix::HearMyselfOff) => "Turn off Hear myself",
+                Some(Fix::EchoEverything) => "Use Everything you hear",
                 None => "",
             };
             if fix.is_some() {
@@ -880,7 +891,7 @@ impl App {
                 *g = (*g - 3.0).max(-20.0);
                 self.stats = Stats::default(); // measure again at the new level
             }
-            Some(Fix::HearMyselfOff) => self.saved.devices.monitor = None,
+            Some(Fix::EchoEverything) => self.saved.devices.echo_ref = Some(audio::EVERYTHING.into()),
             None => {}
         }
     }
@@ -1367,7 +1378,7 @@ impl App {
         });
 
         step(ui, 3, "What you listen on", true);
-        let listen = listen_device(outputs);
+        let choices = echo_choices(outputs);
         ui::card(ui, |ui| {
             let desc = "Speakers and open-back headphones leak into your mic, so friends hear themselves. MicClean can cancel that";
             ui::header(ui, icon::HEADPHONE, "Headphones or speakers", desc, |_| {});
@@ -1378,10 +1389,10 @@ impl App {
                 ui.radio_value(&mut open, true, "Speakers or open-back headphones");
             });
             if open != before {
-                d.echo_ref = if open { listen } else { None };
+                d.echo_ref = open.then(|| audio::EVERYTHING.to_string());
             }
             if open {
-                ui::row(ui, "Playing on", |ui| pick_opt(ui, "setup_echo", &mut d.echo_ref, outputs, "Off"));
+                ui::row(ui, "Cancel", |ui| pick_opt(ui, "setup_echo", &mut d.echo_ref, &choices, "Off"));
             }
             ui.add_space(4.0);
         });
@@ -1455,7 +1466,7 @@ impl App {
                     self.node = if open { None } else { Some(n) };
                 }
                 if echo_on != self.saved.devices.echo_ref.is_some() {
-                    self.saved.devices.echo_ref = if echo_on { listen_device(&self.outputs) } else { None };
+                    self.saved.devices.echo_ref = echo_on.then(|| audio::EVERYTHING.to_string());
                 }
                 if self.node == Some(n) {
                     self.expanded(ui, n, m);
@@ -1712,9 +1723,10 @@ impl App {
                 });
             }
             Node::Echo => {
-                ui::setting(ui, icon::SPEAKERS, "Cancel echo from", "What you listen on: speakers, or open-back headphones your mic can hear", |ui| {
+                let desc = "What you hear on speakers, or open-back headphones your mic can hear. \"Everything you hear\" leaves out MicClean itself, so Hear myself can stay on";
+                ui::setting(ui, icon::SPEAKERS, "Cancel echo from", desc, |ui| {
                     refresh |= refresh_button(ui);
-                    pick_opt(ui, "echo", &mut d.echo_ref, outputs, "Off");
+                    pick_opt(ui, "echo", &mut d.echo_ref, &echo_choices(outputs), "Off");
                 });
                 match &d.echo_ref {
                     None => {
@@ -1722,7 +1734,8 @@ impl App {
                         ui::setting(ui, icon::HEADPHONE, "Echo cancellation", desc, |_| {});
                     }
                     Some(spk) => ui::card(ui, |ui| {
-                        ui::header(ui, icon::SPEAKERS, "Echo cancellation", &format!("Removing what {spk} plays from your mic"), |_| {});
+                        let what = if spk == audio::EVERYTHING { "your apps play (not MicClean itself)".to_string() } else { format!("{spk} plays") };
+                        ui::header(ui, icon::SPEAKERS, "Echo cancellation", &format!("Removing what {what} from your mic"), |_| {});
                         let level = format!("{:.0} dB", m.echo_ref_db);
                         graphs::meter_row(ui, "Playback level", m.echo_ref_db, -60.0, 0.0, None, p.accent, &level);
                         let erle = m.echo_erle_db.map_or("learning...".into(), |e| format!("{e:.0} dB"));
@@ -1863,6 +1876,15 @@ impl App {
                 let convert = "Windows converts MicClean's 48000 Hz for it, which adds delay. Set it to 48000 Hz in Sound settings (Properties → Advanced)";
                 if let Some(r) = off_rate(1) {
                     rate_note(ui, &d.output, r, convert);
+                }
+                if audio::can_be_exclusive(&d.output) {
+                    let desc = match self.engine.as_ref().and_then(|e| e.shared_output.as_deref()) {
+                        Some(why) if d.exclusive_output => format!("Couldn't: {why}"),
+                        _ => "Takes the cable for MicClean alone, so a Discord screen share doesn't send your voice a second time. Hear myself still plays through Windows, so a screen share includes it".into(),
+                    };
+                    ui::setting(ui, icon::SPEAKERS, "Hide from screen share", &desc, |ui| {
+                        ui::toggle(ui, &mut d.exclusive_output);
+                    });
                 }
                 ui::setting(ui, icon::HEADPHONE, "Monitor", "Hear yourself, e.g. on your headphones", |ui| {
                     pick_opt(ui, "mon", &mut d.monitor, outputs, "Off");

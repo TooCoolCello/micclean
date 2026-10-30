@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "micclean"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "cpal",
  "eframe",
@@ -2160,6 +2160,7 @@ dependencies = [
  "sha2",
  "sonora",
  "tray-icon",
+ "wasapi",
  "windows-sys 0.61.2",
  "winresource",
 ]
@@ -3881,6 +3882,19 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "wasapi"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b5f8804a710cf7a18b07610225abb127e562f3249a1f3ed88a6f045c5444910"
+dependencies = [
+ "log",
+ "num-integer",
+ "thiserror 2.0.21",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
