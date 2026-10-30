@@ -47,12 +47,47 @@ pub fn run(settings_dir: &Path) {
     if saved.last().and_then(|p| fs::read_to_string(p).ok()).as_deref() == Some(text.as_str()) {
         return;
     }
+    let _ = write(&dir, &text);
+}
+
+/// A new backup of `text` (a whole settings file), keeping the newest KEEP.
+fn write(dir: &Path, text: &str) -> Result<(), String> {
     let t = crate::logfile::local_time();
     let name = format!("settings-{:04}-{:02}-{:02}-{:02}{:02}{:02}.ron", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-    if fs::create_dir_all(&dir).is_ok() && fs::write(dir.join(name), &text).is_ok() {
-        for old in backups(&dir).iter().rev().skip(KEEP) {
-            let _ = fs::remove_file(old);
-        }
+    fs::create_dir_all(dir).and_then(|()| fs::write(dir.join(name), text)).map_err(|e| e.to_string())?;
+    for old in backups(dir).iter().rev().skip(KEEP) {
+        let _ = fs::remove_file(old);
+    }
+    Ok(())
+}
+
+/// %APPDATA%\MicClean\backups.
+pub fn dir() -> Option<PathBuf> {
+    eframe::storage_dir("MicClean").map(|d| backup_dir(&d))
+}
+
+/// Backups, newest first.
+pub fn list() -> Vec<PathBuf> {
+    dir().map(|d| backups(&d).into_iter().rev().collect()).unwrap_or_default()
+}
+
+/// Backs up these settings (eframe's "app" value) now.
+pub fn save(settings: String) -> Result<(), String> {
+    let text = ron::to_string(&HashMap::from([(eframe::APP_KEY.to_string(), settings)])).map_err(|e| e.to_string())?;
+    write(&dir().ok_or("there's no settings folder")?, &text)
+}
+
+/// The MicClean settings in a settings file, a backup or one a friend sent, if it is one.
+pub fn settings_in(text: &str) -> Option<String> {
+    ron::from_str::<HashMap<String, String>>(text).ok()?.remove(eframe::APP_KEY)
+}
+
+/// "2026-10-29 19:28" for settings-2026-10-29-192843.ron.
+pub fn label(p: &Path) -> String {
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    match stem.strip_prefix("settings-") {
+        Some(s) if s.len() >= 15 => format!("{} {}:{}", &s[..10], &s[11..13], &s[13..15]),
+        _ => stem,
     }
 }
 
@@ -86,6 +121,9 @@ mod tests {
         run(&data);
         assert_eq!(fs::read_to_string(data.join("app.ron")).unwrap(), good(11));
         assert!(data.join("app.broken.ron").exists());
+        assert_eq!(settings_in(&good(11)).as_deref(), Some("settings 11"));
+        assert_eq!(settings_in("not a settings file"), None);
+        assert_eq!(label(Path::new("settings-2026-10-29-192843.ron")), "2026-10-29 19:28");
         let _ = fs::remove_dir_all(&root);
     }
 }

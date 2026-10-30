@@ -187,7 +187,7 @@ pub fn analyse(p: &Params, quiet: &[Quiet], talk: &[Take]) -> Result<Outcome, St
     let tuned = p.bands.iter().flatten().any(|b| b.kind != BandKind::LowCut);
     s.bands = if tuned { with_low_cut(p.bands, cut) } else { full_eq };
     if s.bands != full_eq {
-        notes.push("Kept your own EQ bands and only set the low cut. The Equalizer's Suggest button has a full EQ for your voice.".into());
+        notes.push("Kept your own Tone bands and only set the low cut. Suggest in Tone (Advanced) has a full EQ for your voice.".into());
     }
 
     // The de-esser and compressor sit after auto level and the EQ, so their levels move by
@@ -337,11 +337,12 @@ pub fn changes(old: &Params, new: &Params) -> Vec<String> {
         }
     };
     let db = |what: &str, a: f32, b: f32| ((a - b).abs() >= 0.05).then(|| format!("{what}{a:+.1} → {b:+.1} dB"));
-    line("Input gain", &[db("", old.input_gain_db, new.input_gain_db)]);
+    // The same names as the steps in the app (main.rs Node::title), in plain words.
+    line("Your mic", &[db("gain ", old.input_gain_db, new.input_gain_db)]);
     let strength = (old.denoise_strength != new.denoise_strength)
         .then(|| format!("strength {:.0}% → {:.0}%", old.denoise_strength * 100.0, new.denoise_strength * 100.0));
     line("Noise removal", &[strength]);
-    line("Voice gate", &[db("minimum level ", old.gate_threshold_db, new.gate_threshold_db)]);
+    line("Mute between words", &[db("mutes below ", old.gate_threshold_db, new.gate_threshold_db)]);
     if old.bands != new.bands {
         let bands: Vec<String> = new
             .bands
@@ -356,15 +357,15 @@ pub fn changes(old: &Params, new: &Params) -> Vec<String> {
                 BandKind::Notch => format!("notch at {}", hz(b.freq)),
             })
             .collect();
-        line("Equalizer", &[Some(bands.join(", "))]);
+        line("Tone", &[Some(bands.join(", "))]);
     }
-    line("De-esser", &[db("threshold ", old.deess_threshold_db, new.deess_threshold_db)]);
-    let ratio = (old.comp_ratio != new.comp_ratio).then(|| format!("ratio {:.0}:1 → {:.0}:1", old.comp_ratio, new.comp_ratio));
+    line("Soften S sounds", &[db("starts at ", old.deess_threshold_db, new.deess_threshold_db)]);
+    let ratio = (old.comp_ratio != new.comp_ratio).then(|| format!("strength {:.0}:1 → {:.0}:1", old.comp_ratio, new.comp_ratio));
     line(
-        "Compressor",
-        &[db("threshold ", old.comp_threshold_db, new.comp_threshold_db), ratio, db("makeup ", old.comp_makeup_db, new.comp_makeup_db)],
+        "Tame loud parts",
+        &[db("starts at ", old.comp_threshold_db, new.comp_threshold_db), ratio, db("boost after ", old.comp_makeup_db, new.comp_makeup_db)],
     );
-    line("Output", &[db("gain ", old.output_gain_db, new.output_gain_db)]);
+    line("Loudness", &[db("", old.output_gain_db, new.output_gain_db)]);
     out
 }
 

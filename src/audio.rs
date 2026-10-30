@@ -3,7 +3,7 @@
 //! cpal's; the two it can't open (exclusive output, every app but this one as the echo
 //! source) run on their own threads with the wasapi crate.
 
-use crate::dsp::{Chain, FRAME, Kind, Meters, Params, Profile, Profiles, SR};
+use crate::dsp::{Chain, FRAME, Learner, Meters, Params, Profiles, SR};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use ringbuf::HeapRb;
@@ -18,23 +18,31 @@ use std::time::{Duration, Instant};
 /// Input channels with their own level meter.
 pub const MAX_CH: usize = 8;
 
-/// GUI <-> mic callback mailbox. The callback only ever try_locks it.
+/// GUI <-> mic callback mailbox. The callback only ever try_locks it, and never allocates or
+/// frees through it: whatever it lets go of goes back here for the GUI to drop.
 #[derive(Default)]
 pub struct Shared {
     pub params: Params,
     pub params_ver: u64,
+    /// The learned sounds the GUI last handed over.
     pub profiles: Profiles,
-    pub profiles_ver: u64,
-    /// Learn request from the GUI: what, and for how many seconds.
-    pub learn: Option<(Kind, f32)>,
-    /// Finished learn run for the GUI to store, or why it couldn't be learned.
-    pub learned: Option<(Kind, Result<Profile, &'static str>)>,
+    /// A new copy of them for the callback to swap in; it hands its old one back in `old_profiles`.
+    pub new_profiles: Option<Profiles>,
+    pub old_profiles: Option<Profiles>,
+    /// Learn run from the GUI, and the same run back with all its frames.
+    pub learn: Option<Learner>,
+    pub learned: Option<Learner>,
     /// Zeroed buffer from the GUI to record the mic into (before the chain), returned when full.
     pub record: Option<Vec<f32>>,
     pub recorded: Option<Vec<f32>>,
+    /// A recording a new `record` cut short (an empty one stops it), for the GUI to drop.
+    pub discarded: Option<Vec<f32>>,
     pub record_progress: Option<f32>,
     /// Silences the monitor output while a recording plays back on it.
     pub mute_monitor: bool,
+    /// Silences what's sent (not Hear myself) while Smart setup listens to the room and to you
+    /// reading, which friends shouldn't have to hear.
+    pub mute_sent: bool,
     /// The window is on screen, so the display-only spectra are worth computing.
     pub viz: bool,
     pub latency: Arc<Latency>,
@@ -101,6 +109,19 @@ pub fn default_output_name() -> Option<String> {
     d.description().ok().map(|d| d.name().to_string())
 }
 
+/// VB-Cable's ends, also when renamed in Windows: as a mic, MicClean would hear itself.
+pub fn is_cable(name: &str) -> bool {
+    name.contains("CABLE") || name.contains("VB-Audio")
+}
+
+/// The mic to start with: Windows' default one, unless that's a cable or Stereo Mix (what the
+/// PC plays), then the first real one.
+pub fn first_mic(inputs: &[String]) -> Option<String> {
+    let real = |n: &String| !is_cable(n) && !n.contains("Stereo Mix");
+    let default = cpal::default_host().default_input_device().and_then(|d| d.description().ok()).map(|d| d.name().to_string());
+    default.filter(real).or_else(|| inputs.iter().find(|n| real(n)).cloned())
+}
+
 pub fn device_names(input: bool) -> Vec<String> {
     let host = cpal::default_host();
     let devs = if input { host.input_devices() } else { host.output_devices() };
@@ -130,7 +151,10 @@ fn es(e: impl std::fmt::Display) -> String {
 /// they must not trigger a reconnect; anything else asks the GUI to reopen the devices.
 fn on_error(shared: Arc<Mutex<Shared>>, dev: String) -> impl FnMut(cpal::Error) + Send + 'static {
     move |e: cpal::Error| {
-        let Ok(mut s) = shared.lock() else { return };
+        // cpal calls this on the capture thread for every glitch: those never wait for the GUI
+        // (one missed count is fine). Real errors are rare enough to wait.
+        let s = if matches!(e.kind(), cpal::ErrorKind::Xrun) { shared.try_lock().ok() } else { shared.lock().ok() };
+        let Some(mut s) = s else { return };
         match e.kind() {
             cpal::ErrorKind::Xrun => {
                 s.glitches += 1;
@@ -185,24 +209,29 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     let (mut workers, mut shared_output) = (Vec::new(), None);
     let mut outs = Vec::new(); // (ring, is_monitor)
     let latency = shared.lock().map_err(es)?.latency.clone();
-    let exclusive = if dev.exclusive_output && can_be_exclusive(&dev.output) {
-        open_output_exclusive(&dev.output, shared.clone(), latency.clone()).map_err(|e| shared_output = Some(e)).ok()
+    // No output yet (Setup, before VB-Cable is in): the mic still runs, for the meters.
+    if dev.output.is_empty() {
+        info += ", nothing sent yet";
     } else {
-        None
-    };
-    let prod = match exclusive {
-        Some((worker, prod)) => {
-            workers.push(worker);
-            info += ", output exclusive";
-            prod
-        }
-        None => {
-            let (stream, prod) = open_output(&dev.output, shared.clone(), Some(latency.clone()))?;
-            streams.push(stream);
-            prod
-        }
-    };
-    outs.push((prod, false));
+        let exclusive = if dev.exclusive_output && can_be_exclusive(&dev.output) {
+            open_output_exclusive(&dev.output, shared.clone(), latency.clone()).map_err(|e| shared_output = Some(e)).ok()
+        } else {
+            None
+        };
+        let prod = match exclusive {
+            Some((worker, prod)) => {
+                workers.push(worker);
+                info += ", output exclusive";
+                prod
+            }
+            None => {
+                let (stream, prod) = open_output(&dev.output, shared.clone(), Some(latency.clone()))?;
+                streams.push(stream);
+                prod
+            }
+        };
+        outs.push((prod, false));
+    }
     // Headphones unplugged shouldn't take the Discord feed down with them.
     if let Some(name) = &dev.monitor {
         match open_output(name, shared.clone(), None) {
@@ -256,16 +285,24 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     let in_cfg = StreamConfig::new(rate, 1);
     let out_cfg = StreamConfig::new(SR as u32, 1);
     let mut chain = Chain::default();
+    let mut profiles = Profiles::default();
+    {
+        let mut sh = shared.lock().map_err(es)?;
+        // Auto level carries on where the last engine left off instead of starting at 0 dB.
+        // ponytail: with Auto level off the meter reads 0, so it starts there; it climbs back
+        // within a few seconds once turned on.
+        chain.set_agc(sh.meters.agc_db);
+        sh.new_profiles = Some(sh.profiles.clone());
+    }
     let frame_in = rate as usize / 100;
     let mut acc = Vec::with_capacity(frame_in);
     let mut frame = [0.0f32; FRAME];
     let (mut params, mut params_ver) = (Params::default(), u64::MAX);
-    let (mut profiles, mut profiles_ver) = (Profiles::default(), u64::MAX);
     let ref_n = echo.as_ref().map_or(0, |e| e.1 as usize / 100);
     let (mut ref_in, mut ref_out) = (vec![0.0f32; ref_n], vec![0.0f32; ref_n]);
     let mut starved = 0;
     let (mut rec, mut rec_pos) = (None::<Vec<f32>>, 0);
-    let mut mute_monitor = false;
+    let (mut mute_monitor, mut mute_sent) = (false, false);
     let mut ch_peak = [0.0f32; MAX_CH];
     let sh = shared.clone();
 
@@ -283,18 +320,18 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
                     params = sh.params.clone();
                     params_ver = sh.params_ver;
                 }
-                if sh.profiles_ver != profiles_ver {
-                    profiles = sh.profiles.clone();
-                    profiles_ver = sh.profiles_ver;
+                if let Some(mut p) = sh.new_profiles.take() {
+                    std::mem::swap(&mut profiles, &mut p);
+                    sh.old_profiles = Some(p);
                 }
-                if let Some((kind, secs)) = sh.learn.take() {
-                    chain.start_learning(kind, secs);
+                if let Some(l) = sh.learn.take() {
+                    chain.start_learning(l);
                 }
-                if let Some(r) = chain.take_learned() {
-                    sh.learned = Some(r);
+                if let Some(l) = chain.take_learned() {
+                    sh.learned = Some(l);
                 }
                 if let Some(buf) = sh.record.take() {
-                    rec = Some(buf);
+                    sh.discarded = rec.replace(buf);
                     rec_pos = 0;
                 }
                 // The GUI empties these when it reads them.
@@ -303,7 +340,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
                 if rec.as_ref().is_some_and(|r| rec_pos == r.len()) {
                     sh.recorded = rec.take();
                 }
-                mute_monitor = sh.mute_monitor;
+                (mute_monitor, mute_sent) = (sh.mute_monitor, sh.mute_sent);
                 chain.viz = sh.viz;
                 sh.meters = chain.meters.clone();
             }
@@ -346,8 +383,14 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
             }
             chain.process(&params, &profiles, &mut frame);
             for (o, is_monitor) in &mut outs {
-                if !(*is_monitor && mute_monitor) {
-                    o.push_slice(&frame);
+                match (*is_monitor, mute_monitor, mute_sent) {
+                    (true, true, _) => {}
+                    (false, _, true) => {
+                        o.push_slice(&[0.0; FRAME]);
+                    }
+                    _ => {
+                        o.push_slice(&frame);
+                    }
                 }
             }
             let load = t0.elapsed().as_secs_f32() / 0.01;

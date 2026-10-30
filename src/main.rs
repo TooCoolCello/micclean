@@ -15,7 +15,6 @@ use audio::{Devices, Engine, Shared};
 use dsp::{Band, BandKind, Kind, Meters, NoiseProfile, Params, Profiles, SPEC_BINS, SPEC_LO, SPEC_SPAN};
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText, Stroke, ViewportCommand};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,10 +23,12 @@ use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use ui::icon;
 
-// ponytail: a fixed localhost port is the single-instance lock; a named mutex if it ever collides.
+/// "Show your window" pings from a second launch go to this localhost port plus the Windows
+/// session number, so each signed-in user has their own.
 const INSTANCE_PORT: u16 = 47391;
-const HELLO: &[u8] = b"MICCLEAN\n";
 const RECORD_SECS: usize = 10;
+/// A raw mic peak this close to full scale (-0.3 dBFS) is clipping before MicClean.
+const CLIP_LEVEL: f32 = 0.966;
 /// Set when a second launch or the tray asks for the window.
 static SHOW: AtomicBool = AtomicBool::new(false);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
@@ -38,40 +39,34 @@ fn main() -> eframe::Result {
         install::uninstall(std::env::args().any(|a| a == "--silent"));
         return Ok(());
     }
-    let mut lock = TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT));
-    if std::env::args().any(|a| a == "--updated") {
-        // Started by setup after an update: the old copy may still be letting go of the lock.
+    let mut first = first_copy();
+    if !first && std::env::args().any(|a| a == "--updated") {
+        // Started by setup after an update: the old copy may still be closing.
         for _ in 0..50 {
-            if lock.is_ok() {
+            std::thread::sleep(Duration::from_millis(200));
+            first = first_copy();
+            if first {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(200));
-            lock = TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT));
         }
     }
-    match lock {
-        Ok(listener) => {
-            std::thread::spawn(move || {
-                for mut c in listener.incoming().flatten() {
-                    let _ = c.write_all(HELLO);
-                    SHOW.store(true, Ordering::Relaxed);
-                    if let Some(ctx) = CTX.get() {
-                        ctx.request_repaint();
-                    }
+    let port = instance_port();
+    if !first {
+        // Already running: that copy shows its window, this one leaves. Two copies would
+        // both grab the mic and double the audio going to Discord.
+        let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, port));
+        return Ok(());
+    }
+    // Only for the window pings: if another program holds the port, the lock still works.
+    if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+        std::thread::spawn(move || {
+            for _ in listener.incoming().flatten() {
+                SHOW.store(true, Ordering::Relaxed);
+                if let Some(ctx) = CTX.get() {
+                    ctx.request_repaint();
                 }
-            });
-        }
-        Err(_) => {
-            // Already running: that copy shows its window, this one leaves. Two copies would
-            // both grab the mic and double the audio going to Discord.
-            let mut hello = [0u8; HELLO.len()];
-            let is_us = TcpStream::connect((Ipv4Addr::LOCALHOST, INSTANCE_PORT))
-                .and_then(|mut s| s.read_exact(&mut hello))
-                .is_ok_and(|_| hello == HELLO);
-            if is_us {
-                return Ok(());
             }
-        }
+        });
     }
 
     if let Some(dir) = eframe::storage_dir("MicClean") {
@@ -81,7 +76,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 720.0])
-            .with_min_inner_size([420.0, 420.0])
+            // Below this, header rows (a picker or buttons beside the text) don't fit.
+            .with_min_inner_size([640.0, 480.0])
             .with_title("MicClean")
             .with_icon(Arc::new(egui::IconData { rgba: icon_rgba(true), width: ICON, height: ICON }))
             .with_visible(!hidden),
@@ -98,6 +94,33 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// One copy per Windows session: a named mutex in the session's own (Local\) namespace, so
+/// another Windows user (fast user switching, Remote Desktop) runs their own copy. The first
+/// copy keeps its handle until it exits; a later one closes its own at once, or it would keep
+/// the mutex alive after the first one has gone.
+fn first_copy() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = "Local\\MicClean\0".encode_utf16().collect();
+    // SAFETY: a NUL-terminated name that outlives the call; the handle is only closed here.
+    unsafe {
+        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if !h.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(h);
+            return false;
+        }
+    }
+    true
+}
+
+fn instance_port() -> u16 {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    let mut session = 0u32;
+    // SAFETY: writes one u32 into `session`.
+    unsafe { ProcessIdToSessionId(std::process::id(), &mut session) };
+    INSTANCE_PORT + (session % 100) as u16
 }
 
 /// Everything that survives a restart (eframe stores it in %APPDATA%\MicClean).
@@ -130,9 +153,25 @@ struct Preset {
     params: Params,
 }
 
-/// Same settings, ignoring the Bypass switch (that's a listening aid, not part of a preset).
-fn same_preset(a: &Params, b: &Params) -> bool {
-    Params { bypass: false, ..a.clone() } == Params { bypass: false, ..b.clone() }
+/// `current` with a preset picked: a preset is a style, so what Smart setup measured for your
+/// mic and voice (input gain, gate level, EQ, compressor level, loudness) stays, and so does
+/// Bypass (a listening aid, not part of a preset).
+fn with_preset(current: &Params, preset: &Params) -> Params {
+    Params {
+        bypass: current.bypass,
+        input_gain_db: current.input_gain_db,
+        gate_threshold_db: current.gate_threshold_db,
+        bands: current.bands,
+        comp_threshold_db: current.comp_threshold_db,
+        comp_makeup_db: current.comp_makeup_db,
+        output_gain_db: current.output_gain_db,
+        ..preset.clone()
+    }
+}
+
+/// The current settings are this preset's style.
+fn same_preset(preset: &Params, current: &Params) -> bool {
+    with_preset(current, preset) == *current
 }
 
 /// Talking = your settings as they are; Singing and Gaming are small changes from there,
@@ -178,12 +217,14 @@ impl Stage {
     }
 }
 
-/// "Hold to hear it off": bypasses one stage only while the button is held down.
-fn ab_row(ui: &mut egui::Ui, stage: Stage, shown: Option<Stage>, hold: &mut Option<Stage>) {
+/// "Hold to hear it off": bypasses one stage only while the button is held down. It changes
+/// what's sent, so without Hear myself (`can_hear`) only friends would notice.
+fn ab_row(ui: &mut egui::Ui, stage: Stage, shown: Option<Stage>, hold: &mut Option<Stage>, can_hear: bool) {
     ui::row(ui, "Compare", |ui| {
         let held = shown == Some(stage);
         let label = if held { "Off while held" } else { "Hold to hear it off" };
-        if ui.add(egui::Button::new(label).selected(held)).is_pointer_button_down_on() {
+        let button = ui.add_enabled(can_hear, egui::Button::new(label).selected(held));
+        if button.on_disabled_hover_text("Turn on Hear myself (Home) to hear the difference").is_pointer_button_down_on() {
             *hold = Some(stage);
         }
     });
@@ -204,12 +245,22 @@ struct OldSave {
     params: OldEq,
 }
 
-/// Loads the settings, turning an old fixed EQ into the same filters as bands. The next save
-/// writes bands only, so this converts once.
-// ponytail: drop OldEq once nobody has a pre-parametric save left.
 fn load(storage: &dyn eframe::Storage) -> Saved {
-    let mut saved: Saved = eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
-    if let Some(OldSave { params: o }) = eframe::get_value(storage, eframe::APP_KEY) {
+    parse_saved(storage.get_string(eframe::APP_KEY).as_deref()).unwrap_or_else(|e| {
+        // The file itself is still in the backups.
+        logfile::line(&format!("Couldn't read the settings, so they're back to defaults: {e}"));
+        parse_saved(None).unwrap_or_default()
+    })
+}
+
+/// Settings from their saved text (eframe's "app" value; restoring a backup uses it too),
+/// turning an old fixed EQ into the same filters as bands and old learned-sound floors into
+/// ones before input gain, and every value into its slider's range. The next save writes the
+/// new forms, so each converts once.
+// ponytail: drop OldEq once nobody has a pre-parametric save left.
+fn parse_saved(text: Option<&str>) -> Result<Saved, ron::error::SpannedError> {
+    let mut saved: Saved = text.map(ron::from_str).transpose()?.unwrap_or_default();
+    if let Some(OldSave { params: o }) = text.and_then(|t| ron::from_str(t).ok()) {
         let band = |kind, freq, q, gain_db| Some(Band { kind, freq, gain_db, q, on: true });
         let boost = |kind, freq, q, gain_db: f32| if gain_db != 0.0 { band(kind, freq, q, gain_db) } else { None };
         saved.params.bands = [
@@ -220,13 +271,17 @@ fn load(storage: &dyn eframe::Storage) -> Saved {
             None,
         ];
     }
+    saved.params.sanitize();
+    saved.presets.iter_mut().for_each(|p| p.params.sanitize());
+    saved.smart.iter_mut().for_each(Params::sanitize);
+    saved.profiles.migrate_floors(saved.params.input_gain_db);
     if !saved.presets_seeded {
         saved.presets = starter_presets(&saved.params);
         saved.presets_seeded = true;
     }
     // A listening aid: left on, it would send the raw mic after the next reboot.
     saved.params.bypass = false;
-    saved
+    Ok(saved)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -281,7 +336,7 @@ fn echo_choices(outputs: &[String]) -> Vec<String> {
 
 /// Windows' classic Sound dialog, where Properties → Advanced sets a device's rate.
 fn open_sound_settings() {
-    let _ = std::process::Command::new("control").arg("mmsys.cpl").spawn();
+    let _ = std::process::Command::new(install::windows_exe(install::CONTROL)).arg("mmsys.cpl").spawn();
 }
 
 /// A box in the signal chain; clicking one opens its settings under the chain.
@@ -441,6 +496,15 @@ struct App {
     hidden: bool,
     /// Last time you were talking, so an automatic update waits for a pause.
     last_voice: Instant,
+    /// When the mic clipped before MicClean in the last 10 s; 3 of them show a warning until
+    /// `clipping_until`.
+    clips: Vec<Instant>,
+    clipping_until: Option<Instant>,
+    /// Settings' Reset asks once more; then Undo has the settings from before.
+    reset_armed: bool,
+    reset_undo: Option<Params>,
+    /// What the last backup, restore or dropped file did.
+    backup_msg: String,
     page: Page,
     /// The chain box whose settings are open on Home.
     node: Option<Node>,
@@ -481,6 +545,8 @@ impl App {
         });
         logfile::line(&format!("MicClean {} started", update::VERSION));
         let saved = cc.storage.map(load).unwrap_or_default();
+        // Nothing saved yet. (No storage at all isn't one: it would turn autostart on each start.)
+        let first_start = cc.storage.is_some_and(|s| s.get_string(eframe::APP_KEY).is_none());
         let shared = Shared {
             params: saved.params.clone(),
             profiles: saved.profiles.clone(),
@@ -546,6 +612,11 @@ impl App {
             hide_in: 0,
             hidden: false,
             last_voice: now,
+            clips: Vec::new(),
+            clipping_until: None,
+            reset_armed: false,
+            reset_undo: None,
+            backup_msg: String::new(),
             page: Page::Home,
             node: None,
             calib: None,
@@ -585,10 +656,15 @@ impl App {
         app.refresh_devices();
         // A save with a mic in it is from before Setup existed: that person is set up.
         app.saved.setup_done |= !app.saved.devices.input.is_empty();
+        if first_start && app.installed && !app.autostart {
+            // On unless turned off (Setup's last step and Settings have the switch): Discord
+            // listens to the cable from sign-in, and a silent one sounds like a broken mic.
+            app.autostart = autostart::set(true);
+        }
         app.page = if app.saved.setup_done { Page::Home } else { Page::Setup };
         let d = &mut app.saved.devices;
         if d.input.is_empty() {
-            d.input = app.inputs.first().cloned().unwrap_or_default();
+            d.input = audio::first_mic(&app.inputs).unwrap_or_default();
         }
         if d.output.is_empty() {
             // VB-Cable's playback side is what Discord then picks up as "CABLE Output".
@@ -615,8 +691,8 @@ impl App {
         self.in_channels = mic.map_or(1, |f| f.1);
         let rate = |name: &str| format(false, name).map(|f| f.0);
         self.rates = [mic.map(|f| f.0), rate(&d.output), d.monitor.as_deref().and_then(rate)];
-        if self.saved.devices.input.is_empty() || self.saved.devices.output.is_empty() {
-            self.status = "Click Input and Output in the signal chain to pick your devices.".into();
+        if self.saved.devices.input.is_empty() {
+            self.status = "Pick your mic in Setup.".into();
             return;
         }
         match audio::start(&self.saved.devices, self.shared.clone()) {
@@ -635,7 +711,7 @@ impl App {
             self.last_frames = self.meters.frames;
             self.last_beat = now;
         }
-        if now < self.next_check || self.saved.devices.input.is_empty() || self.saved.devices.output.is_empty() {
+        if now < self.next_check || self.saved.devices.input.is_empty() {
             return;
         }
         self.next_check = now + Duration::from_secs(3);
@@ -644,10 +720,12 @@ impl App {
         if waiting_for_device {
             self.refresh_devices();
         }
-        let came_back = self
-            .engine
-            .as_ref()
-            .is_some_and(|e| e.missing.iter().any(|m| self.outputs.contains(m)));
+        // Like a device change, it waits for Smart setup, a recording or a learn to finish.
+        let came_back = !self.busy()
+            && self
+                .engine
+                .as_ref()
+                .is_some_and(|e| e.missing.iter().any(|m| self.outputs.contains(m)));
         if stalled {
             logfile::line("No sound from the input for 2 s, restarting audio");
         }
@@ -658,6 +736,13 @@ impl App {
             self.refresh_devices();
             self.restart();
         }
+    }
+
+    /// A device change restarts audio, which would cut Smart setup, a recording or a learn
+    /// short without a word: it waits for them to finish. Without audio those can't finish
+    /// (and their state is stale), so nothing waits then.
+    fn busy(&self) -> bool {
+        self.engine.is_some() && (self.calib.is_some() || self.record_progress.is_some() || self.meters.learning.is_some())
     }
 
     fn sync(&mut self) {
@@ -676,11 +761,14 @@ impl App {
             sh.params_ver += 1;
         }
         sh.viz = self.viz;
+        sh.mute_sent = self.calib.is_some();
         self.latency_us = (sh.latency.capture_us.load(Ordering::Relaxed), sh.latency.output_us.load(Ordering::Relaxed));
-        if let Some((kind, prof)) = sh.learned.take() {
-            match prof {
+        // Dropped here, on the GUI thread: the audio thread never frees anything.
+        (sh.old_profiles, sh.discarded) = (None, None);
+        if let Some(l) = sh.learned.take() {
+            match l.finish() {
                 Err(why) => self.learn_msg = why.into(),
-                Ok(profile) if kind == Kind::Keep => {
+                Ok(profile) if l.kind == Kind::Keep => {
                     self.saved.profiles.keep = Some(profile);
                     self.learn_msg = "Learned your voice.".into();
                 }
@@ -700,7 +788,7 @@ impl App {
         }
         if sh.profiles != self.saved.profiles {
             sh.profiles = self.saved.profiles.clone();
-            sh.profiles_ver += 1;
+            sh.new_profiles = Some(self.saved.profiles.clone());
         }
         // Smart setup's own recording while it runs, otherwise the test page's. Empty ones
         // were stopped.
@@ -711,8 +799,22 @@ impl App {
             }
         }
         self.record_progress = sh.record_progress;
-        for (h, p) in self.chan_hold.iter_mut().zip(std::mem::take(&mut sh.channel_peak)) {
+        let peaks = std::mem::take(&mut sh.channel_peak);
+        for (h, p) in self.chan_hold.iter_mut().zip(peaks) {
             *h = (20.0 * p.max(1e-6).log10()).max(*h - 0.5);
+        }
+        // Clipping before MicClean: the mic channel (or all of them, mixed) hit full scale.
+        let raw = match self.saved.devices.input_channel {
+            Some(c) => peaks.get(c as usize).copied().unwrap_or(0.0),
+            None => peaks.iter().fold(0.0f32, |m, &p| m.max(p)),
+        };
+        let now = Instant::now();
+        self.clips.retain(|t| now - *t < Duration::from_secs(10));
+        if raw >= CLIP_LEVEL && self.engine.is_some() {
+            self.clips.push(now);
+            if self.clips.len() >= 3 {
+                self.clipping_until = Some(now + Duration::from_secs(30));
+            }
         }
         if let Some(e) = sh.error.take() {
             self.status = format!("Audio error: {e} (reconnecting)");
@@ -728,7 +830,8 @@ impl App {
         self.stop_playback();
         let Some(raw) = &self.clip else { return };
         let clip = if processed {
-            dsp::render(raw, &self.saved.params, &self.saved.profiles)
+            // What friends get with cleaning on, whatever Bypass is set to right now.
+            dsp::render(raw, &Params { bypass: false, ..self.saved.params.clone() }, &self.saved.profiles)
         } else {
             raw.clone()
         };
@@ -750,7 +853,7 @@ impl App {
 
     fn learn(&mut self, kind: Kind, secs: f32) {
         self.learn_msg.clear();
-        self.shared.lock().unwrap().learn = Some((kind, secs));
+        self.shared.lock().unwrap().learn = Some(dsp::Learner::new(kind, secs, self.saved.params.input_gain_db));
     }
 
     /// Status changes, glitches (at most a line a minute) and update steps go to the log file.
@@ -784,7 +887,9 @@ impl App {
         let (raw, out) = if running { (m.in_db - self.saved.params.input_gain_db, m.out_db) } else { (-120.0, -120.0) };
         self.raw_hold = raw.max(self.raw_hold - 0.5);
         self.out_hold = out.max(self.out_hold - 0.5);
-        let talking = running && m.vad >= 0.5 && m.gate_open && !self.saved.params.bypass;
+        // By the voice detector, not the gate: a mic too quiet to open the gate is exactly the
+        // one the "very quiet" banner is for.
+        let talking = running && m.vad >= 0.5 && !self.saved.params.bypass;
         if running && m.vad >= 0.5 && m.gate_level_db > self.saved.params.gate_threshold_db {
             self.last_voice = Instant::now();
         }
@@ -813,17 +918,38 @@ impl App {
             return Some(("no_output", "Nothing is being sent".into(), desc, Some(Fix::Setup)));
         }
         if self.engine.is_none() {
+            // Unplugged or renamed: Restart would only try the same device again.
+            let gone = [(&d.input, &self.inputs), (&d.output, &self.outputs)].into_iter().find(|(n, list)| !n.is_empty() && !list.contains(n));
+            if let Some((name, _)) = gone {
+                let desc = format!("{name} isn't connected. Plug it back in, or pick another one in Setup.");
+                return Some(("stopped", "A device is missing".into(), desc, Some(Fix::Setup)));
+            }
             return Some(("stopped", "Audio isn't running".into(), self.status.clone(), Some(Fix::Restart)));
         }
         if self.saved.params.bypass {
             let desc = "Your mic is being sent without any cleaning.".into();
             return Some(("bypass", "Bypass is on".into(), desc, Some(Fix::BypassOff)));
         }
+        if audio::is_cable(&d.input) && open("mic_cable") {
+            let desc = "MicClean would hear its own output and loop it back. Pick your real mic in Setup.".into();
+            return Some(("mic_cable", "Your mic is set to VB-Cable".into(), desc, Some(Fix::Setup)));
+        }
+        if self.clipping_until.is_some_and(|t| Instant::now() < t) && open("clipping") {
+            let desc = "It distorts before MicClean gets it, and nothing after can undo that. Turn down the gain knob on your mic or audio interface, or the mic level in Sound settings.".into();
+            return Some(("clipping", "Your mic is clipping".into(), desc, Some(Fix::SoundSettings)));
+        }
         if let Some((name, why)) = self.engine.as_ref().and_then(|e| e.failed.first())
             && open("failed")
         {
-            let desc = format!("It's plugged in but wouldn't start: {why}. Close other apps using it, then Restart.");
-            return Some(("failed", format!("Couldn't open {name}"), desc, Some(Fix::Restart)));
+            let desc = format!("{name} is plugged in but wouldn't start: {why}. Close other apps using it, then Restart.");
+            return Some(("failed", "A device couldn't start".into(), desc, Some(Fix::Restart)));
+        }
+        if let Some(name) = self.engine.as_ref().and_then(|e| e.missing.first())
+            && open("missing")
+        {
+            let what = if d.monitor.as_ref() == Some(name) { "Hear myself" } else { "Echo cancellation" };
+            let desc = format!("{name} isn't connected, so {what} is paused. It starts again when the device is back.");
+            return Some(("missing", format!("{what} is paused"), desc, None));
         }
         if d.monitor.is_some() && d.monitor == d.echo_ref && open("echo_monitor") {
             let desc = "Echo cancellation hears your own voice played back on the same device, and removes part of it. \"Everything you hear\" leaves MicClean out.".into();
@@ -839,8 +965,8 @@ impl App {
         if let Some((name, r)) = names.iter().zip(self.rates).find_map(|(n, r)| Some((n.as_ref()?, r.filter(|&r| r != dsp::SR as u32)?)))
             && open("rate")
         {
-            let desc = "That adds delay. In Sound settings, set it to 48000 Hz under Properties → Advanced.".into();
-            return Some(("rate", format!("{name} runs at {r} Hz"), desc, Some(Fix::SoundSettings)));
+            let desc = format!("{name} runs at {r} Hz, which adds delay. In Sound settings, set it to 48000 Hz under Properties → Advanced.");
+            return Some(("rate", "A device isn't at 48000 Hz".into(), desc, Some(Fix::SoundSettings)));
         }
         if s.voiced >= 300 && s.raw_peak < -42.0 && open("quiet") {
             let desc = "Turn up the gain knob on your mic or audio interface. It's cleaner than adding gain here.".into();
@@ -919,7 +1045,7 @@ impl App {
                         let before = o.params.output_gain_db;
                         o.params.output_gain_db = smart::output_gain(&o.params, &self.saved.profiles, audio);
                         if o.params.output_gain_db < before {
-                            o.notes.push("Output turned down so your loudest words stay 6 dB under the limiter. Working on every word, it squashes them and sounds like clipping.".into());
+                            o.notes.push("Loudness turned down so your loudest words stay clear of the clip guard. Working on every word, it squashes them and sounds like clipping.".into());
                         }
                     }
                     let old = self.saved.params.clone();
@@ -994,7 +1120,7 @@ impl eframe::App for App {
             self.quitting = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
-        if self.saved.devices != self.engine_devices {
+        if self.saved.devices != self.engine_devices && !self.busy() {
             self.restart();
         }
 
@@ -1058,6 +1184,11 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
             self.hidden = true;
         }
+        // A settings file dropped on the window (a backup, or one a friend sent) loads.
+        if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
+            self.load_settings_file(&path);
+            self.page = Page::Settings;
+        }
 
         self.viz = true;
         // Whatever was held down last frame is what the audio hears now; buttons re-arm it.
@@ -1071,13 +1202,14 @@ impl eframe::App for App {
         let p = ui::pal(ui);
         // Like Windows' NavigationView: labels when there's room, icons only when narrow or
         // folded with the menu button.
-        let compact = self.saved.nav_compact || ui.available_width() < 720.0;
+        let narrow = ui.available_width() < 720.0;
+        let compact = self.saved.nav_compact || narrow;
         egui::Panel::left("nav")
             .exact_size(if compact { 56.0 } else { 240.0 })
             .resizable(false)
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 4, right: 4, top: 10, bottom: 8 }))
-            .show(ui, |ui| self.nav(ui, compact));
+            .show(ui, |ui| self.nav(ui, compact, narrow));
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 0 }))
             .show(ui, |ui| {
@@ -1146,9 +1278,10 @@ fn match_bar(ui: &mut egui::Ui, dist: f32, looseness: f32) {
 }
 
 impl App {
-    fn nav(&mut self, ui: &mut egui::Ui, compact: bool) {
+    /// `narrow`: the window is too narrow for labels, so the fold button has nothing to do.
+    fn nav(&mut self, ui: &mut egui::Ui, compact: bool, narrow: bool) {
         let fold = if compact { "Show labels" } else { "MicClean" };
-        if ui::nav_item(ui, icon::MENU, fold, false, compact).clicked() {
+        if !narrow && ui::nav_item(ui, icon::MENU, fold, false, compact).clicked() {
             self.saved.nav_compact = !compact;
         }
         ui.add_space(4.0);
@@ -1201,7 +1334,7 @@ impl App {
         let verdict = match () {
             _ if !running => "Not running",
             _ if s.voiced < 100 => "Talk to see your level",
-            _ if s.out_peak < -26.0 => "Quiet. Turn Loudness up, or run Smart setup",
+            _ if s.out_peak < -26.0 => "Quiet. Turn Loudness up",
             _ if s.out_peak > -8.0 => "Loud. Turn Loudness down",
             _ => "A good level",
         };
@@ -1219,7 +1352,7 @@ impl App {
 
         let (pr, d, outputs) = (&mut self.saved.params, &mut self.saved.devices, &self.outputs);
         ui::group(ui, icon::VOLUME, "Your sound", "The main switches. Every setting is in Advanced", None, |ui| {
-            ui::row(ui, "Remove background noise", |ui| {
+            ui::row(ui, Node::Noise.title(), |ui| {
                 // Normal covers Smart setup's gentler strengths for quiet rooms.
                 let mut level = if !pr.denoise { 0 } else if pr.denoise_strength < 0.95 { 1 } else { 2 };
                 let before = level;
@@ -1233,7 +1366,7 @@ impl App {
                     }
                 }
             });
-            ui::row(ui, "Mute me when I'm not talking", |ui| {
+            ui::row(ui, Node::Gate.title(), |ui| {
                 ui::toggle(ui, &mut pr.gate);
             });
             ui::row(ui, "Loudness", |ui| {
@@ -1256,7 +1389,8 @@ impl App {
     /// Record 10 seconds of the raw mic, then play it back as it was and cleaned up.
     fn compare_card(&mut self, ui: &mut egui::Ui) {
         let recording = self.record_progress.is_some() && self.calib.is_none();
-        let has_clip = self.clip.is_some() && !recording;
+        // Not while Smart setup listens: the playback would end up in its measurement.
+        let has_clip = self.clip.is_some() && !recording && self.calib.is_none();
         let can_record = self.record_progress.is_none() && self.engine.is_some();
         let (mut record, mut original, mut processed, mut stop) = (false, false, false, false);
         let desc = "Record 10 seconds, then play it as it was and cleaned up, on Hear myself's device or your speakers";
@@ -1352,7 +1486,7 @@ impl App {
                 None => ui::row(ui, "VB-Cable isn't installed (free)", |ui| {
                     refresh |= ui.button("Refresh list").clicked();
                     if ui.button("Get VB-Cable").clicked() {
-                        let _ = std::process::Command::new("explorer").arg("https://vb-audio.com/Cable/").spawn();
+                        let _ = std::process::Command::new(install::windows_exe("explorer.exe")).arg("https://vb-audio.com/Cable/").spawn();
                     }
                 }),
                 _ => {}
@@ -1364,7 +1498,8 @@ impl App {
                     }
                 });
             }
-            egui::CollapsingHeader::new("Then in Discord").show(ui, |ui| {
+            // Open: without step 1 there, MicClean does nothing for Discord.
+            egui::CollapsingHeader::new("Then in Discord").default_open(true).show(ui, |ui| {
                 for line in [
                     "1. Voice & Video → Input Device: CABLE Output.",
                     "2. Turn off Noise Suppression, Echo Cancellation and Automatic Gain Control. MicClean does these.",
@@ -1402,6 +1537,8 @@ impl App {
 
         step(ui, 4, "Tune it to your voice", self.saved.smart.is_some());
         self.smart_card(ui);
+        step(ui, 5, "Keep it running", self.autostart);
+        self.autostart_row(ui);
         ui.add_space(14.0);
         if ui::accent_button(ui, true, "Done").clicked() {
             self.saved.setup_done = true;
@@ -1560,31 +1697,34 @@ impl App {
     fn presets_card(&mut self, ui: &mut egui::Ui) {
         let current = self.saved.presets.iter().position(|pr| same_preset(&pr.params, &self.saved.params));
         let desc = match current {
-            Some(i) => format!("Using \"{}\"", self.saved.presets[i].name),
-            None => "Changed since you picked one. Type a name and Save to keep these settings".into(),
+            Some(i) => format!("Using \"{}\". Presets change the style; Smart setup's levels and EQ stay", self.saved.presets[i].name),
+            None => "Changed since you picked one. Type a name and Save to keep this style".into(),
         };
-        let (mut pick, mut save, mut delete) = (None, false, false);
+        let (mut pick, mut save, mut delete) = (None, false, None);
         let (presets, name) = (&self.saved.presets, &mut self.preset_name);
         ui::setting(ui, icon::SETTINGS, "Preset", &desc, |ui| {
-            let bin = egui::Button::new(RichText::new(icon::DELETE).font(ui::icon_font(14.0))).frame(false);
-            delete = ui.add_enabled(current.is_some(), bin).on_hover_text("Delete this preset").clicked();
             save = ui
                 .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
-                .on_hover_text("Saves the current settings under this name (replaces one with the same name)")
+                .on_hover_text("Saves the current style under this name (replaces one with the same name)")
                 .clicked();
-            ui.add(egui::TextEdit::singleline(name).hint_text("New preset name").desired_width(130.0));
+            ui.add(egui::TextEdit::singleline(name).hint_text("New preset").desired_width(90.0));
             let shown = current.map_or("Choose", |i| presets[i].name.as_str());
-            egui::ComboBox::from_id_salt("preset").width(130.0).selected_text(shown).truncate().show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("preset").width(110.0).selected_text(shown).truncate().show_ui(ui, |ui| {
                 for (i, pr) in presets.iter().enumerate() {
-                    if ui.add(egui::Button::selectable(current == Some(i), &pr.name)).clicked() {
-                        pick = Some(i);
-                    }
+                    ui.horizontal(|ui| {
+                        let bin = egui::Button::new(RichText::new(icon::DELETE).font(ui::icon_font(12.0))).frame(false);
+                        if ui.add(bin).on_hover_text("Delete this preset").clicked() {
+                            delete = Some(i);
+                        }
+                        if ui.add(egui::Button::selectable(current == Some(i), &pr.name)).clicked() {
+                            pick = Some(i);
+                        }
+                    });
                 }
             });
         });
         if let Some(i) = pick {
-            let bypass = self.saved.params.bypass;
-            self.saved.params = Params { bypass, ..self.saved.presets[i].params.clone() };
+            self.saved.params = with_preset(&self.saved.params, &self.saved.presets[i].params);
         }
         if save {
             let name = self.preset_name.trim().to_string();
@@ -1595,7 +1735,7 @@ impl App {
             }
             self.preset_name.clear();
         }
-        if let (true, Some(i)) = (delete, current) {
+        if let Some(i) = delete {
             self.saved.presets.remove(i);
         }
     }
@@ -1606,9 +1746,9 @@ impl App {
         let p = ui::pal(ui);
         let can_start = self.engine.is_some() && !self.saved.params.bypass && self.record_progress.is_none();
         let (calib, report, has_undo) = (&self.calib, &self.smart_report, self.smart_undo.is_some());
-        let (mut start, mut cancel, mut undo) = (false, false, false);
+        let (mut start, mut cancel, mut undo, mut dismiss) = (false, false, false, false);
         ui::card(ui, |ui| {
-            let desc = "Listens to your room for 3 seconds and to you reading for 15, then sets each effect for your voice";
+            let desc = "Listens to your room for 3 seconds and to you reading for 15, then sets each effect for your voice. Friends hear silence while it listens";
             ui::header(ui, icon::SMART, "Smart setup", desc, |ui| {
                 if calib.is_some() {
                     cancel = ui.button("Cancel").clicked();
@@ -1632,11 +1772,18 @@ impl App {
                 for line in report {
                     ui.label(RichText::new(line).color(p.text2));
                 }
-                if has_undo {
-                    undo = ui.button("Undo").on_hover_text("Puts every setting back to how it was before").clicked();
-                }
+                ui.horizontal(|ui| {
+                    if has_undo {
+                        undo = ui.button("Undo").on_hover_text("Puts every setting back to how it was before Smart setup").clicked();
+                    }
+                    dismiss = ui.button("Dismiss").on_hover_text("Hides this. Smart setup's settings stay").clicked();
+                });
             }
         });
+        if dismiss {
+            // Undo would also throw away whatever was changed since, so it goes with the report.
+            (self.smart_report, self.smart_undo) = (Vec::new(), None);
+        }
         if start {
             self.calib = Some(Calib { start: Instant::now(), frame: 0, quiet: Vec::new(), talk: Vec::new(), audio: None });
             // A second shorter than setup, so it's back in time.
@@ -1678,7 +1825,12 @@ impl App {
             level_row(ui, "Out", m.out_db);
         });
         spectrum_card(ui, m, &self.saved.params);
-        ui::setting(ui, icon::POWER, "Bypass", "Send the raw mic to compare (echo cancellation stays on)", |ui| {
+        let desc = if self.saved.devices.monitor.is_some() {
+            "Send your mic without cleaning, to compare. Echo cancellation and the clip guard stay on"
+        } else {
+            "Send your mic without cleaning, to compare. Turn on Hear myself to hear the difference yourself"
+        };
+        ui::setting(ui, icon::POWER, "Bypass", desc, |ui| {
             ui::toggle(ui, &mut self.saved.params.bypass);
         });
     }
@@ -1688,6 +1840,7 @@ impl App {
     fn panel(&mut self, ui: &mut egui::Ui, node: Node, m: &Meters) {
         let p = ui::pal(ui);
         let snap = self.saved.params.clone(); // heap-free copy for the graphs to read
+        let can_hear = self.saved.devices.monitor.is_some();
         let (shown, hold) = (self.ab_shown, &mut self.ab_hold);
         let (agc_hist, pitch_hist, eq_ui) = (&self.agc_hist, &self.pitch_hist, &mut self.eq_ui);
         let (d, inputs, outputs) = (&mut self.saved.devices, &self.inputs, &self.outputs);
@@ -1749,7 +1902,7 @@ impl App {
             Node::Noise => ui::group(ui, icon::VOLUME, "Noise removal", "Removes fans, keyboards and room noise", Some(&mut pr.denoise), |ui| {
                 graphs::denoise_view(ui, m);
                 ui.add_space(6.0);
-                ab_row(ui, Stage::Denoise, shown, hold);
+                ab_row(ui, Stage::Denoise, shown, hold, can_hear);
                 ui::row(ui, "Strength", |ui| {
                     ui.add(egui::Slider::new(&mut pr.denoise_strength, 0.0..=1.0));
                 });
@@ -1761,12 +1914,12 @@ impl App {
                 });
             }),
             Node::Gate => {
-                ui::group(ui, icon::MUTE, "Voice gate", "Mutes you when you're not talking or singing", Some(&mut pr.gate), |ui| {
+                ui::group(ui, icon::MUTE, Node::Gate.title(), "Mutes you when you're not talking or singing", Some(&mut pr.gate), |ui| {
                     if let Some(t) = graphs::gate_graph(ui, &snap, m) {
                         pr.gate_threshold_db = t.clamp(-80.0, -10.0);
                     }
                     ui.add_space(6.0);
-                    ab_row(ui, Stage::Gate, shown, hold);
+                    ab_row(ui, Stage::Gate, shown, hold, can_hear);
                     ui::row(ui, "Minimum level", |ui| {
                         slider(ui, &mut pr.gate_threshold_db, -80.0..=-10.0, " dB");
                     });
@@ -1800,10 +1953,10 @@ impl App {
             }
             Node::Level => {
                 let desc = format!("Evens out quiet and loud · now {:+.1} dB", m.agc_db);
-                ui::group(ui, icon::VOLUME, "Auto level", &desc, Some(&mut pr.agc), |ui| {
+                ui::group(ui, icon::VOLUME, Node::Level.title(), &desc, Some(&mut pr.agc), |ui| {
                     graphs::history_graph(ui, agc_hist, -12.0, snap.agc_max_gain_db.max(1.0), Some(0.0), p.accent, "gain it applied, last 30 s");
                     ui.add_space(6.0);
-                    ab_row(ui, Stage::Agc, shown, hold);
+                    ab_row(ui, Stage::Agc, shown, hold, can_hear);
                     ui::row(ui, "Target level", |ui| {
                         slider(ui, &mut pr.agc_target_db, -36.0..=-10.0, " dB");
                     });
@@ -1814,18 +1967,18 @@ impl App {
                     });
                 });
             }
-            Node::Eq => ui::group(ui, icon::EQ, "Equalizer", "Up to 5 bands over your live output spectrum", Some(&mut pr.eq), |ui| {
+            Node::Eq => ui::group(ui, icon::EQ, Node::Eq.title(), "Up to 5 bands over your live output spectrum", Some(&mut pr.eq), |ui| {
                 eq_ui.show(ui, &mut pr.bands, &m.spec_out);
-                ab_row(ui, Stage::Eq, shown, hold);
+                ab_row(ui, Stage::Eq, shown, hold, can_hear);
             }),
             Node::Deess => {
                 let desc = format!("Tames harsh S sounds · now -{:.1} dB", m.deess_db);
-                ui::group(ui, icon::MUSIC, "De-esser", &desc, Some(&mut pr.deess), |ui| {
+                ui::group(ui, icon::MUSIC, Node::Deess.title(), &desc, Some(&mut pr.deess), |ui| {
                     let (lvl, thr) = (m.deess_level_db, snap.deess_threshold_db);
                     let hot = if lvl > thr { graphs::AMBER } else { p.accent };
                     graphs::meter_row(ui, "S sounds (5 kHz+)", lvl, -60.0, 0.0, Some(thr), hot, &format!("{lvl:.0} dB"));
                     graphs::meter_row(ui, "Cutting them by", m.deess_db, 0.0, 12.0, None, graphs::AMBER, &format!("-{:.1} dB", m.deess_db));
-                    ab_row(ui, Stage::Deess, shown, hold);
+                    ab_row(ui, Stage::Deess, shown, hold, can_hear);
                     ui::row(ui, "Threshold", |ui| {
                         slider(ui, &mut pr.deess_threshold_db, -50.0..=0.0, " dB");
                     });
@@ -1833,12 +1986,12 @@ impl App {
             }
             Node::Comp => {
                 let desc = format!("Keeps loud parts in check · now -{:.1} dB", m.gr_db);
-                ui::group(ui, icon::EQ, "Compressor", &desc, Some(&mut pr.comp), |ui| {
+                ui::group(ui, icon::EQ, Node::Comp.title(), &desc, Some(&mut pr.comp), |ui| {
                     if let Some(t) = graphs::comp_graph(ui, &snap, m) {
                         pr.comp_threshold_db = t.clamp(-50.0, 0.0);
                     }
                     ui.add_space(6.0);
-                    ab_row(ui, Stage::Comp, shown, hold);
+                    ab_row(ui, Stage::Comp, shown, hold, can_hear);
                     ui::row(ui, "Threshold", |ui| {
                         slider(ui, &mut pr.comp_threshold_db, -50.0..=0.0, " dB");
                     });
@@ -1858,7 +2011,7 @@ impl App {
                     });
                 });
             }
-            Node::Limiter => ui::group(ui, icon::VOLUME, "Limiter", "Always on, so nothing you send can clip", None, |ui| {
+            Node::Limiter => ui::group(ui, icon::VOLUME, Node::Limiter.title(), "Always on, so nothing you send can clip", None, |ui| {
                 let red = Color32::from_rgb(232, 72, 72);
                 let limiting = m.lim_db > 0.1;
                 let ceil = 20.0 * dsp::LIMIT_CEIL.log10();
@@ -1987,22 +2140,115 @@ impl App {
         }
     }
 
-    fn settings(&mut self, ui: &mut egui::Ui) {
+    /// Settings' backups: the automatic ones (newest first) to restore, one made now, and the
+    /// folder to send one to a friend from. A settings file dropped on the window loads too.
+    fn backups(&mut self, ui: &mut egui::Ui) {
+        let p = ui::pal(ui);
+        let (mut now, mut open) = (false, false);
+        let mut restore = None;
+        ui::card(ui, |ui| {
+            let desc = "Kept from each start, the last 10. To load one a friend sent you, drag the file onto this window. Your devices stay as they are";
+            ui::header(ui, icon::FOLDER, "Settings backups", desc, |ui| {
+                open = ui.button("Open folder").clicked();
+                now = ui.button("Back up now").clicked();
+            });
+            for b in backup::list().iter().take(10) {
+                ui::row(ui, &backup::label(b), |ui| {
+                    if ui.button("Restore").on_hover_text("Your current settings are backed up first").clicked() {
+                        restore = Some(b.clone());
+                    }
+                });
+            }
+            if !self.backup_msg.is_empty() {
+                ui.label(RichText::new(&self.backup_msg).small().color(p.text2));
+            }
+        });
+        if now {
+            self.backup_msg = match self.back_up() {
+                Ok(()) => "Backed up.".into(),
+                Err(e) => format!("Couldn't back up: {e}"),
+            };
+        }
+        if open && let Some(dir) = backup::dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::process::Command::new(install::windows_exe("explorer.exe")).arg(dir).spawn();
+        }
+        if let Some(b) = restore {
+            self.load_settings_file(&b);
+        }
+    }
+
+    fn back_up(&self) -> Result<(), String> {
+        backup::save(ron::to_string(&self.saved).map_err(|e| e.to_string())?)
+    }
+
+    /// Loads a backup or a settings file someone sent, keeping this PC's devices. The current
+    /// settings are backed up first, so a wrong file is one Restore away from undone.
+    fn load_settings_file(&mut self, path: &std::path::Path) {
+        let name = path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        let Some(settings) = std::fs::read_to_string(path).ok().and_then(|t| backup::settings_in(&t)) else {
+            self.backup_msg = format!("{name} isn't a MicClean settings file.");
+            return;
+        };
+        let mut loaded = match parse_saved(Some(&settings)) {
+            Ok(s) => s,
+            Err(e) => {
+                self.backup_msg = format!("Didn't load {name}: this version of MicClean can't read it ({e}).");
+                return;
+            }
+        };
+        if let Err(e) = self.back_up() {
+            self.backup_msg = format!("Didn't load {name}: couldn't back up your current settings first ({e}).");
+            return;
+        }
+        loaded.devices = self.saved.devices.clone();
+        loaded.setup_done = true;
+        self.saved = loaded;
+        (self.smart_report, self.smart_undo, self.reset_undo) = (Vec::new(), None, None);
+        self.backup_msg = format!("Loaded {name}. Your settings from before are the newest backup.");
+        logfile::line(&format!("Loaded settings from {}", path.display()));
+    }
+
+    /// Shown in Setup and Settings.
+    fn autostart_row(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
-        ui::setting(ui, icon::POWER, "Start with Windows", "Opens hidden in the tray when you sign in", |ui| {
+        let desc = "Opens hidden in the tray when you sign in, so Discord never listens to a silent cable";
+        ui::setting(ui, icon::POWER, "Start with Windows", desc, |ui| {
             changed = ui::toggle(ui, &mut self.autostart).changed();
         });
         if changed && !autostart::set(self.autostart) {
             self.autostart = autostart::enabled();
             self.status = "Couldn't change the Windows startup entry.".into();
         }
-        let mut reset = false;
-        ui::setting(ui, icon::REFRESH, "Reset all sliders", "Back to the defaults. Learned sounds are kept", |ui| {
-            reset = ui.button("Reset").clicked();
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        self.autostart_row(ui);
+        let (mut arm, mut reset, mut cancel, mut undo) = (false, false, false, false);
+        let desc = match (self.reset_armed, self.reset_undo.is_some()) {
+            (true, _) => "Every switch and slider goes back to the default, Smart setup's choices too. Learned sounds and presets stay",
+            (false, true) => "Done. Undo puts your settings back",
+            (false, false) => "Back to the defaults. Learned sounds and presets stay",
+        };
+        ui::setting(ui, icon::REFRESH, "Reset all settings", desc, |ui| {
+            if self.reset_armed {
+                cancel = ui.button("Cancel").clicked();
+                reset = ui::accent_button(ui, true, "Reset everything").clicked();
+            } else {
+                arm = ui.button("Reset").clicked();
+                if self.reset_undo.is_some() {
+                    undo = ui.button("Undo").clicked();
+                }
+            }
         });
+        self.reset_armed = (self.reset_armed || arm) && !cancel && !reset;
         if reset {
-            self.saved.params = Params::default();
+            self.reset_undo = Some(std::mem::take(&mut self.saved.params));
         }
+        if undo && let Some(old) = self.reset_undo.take() {
+            self.saved.params = old;
+        }
+        self.backups(ui);
         self.updates(ui);
         let mut show_log = false;
         ui::setting(ui, icon::FOLDER, "Log file", "Device errors, glitches, restarts and updates, for troubleshooting. It stays on this PC", |ui| {
@@ -2011,7 +2257,7 @@ impl App {
         if show_log {
             use std::os::windows::process::CommandExt;
             // raw_arg: explorer wants /select,"path" exactly, which normal argument quoting breaks.
-            let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", logfile::path().display())).spawn();
+            let _ = std::process::Command::new(install::windows_exe("explorer.exe")).raw_arg(format!("/select,\"{}\"", logfile::path().display())).spawn();
         }
         ui::setting(
             ui,
@@ -2254,7 +2500,7 @@ mod autostart {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     fn reg(args: &[&str]) -> bool {
-        Command::new("reg")
+        Command::new(crate::install::windows_exe(crate::install::REG))
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2284,7 +2530,7 @@ mod autostart {
         fn run_entry_is_quoted() {
             let before = super::enabled();
             assert!(super::set(true));
-            let out = super::Command::new("reg").args(["query", super::KEY, "/v", "MicClean"]).output().unwrap();
+            let out = super::Command::new(crate::install::windows_exe(crate::install::REG)).args(["query", super::KEY, "/v", "MicClean"]).output().unwrap();
             let text = String::from_utf8_lossy(&out.stdout).to_string();
             super::set(before);
             let exe = std::env::current_exe().unwrap();
@@ -2321,6 +2567,19 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_changes_the_style_but_keeps_what_smart_setup_measured() {
+        // Presets made on a first start, before Smart setup ran.
+        let presets = starter_presets(&Params::default());
+        let mut tuned = Params { input_gain_db: 18.0, gate_threshold_db: -38.0, output_gain_db: -4.0, comp_makeup_db: 2.0, ..Params::default() };
+        tuned.bands[1] = Some(Band { kind: BandKind::Bell, freq: 300.0, gain_db: -3.0, q: 1.0, on: true });
+        let singing = with_preset(&tuned, &presets[1].params);
+        assert_eq!((singing.input_gain_db, singing.gate_threshold_db, singing.output_gain_db), (18.0, -38.0, -4.0));
+        assert_eq!((singing.bands, singing.comp_makeup_db), (tuned.bands, 2.0));
+        assert_eq!((singing.gate_hold_ms, singing.comp_ratio), (900.0, 2.0), "the Singing style itself");
+        assert!(same_preset(&presets[1].params, &singing) && !same_preset(&presets[2].params, &singing));
+    }
+
+    #[test]
     fn old_fixed_eq_save_loads_as_bands() {
         // A real save from before the parametric EQ.
         let old = r#"(devices:(input:"Test Microphone",output:"CABLE Input (VB-Audio Virtual Cable)",monitor:None,echo_ref:None),params:(bypass:false,input_gain_db:0.0,denoise:true,denoise_strength:1.0,sing_protect:0.3,gate:false,gate_threshold_db:-50.0,vad_threshold:0.5,gate_hold_ms:400.0,gate_floor_db:-60.0,learn_match:3.0,agc:true,agc_target_db:-14.0,agc_max_gain_db:15.0,eq:true,low_cut_hz:165.0,low_gain_db:0.0,mid_freq_hz:300.0,mid_gain_db:2.8,high_gain_db:3.0,deess:true,deess_threshold_db:-24.0,comp:true,comp_threshold_db:-24.0,comp_ratio:3.0,comp_attack_ms:5.0,comp_release_ms:120.0,comp_makeup_db:4.0,output_gain_db:6.0),profiles:(noises:[],keep:None))"#;
@@ -2345,5 +2604,20 @@ mod tests {
         eframe::set_value(&mut store, eframe::APP_KEY, &edited);
         assert!(!store.0.contains("low_cut_hz"));
         assert_eq!(load(&store).params.bands, edited.params.bands);
+    }
+
+    #[test]
+    fn a_0_8_save_keeps_every_setting() {
+        // A real 0.8.0 save (presets cut to one). Any field that changes type must still read
+        // this, or the whole file fails and every setting goes back to defaults.
+        let old = r#"(devices:(input:"Loop-back 1/2 (Audient iD24)",input_channel:None,output:"CABLE Input (VB-Audio Virtual Cable)",monitor:None,echo_ref:Some("Analogue 1/2 (Audient iD24)"),exclusive_output:true),params:(bypass:false,input_gain_db:16.0,denoise:true,denoise_strength:1.0,sing_protect:0.75,gate:false,gate_threshold_db:-66.0,vad_threshold:0.5,gate_hold_ms:400.0,gate_floor_db:-60.0,gate_attack_ms:3.0,gate_release_ms:60.0,gate_hysteresis_db:6.0,learn_match:3.9,agc:true,agc_target_db:-22.0,agc_max_gain_db:15.0,eq:true,bands:(Some((kind:LowCut,freq:170.0,gain_db:0.0,q:0.71,on:true)),None,None,Some((kind:Bell,freq:3200.0,gain_db:1.0,q:1.0,on:true)),None),deess:true,deess_threshold_db:-39.0,comp:true,comp_threshold_db:-30.0,comp_ratio:3.0,comp_attack_ms:5.0,comp_release_ms:120.0,comp_makeup_db:4.0,output_gain_db:4.0),profiles:(noises:[],keep:None),update_check_off:false,update_popup_off:false,auto_update:true,presets:[(name:"Talking",params:(bypass:false,input_gain_db:16.0,denoise:true,denoise_strength:1.0,sing_protect:0.3,gate:true,gate_threshold_db:-67.0,vad_threshold:0.5,gate_hold_ms:400.0,gate_floor_db:-12.0,gate_attack_ms:2.0,gate_release_ms:60.0,gate_hysteresis_db:6.0,learn_match:3.0,agc:true,agc_target_db:-14.0,agc_max_gain_db:15.0,eq:true,bands:(Some((kind:LowCut,freq:165.0,gain_db:0.0,q:0.71,on:true)),None,Some((kind:Bell,freq:300.0,gain_db:2.8,q:1.0,on:true)),Some((kind:HighShelf,freq:4271.0,gain_db:3.0,q:0.71,on:true)),None),deess:true,deess_threshold_db:-24.0,comp:true,comp_threshold_db:-21.0,comp_ratio:3.0,comp_attack_ms:5.0,comp_release_ms:120.0,comp_makeup_db:0.0,output_gain_db:6.0))],presets_seeded:true,nav_compact:false,smart:Some((bypass:false,input_gain_db:16.0,denoise:true,denoise_strength:0.85,sing_protect:0.3,gate:true,gate_threshold_db:-66.0,vad_threshold:0.5,gate_hold_ms:400.0,gate_floor_db:-60.0,gate_attack_ms:3.0,gate_release_ms:60.0,gate_hysteresis_db:6.0,learn_match:3.9,agc:false,agc_target_db:-18.7,agc_max_gain_db:15.0,eq:true,bands:(Some((kind:LowCut,freq:170.0,gain_db:0.0,q:0.707,on:true)),None,None,None,Some((kind:HighShelf,freq:8000.0,gain_db:-2.0,q:0.707,on:true))),deess:true,deess_threshold_db:-39.0,comp:true,comp_threshold_db:-30.0,comp_ratio:3.0,comp_attack_ms:5.0,comp_release_ms:120.0,comp_makeup_db:4.0,output_gain_db:4.0)),setup_done:true)"#;
+        let s = parse_saved(Some(old)).unwrap();
+        assert_eq!(s.devices.echo_ref.as_deref(), Some("Analogue 1/2 (Audient iD24)"));
+        assert_eq!((s.params.input_gain_db, s.params.learn_match, s.params.agc_target_db), (16.0, 3.9, -22.0));
+        assert_eq!((s.presets.len(), s.presets[0].params.gate_floor_db), (1, -12.0));
+        assert!(s.setup_done && s.auto_update && s.smart.is_some());
+        // One that can't be read starts from the defaults, starter presets included.
+        let bad = load(&Mem("(setup_done:Some(true))".into()));
+        assert_eq!((bad.devices.input.as_str(), bad.presets.len()), ("", 3));
     }
 }

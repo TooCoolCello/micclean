@@ -107,8 +107,13 @@ pub fn failed_version() -> Option<String> {
     Some(v)
 }
 
+/// Gives up on a connection that stalls (under 1 kB/s for a minute), not on a slow one: a
+/// fixed time limit made a 12 MB download fail every time under about 0.8 Mbit/s.
+// ponytail: no --ssl-revoke-best-effort (for networks that block revocation checks): the curl
+// in older Windows 10 builds (7.55) doesn't know it and would fail every check.
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = install::hidden(Command::new("curl.exe").args(["--silent", "--show-error", "--fail", "--location", "--max-time", "120"]).args(args))
+    let opts = ["--silent", "--show-error", "--fail", "--location", "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "60"];
+    let out = install::hidden(Command::new(install::windows_exe(install::CURL)).args(opts).args(args))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

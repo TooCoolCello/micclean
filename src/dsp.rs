@@ -94,6 +94,43 @@ impl Default for Params {
     }
 }
 
+impl Params {
+    /// Every value inside what its slider allows, and NaN back to the default: a hand-edited or
+    /// damaged settings file can't crash the audio thread (a clamp with min > max panics) or
+    /// blow it up.
+    pub fn sanitize(&mut self) {
+        fn fix(v: &mut f32, lo: f32, hi: f32, def: f32) {
+            *v = if v.is_finite() { v.clamp(lo, hi) } else { def };
+        }
+        let d = Params::default();
+        fix(&mut self.input_gain_db, -20.0, 30.0, d.input_gain_db);
+        fix(&mut self.denoise_strength, 0.0, 1.0, d.denoise_strength);
+        fix(&mut self.sing_protect, 0.0, 1.0, d.sing_protect);
+        fix(&mut self.gate_threshold_db, -80.0, -10.0, d.gate_threshold_db);
+        fix(&mut self.vad_threshold, 0.0, 1.0, d.vad_threshold);
+        fix(&mut self.gate_hold_ms, 0.0, 2000.0, d.gate_hold_ms);
+        fix(&mut self.gate_floor_db, -90.0, 0.0, d.gate_floor_db);
+        fix(&mut self.gate_attack_ms, 0.5, 50.0, d.gate_attack_ms);
+        fix(&mut self.gate_release_ms, 10.0, 500.0, d.gate_release_ms);
+        fix(&mut self.gate_hysteresis_db, 0.0, 20.0, d.gate_hysteresis_db);
+        fix(&mut self.learn_match, 1.0, 8.0, d.learn_match);
+        fix(&mut self.agc_target_db, -36.0, -10.0, d.agc_target_db);
+        fix(&mut self.agc_max_gain_db, 0.0, 30.0, d.agc_max_gain_db);
+        fix(&mut self.deess_threshold_db, -50.0, 0.0, d.deess_threshold_db);
+        fix(&mut self.comp_threshold_db, -50.0, 0.0, d.comp_threshold_db);
+        fix(&mut self.comp_ratio, 1.0, 20.0, d.comp_ratio);
+        fix(&mut self.comp_attack_ms, 0.5, 50.0, d.comp_attack_ms);
+        fix(&mut self.comp_release_ms, 20.0, 1000.0, d.comp_release_ms);
+        fix(&mut self.comp_makeup_db, 0.0, 24.0, d.comp_makeup_db);
+        fix(&mut self.output_gain_db, -20.0, 30.0, d.output_gain_db);
+        for b in self.bands.iter_mut().flatten() {
+            fix(&mut b.freq, 20.0, 20_000.0, 1000.0);
+            fix(&mut b.q, 0.1, 18.0, 0.707);
+            fix(&mut b.gain_db, -24.0, 24.0, 0.0);
+        }
+    }
+}
+
 pub const BANDS: usize = 5;
 /// The safety limiter's ceiling (linear, about -0.26 dBFS).
 pub const LIMIT_CEIL: f32 = 0.97;
@@ -150,9 +187,13 @@ pub enum Kind {
 pub struct Profile {
     pub mean: [f32; NB],
     pub var: [f32; NB],
-    /// Frames quieter than this (band level, dB) aren't this sound: the room around it. None
-    /// for profiles from before 0.6.2, which learned the room too and so matched everything.
+    /// Frames quieter than this (band level in dB, before input gain, so turning the gain up
+    /// or down doesn't move it) aren't this sound: the room around it. None for profiles from
+    /// before 0.6.2, which learned the room too and so matched everything.
     #[serde(default)]
+    pub floor_raw_db: Option<f32>,
+    /// 0.6.2 to 0.8: the same floor after input gain. Read once, turned into `floor_raw_db`.
+    #[serde(default, skip_serializing)]
     pub floor_db: Option<f32>,
 }
 
@@ -168,18 +209,19 @@ fn shape(f: &[f32; NB]) -> ([f32; NB], f32) {
 
 impl Profile {
     /// Mean squared z-score of the frame's shape: ~1 for a typical frame of this sound, large
-    /// for others, INFINITY when it's quieter than the sound ever was.
-    fn dist(&self, f: &[f32; NB]) -> f32 {
+    /// for others, INFINITY when it's quieter than the sound ever was. `gain_db` is the input
+    /// gain the frame went through.
+    fn dist(&self, f: &[f32; NB], gain_db: f32) -> f32 {
         let (s, level) = shape(f);
-        match self.floor_db {
-            Some(floor) if level >= floor => (0..NB).map(|i| (s[i] - self.mean[i]).powi(2) / self.var[i]).sum::<f32>() / NB as f32,
+        match self.floor_raw_db {
+            Some(floor) if level - gain_db >= floor => (0..NB).map(|i| (s[i] - self.mean[i]).powi(2) / self.var[i]).sum::<f32>() / NB as f32,
             _ => f32::INFINITY,
         }
     }
 
     /// Learned before 0.6.2: it never matches, and the app asks for it to be learned again.
     pub fn outdated(&self) -> bool {
-        self.floor_db.is_none()
+        self.floor_raw_db.is_none()
     }
 }
 
@@ -204,13 +246,25 @@ enum Match {
 }
 
 impl Profiles {
+    /// Floors saved by 0.6.2 to 0.8 were after input gain; they become floors before it,
+    /// taking `gain_db` (the gain in the same save) as the gain they were learned at.
+    pub fn migrate_floors(&mut self, gain_db: f32) {
+        for p in self.noises.iter_mut().map(|n| &mut n.profile).chain(self.keep.as_mut()) {
+            if let Some(floor) = p.floor_db.take()
+                && p.floor_raw_db.is_none()
+            {
+                p.floor_raw_db = Some(floor - gain_db);
+            }
+        }
+    }
+
     // ponytail: nearest-centroid classifier; swap for a small trained net if it misfires a lot.
     /// Also writes each sound's distance into `m` for the match bars (INFINITY = off or none).
-    fn classify(&self, f: &[f32; NB], max_dist: f32, m: &mut Meters) -> Option<Match> {
+    fn classify(&self, f: &[f32; NB], gain_db: f32, max_dist: f32, m: &mut Meters) -> Option<Match> {
         m.match_dist = [f32::INFINITY; MATCH_BARS];
         let mut noise = None::<(usize, f32)>;
         for (i, n) in self.noises.iter().enumerate().filter(|(_, n)| n.enabled) {
-            let d = n.profile.dist(f);
+            let d = n.profile.dist(f, gain_db);
             if let Some(slot) = m.match_dist.get_mut(i) {
                 *slot = d;
             }
@@ -218,7 +272,7 @@ impl Profiles {
                 noise = Some((i, d));
             }
         }
-        m.keep_dist = self.keep.as_ref().map_or(f32::INFINITY, |p| p.dist(f));
+        m.keep_dist = self.keep.as_ref().map_or(f32::INFINITY, |p| p.dist(f, gain_db));
         let keep = Some(m.keep_dist).filter(|&d| d < max_dist);
         match (noise, keep) {
             (Some((i, dn)), Some(dk)) => Some(if dk <= dn { Match::Keep } else { Match::Noise(i) }),
@@ -302,7 +356,8 @@ pub struct Chain {
     learner: Option<Learner>,
     /// Last frame's learned-sound match.
     class: Option<Match>,
-    learned: Option<(Kind, Result<Profile, &'static str>)>,
+    /// A learn run that has all its frames, for the GUI to finish.
+    learned: Option<Learner>,
     hold: u32,
     gate_gain: f32,
     agc_db: f32,
@@ -339,15 +394,22 @@ impl Default for Chain {
     }
 }
 
-/// Runs a recorded clip through a fresh chain, for the record-and-compare player.
+/// Runs a recorded clip through the chain, for the record-and-compare player. It goes through
+/// twice and the second pass is kept: live, auto level and noise removal have long settled,
+/// and a cold chain would fade the first seconds in.
 pub fn render(raw: &[f32], p: &Params, prof: &Profiles) -> Vec<f32> {
     let mut chain = Chain::default();
     let mut out = Vec::with_capacity(raw.len());
-    for c in raw.chunks(FRAME) {
-        let mut f = [0.0; FRAME];
-        f[..c.len()].copy_from_slice(c);
-        chain.process(p, prof, &mut f);
-        out.extend_from_slice(&f[..c.len()]);
+    for pass in 0..2 {
+        out.clear();
+        for c in raw.chunks(FRAME) {
+            let mut f = [0.0; FRAME];
+            f[..c.len()].copy_from_slice(c);
+            chain.process(p, prof, &mut f);
+            if pass == 1 {
+                out.extend_from_slice(&f[..c.len()]);
+            }
+        }
     }
     out
 }
@@ -390,13 +452,20 @@ fn comp_gr(over: f32, slope: f32) -> f32 {
 }
 
 impl Chain {
-    pub fn start_learning(&mut self, kind: Kind, seconds: f32) {
-        self.learner = Some(Learner::new(kind, (seconds * 100.0) as u32));
+    /// Starts a learn run, made (and allocated) by the GUI.
+    pub fn start_learning(&mut self, l: Learner) {
+        self.learner = Some(l);
     }
 
-    /// Finished learn run: the profile, or why the clip couldn't be learned from.
-    pub fn take_learned(&mut self) -> Option<(Kind, Result<Profile, &'static str>)> {
+    /// A learn run with all its frames; `Learner::finish` turns it into a profile, off the
+    /// audio thread.
+    pub fn take_learned(&mut self) -> Option<Learner> {
         self.learned.take()
+    }
+
+    /// Auto level's gain, so a new chain (audio restarted) picks up where the last one was.
+    pub fn set_agc(&mut self, db: f32) {
+        self.agc_db = if db.is_finite() { db.clamp(-12.0, 30.0) } else { 0.0 };
     }
 
     fn learn_step(&mut self, f: &[f32; NB]) {
@@ -404,8 +473,7 @@ impl Chain {
             l.add(f);
             self.meters.learning = Some((l.kind, l.progress()));
             if l.left == 0 {
-                self.learned = Some((l.kind, l.finish()));
-                self.learner = None;
+                self.learned = self.learner.take();
                 self.meters.learning = None;
             }
         }
@@ -473,7 +541,7 @@ impl Chain {
             return;
         }
 
-        let class = prof.classify(&clean, p.learn_match, &mut self.meters);
+        let class = prof.classify(&clean, p.input_gain_db, p.learn_match, &mut self.meters);
         self.class = class;
         self.meters.noise_match = match class {
             Some(Match::Noise(i)) => Some(i),
@@ -525,10 +593,10 @@ impl Chain {
             for (i, s) in x.iter_mut().enumerate() {
                 *s *= db2lin(before + (self.agc_db - before) * i as f32 / FRAME as f32);
             }
-        } else {
-            self.agc_db = 0.0;
         }
-        self.meters.agc_db = self.agc_db;
+        // Off keeps its gain for later: holding "hear it off" mustn't make it climb again from 0.
+        // ponytail: switching back on jumps straight to that gain; ramp it if anyone hears a step.
+        self.meters.agc_db = if p.agc { self.agc_db } else { 0.0 };
 
         if p.eq {
             self.eq.update(&p.bands);
@@ -732,18 +800,21 @@ impl Analyzer {
     }
 }
 
-struct Learner {
-    kind: Kind,
+pub struct Learner {
+    pub kind: Kind,
     total: u32,
     left: u32,
     /// Every frame's band levels, kept so the quiet room around the sound can be left out at
-    /// the end. Allocated once when learning starts.
+    /// the end. Allocated here, on the GUI thread.
     frames: Vec<[f32; NB]>,
+    /// Input gain while learning, so the profile's floor is stored before it.
+    gain_db: f32,
 }
 
 impl Learner {
-    fn new(kind: Kind, frames: u32) -> Self {
-        Self { kind, total: frames, left: frames, frames: Vec::with_capacity(frames as usize) }
+    pub fn new(kind: Kind, seconds: f32, gain_db: f32) -> Self {
+        let n = (seconds * 100.0) as u32;
+        Self { kind, total: n, left: n, frames: Vec::with_capacity(n as usize), gain_db }
     }
 
     fn add(&mut self, f: &[f32; NB]) {
@@ -756,7 +827,7 @@ impl Learner {
     }
 
     /// The learned profile, or why there's none, in words for the app to show.
-    fn finish(&self) -> Result<Profile, &'static str> {
+    pub fn finish(&self) -> Result<Profile, &'static str> {
         const QUIET: &str = "That clip was too quiet, nothing saved.";
         const SHORT: &str = "That sound was too short to learn. Keep it going, or make it a few times over.";
         let pct = |mut v: Vec<f32>, q: f32| {
@@ -789,7 +860,7 @@ impl Learner {
         // 6 dB under its quietest tenth, so it still matches as it fades, but never down in the
         // room it was left out of.
         let floor = (pct(kept.iter().map(|f| f.1).collect(), 0.1) - 6.0).max(cut);
-        Ok(Profile { mean, var, floor_db: Some(floor) })
+        Ok(Profile { mean, var, floor_raw_db: Some(floor - self.gain_db), floor_db: None })
     }
 }
 
@@ -1066,14 +1137,14 @@ mod tests {
         let p = Params { gate: true, ..only("none") };
         let mut chain = Chain::default();
         let hiss = noise(FRAME * 300, 0.1, &mut seed);
-        chain.start_learning(Kind::Noise, 2.0);
+        chain.start_learning(Learner::new(Kind::Noise, 2.0, 0.0));
         for c in hiss.chunks(FRAME).take(200) {
             chain.process(&p, &Profiles::default(), &mut c.to_vec());
         }
-        let (kind, prof) = chain.take_learned().expect("finished");
+        let (kind, prof) = chain.take_learned().map(|l| (l.kind, l.finish())).expect("finished");
         assert_eq!(kind, Kind::Noise);
         // A sound nothing like hiss: all lows, no highs.
-        let other = Profile { mean: std::array::from_fn(|i| if i < NB / 2 { 15.0 } else { -15.0 }), var: [4.0; NB], floor_db: Some(-200.0) };
+        let other = Profile { mean: std::array::from_fn(|i| if i < NB / 2 { 15.0 } else { -15.0 }), var: [4.0; NB], floor_raw_db: Some(-200.0), floor_db: None };
         let noises = vec![
             NoiseProfile { name: "dog".into(), enabled: true, profile: other },
             NoiseProfile { name: "fan".into(), enabled: true, profile: prof.expect("loud enough") },
@@ -1106,11 +1177,11 @@ mod tests {
         let mut clip = noise(n, 0.003, &mut seed);
         clip.iter_mut().enumerate().filter(|(i, _)| on(*i)).for_each(|(i, s)| *s += hum[i]);
         let mut chain = Chain::default();
-        chain.start_learning(Kind::Noise, 5.0);
+        chain.start_learning(Learner::new(Kind::Noise, 5.0, 0.0));
         for c in clip.chunks(FRAME) {
             chain.process(&p, &Profiles::default(), &mut c.to_vec());
         }
-        let (_, prof) = chain.take_learned().expect("finished");
+        let (_, prof) = chain.take_learned().map(|l| (l.kind, l.finish())).expect("finished");
         let profile = prof.expect("loud enough");
         let profiles = Profiles { noises: vec![NoiseProfile { name: "hum".into(), enabled: true, profile }], keep: None };
 
@@ -1129,6 +1200,36 @@ mod tests {
     }
 
     #[test]
+    fn a_learned_sound_still_matches_after_the_input_gain_changes() {
+        let p = Params { gate: true, ..only("none") };
+        let hum = tone(150.0, SR as usize * 2, 0.1);
+        let mut chain = Chain::default();
+        chain.start_learning(Learner::new(Kind::Noise, 2.0, p.input_gain_db));
+        for c in hum.chunks(FRAME) {
+            chain.process(&p, &Profiles::default(), &mut c.to_vec());
+        }
+        let profile = chain.take_learned().expect("finished").finish().expect("learned");
+        let profiles = Profiles { noises: vec![NoiseProfile { name: "hum".into(), enabled: true, profile }], keep: None };
+        // Smart setup turned the gain down 14 dB: the same hum, quieter after the gain.
+        let quieter = Params { input_gain_db: -14.0, ..p.clone() };
+        let mut chain = Chain::default();
+        let hits = hum.chunks(FRAME).filter(|c| {
+            chain.process(&quieter, &profiles, &mut c.to_vec());
+            chain.meters.noise_match.is_some()
+        });
+        assert!(hits.count() > 180, "the hum stopped matching after a gain change");
+    }
+
+    #[test]
+    fn old_floors_after_gain_become_floors_before_it() {
+        let old = Profile { mean: [0.0; NB], var: [4.0; NB], floor_raw_db: None, floor_db: Some(-60.0) };
+        let mut profiles = Profiles { noises: vec![], keep: Some(old) };
+        profiles.migrate_floors(10.0);
+        let p = profiles.keep.unwrap();
+        assert_eq!((p.floor_raw_db, p.floor_db), (Some(-70.0), None));
+    }
+
+    #[test]
     fn a_brief_sound_learns_the_sound_or_says_too_short_never_the_room() {
         let mut seed = 4;
         let p = Params { gate: true, ..only("none") };
@@ -1140,11 +1241,11 @@ mod tests {
             let hum = tone(150.0, (SR * secs) as usize, 0.3);
             clip[start..start + hum.len()].iter_mut().zip(&hum).for_each(|(s, h)| *s += h);
             let mut chain = Chain::default();
-            chain.start_learning(Kind::Noise, 5.0);
+            chain.start_learning(Learner::new(Kind::Noise, 5.0, 0.0));
             for c in clip.chunks(FRAME) {
                 chain.process(&p, &Profiles::default(), &mut c.to_vec());
             }
-            chain.take_learned().expect("finished").1
+            chain.take_learned().map(|l| (l.kind, l.finish())).expect("finished").1
         };
         let profile = learn(0.25).expect("a quarter second is enough");
         let profiles = Profiles { noises: vec![NoiseProfile { name: "bark".into(), enabled: true, profile }], keep: None };
@@ -1164,11 +1265,11 @@ mod tests {
         let p = Params { gate: true, gate_hold_ms: 400.0, vad_threshold: 0.99, ..only("none") };
         let learn = |x: &[f32]| {
             let mut c = Chain::default();
-            c.start_learning(Kind::Noise, x.len() as f32 / SR);
+            c.start_learning(Learner::new(Kind::Noise, x.len() as f32 / SR, 0.0));
             for f in x.chunks(FRAME) {
                 c.process(&p, &Profiles::default(), &mut f.to_vec());
             }
-            c.take_learned().expect("finished").1.expect("learned")
+            c.take_learned().map(|l| (l.kind, l.finish())).expect("finished").1.expect("learned")
         };
         let (hiss, note) = (noise(FRAME * 200, 0.1, &mut seed), tone(200.0, FRAME * 200, 0.3));
         let keys = NoiseProfile { name: "keys".into(), enabled: true, profile: learn(&hiss) };
@@ -1233,11 +1334,11 @@ mod tests {
         clip.iter_mut().zip(room).for_each(|(s, n)| *s += n);
         let p = Params::default();
         let mut chain = Chain::default();
-        chain.start_learning(Kind::Keep, clip.len() as f32 / SR);
+        chain.start_learning(Learner::new(Kind::Keep, clip.len() as f32 / SR, 0.0));
         for c in clip.chunks(FRAME) {
             chain.process(&p, &Profiles::default(), &mut c.to_vec());
         }
-        let keep = chain.take_learned().and_then(|l| l.1.ok()).expect("learned");
+        let keep = chain.take_learned().and_then(|l| l.finish().ok()).expect("learned");
         let profiles = Profiles { noises: vec![], keep: Some(keep) };
         let (mut room, mut talk) = ((0, 0), (0, 0));
         for (i, c) in clip.chunks(FRAME).enumerate() {

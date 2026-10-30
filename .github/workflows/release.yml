@@ -6,18 +6,26 @@ on:
   push:
     tags: ["v*"]
 
+# The build runs every dependency's build script and test, so it can only read the repo.
+# Only the publish job, which runs nothing from the repo, can write a release.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Don't leave the token in .git/config while the build runs.
+          persist-credentials: false
 
       - name: Tag matches Cargo.toml
         shell: pwsh
         run: |
+          # A tag like v0.9.0-rc1 would be published as the latest release, and every
+          # installed copy's updater would fail on its version number.
+          if ($env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+$') { throw "tag $env:GITHUB_REF_NAME isn't vX.Y.Z" }
           $want = "v" + ((Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value)
           if ($env:GITHUB_REF_NAME -ne $want) { throw "tag $env:GITHUB_REF_NAME doesn't match Cargo.toml ($want)" }
 
@@ -34,8 +42,25 @@ jobs:
           $h = (Get-FileHash dist\MicClean-Setup.exe -Algorithm SHA256).Hash.ToLower()
           "$h  MicClean-Setup.exe" | Out-File -Encoding ascii dist\MicClean-Setup.exe.sha256
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: |
+            dist/MicClean-Setup.exe
+            dist/MicClean-Setup.exe.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: dist
+
       - name: Publish release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME dist\MicClean-Setup.exe dist\MicClean-Setup.exe.sha256 --title $env:GITHUB_REF_NAME --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/MicClean-Setup.exe dist/MicClean-Setup.exe.sha256 --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

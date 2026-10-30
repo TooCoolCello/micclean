@@ -13,6 +13,18 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const UNINSTALL_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\MicClean";
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
+pub const REG: &str = r"System32\reg.exe";
+pub const POWERSHELL: &str = r"System32\WindowsPowerShell\v1.0\powershell.exe";
+pub const CURL: &str = r"System32\curl.exe";
+pub const CONTROL: &str = r"System32\control.exe";
+
+/// A Windows program by its full path under %SystemRoot%. Run by bare name, Windows looks in
+/// the running exe's folder first, so a reg.exe or powershell.exe planted next to a
+/// downloaded setup would run instead.
+pub fn windows_exe(rel: &str) -> PathBuf {
+    std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join(rel)
+}
+
 fn env_path(var: &str) -> Result<PathBuf, String> {
     std::env::var_os(var).map(PathBuf::from).ok_or_else(|| format!("%{var}% is not set"))
 }
@@ -36,7 +48,7 @@ pub fn hidden(cmd: &mut Command) -> &mut Command {
 }
 
 fn reg(args: &[&str]) -> bool {
-    hidden(Command::new("reg").args(args)).status().is_ok_and(|s| s.success())
+    hidden(Command::new(windows_exe(REG)).args(args)).status().is_ok_and(|s| s.success())
 }
 
 fn powershell_args(script: &str) -> [&str; 6] {
@@ -44,12 +56,20 @@ fn powershell_args(script: &str) -> [&str; 6] {
 }
 
 fn powershell(script: &str) -> bool {
-    hidden(Command::new("powershell").args(powershell_args(script))).status().is_ok_and(|s| s.success())
+    hidden(Command::new(windows_exe(POWERSHELL)).args(powershell_args(script))).status().is_ok_and(|s| s.success())
 }
 
-/// A PowerShell single-quoted string literal.
+/// A PowerShell single-quoted string literal. PowerShell also ends one at the curly quotes
+/// (‘ ’ ‚ ‛), as in a profile folder named O’Brien, so those are doubled too.
 fn q(s: impl AsRef<std::ffi::OsStr>) -> String {
-    format!("'{}'", s.as_ref().to_string_lossy().replace('\'', "''"))
+    let mut out = String::from("'");
+    for c in s.as_ref().to_string_lossy().chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out + "'"
 }
 
 /// Closes a running copy of this exe so the file can be replaced or deleted.
@@ -237,7 +257,12 @@ pub fn uninstall(silent: bool) {
         let _ = std::fs::remove_file(link);
     }
     reg(&["delete", UNINSTALL_KEY, "/f"]);
-    reg(&["delete", RUN_KEY, "/v", "MicClean", "/f"]);
+    // Start with Windows, unless it points at another copy (a build folder someone runs).
+    let run = hidden(Command::new(windows_exe(REG)).args(["query", RUN_KEY, "/v", "MicClean"])).stdout(Stdio::piped()).output();
+    let ours = run.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains(&exe.to_string_lossy().to_lowercase()));
+    if ours {
+        reg(&["delete", RUN_KEY, "/v", "MicClean", "/f"]);
+    }
 
     let settings = match (wipe, env_path("APPDATA")) {
         (true, Ok(a)) => format!("Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue;", q(a.join("MicClean"))),
@@ -256,7 +281,7 @@ pub fn uninstall(silent: bool) {
         q(&dir),
         q(&dir)
     );
-    let _ = Command::new("powershell")
+    let _ = Command::new(windows_exe(POWERSHELL))
         .args(powershell_args(&script))
         // Not DETACHED_PROCESS: PowerShell exits at once without a console. It outlives us anyway.
         .creation_flags(CREATE_NO_WINDOW)
@@ -300,6 +325,12 @@ mod tests {
         assert_eq!(fs::read(&got).unwrap(), b"new version");
         assert!(!dir.join("micclean.new.exe").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn powershell_quoting_doubles_every_kind_of_single_quote() {
+        assert_eq!(q(r"C:\Users\O'Brien"), r"'C:\Users\O''Brien'");
+        assert_eq!(q("C:\\Users\\O\u{2019}Brien"), "'C:\\Users\\O\u{2019}\u{2019}Brien'");
     }
 
     #[test]
