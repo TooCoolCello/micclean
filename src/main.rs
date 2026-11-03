@@ -201,6 +201,7 @@ enum Stage {
     Agc,
     Eq,
     Deess,
+    Warmth,
     Comp,
 }
 
@@ -212,6 +213,7 @@ impl Stage {
             Stage::Agc => p.agc = false,
             Stage::Eq => p.eq = false,
             Stage::Deess => p.deess = false,
+            Stage::Warmth => p.warmth = false,
             Stage::Comp => p.comp = false,
         }
     }
@@ -349,6 +351,7 @@ enum Node {
     Level,
     Eq,
     Deess,
+    Warmth,
     Comp,
     Limiter,
     Output,
@@ -364,6 +367,7 @@ impl Node {
             Node::Level => "Even out volume",
             Node::Eq => "Tone",
             Node::Deess => "Soften S sounds",
+            Node::Warmth => "Warmth",
             Node::Comp => "Tame loud parts",
             Node::Limiter => "Clip guard",
             Node::Output => "What gets sent",
@@ -378,6 +382,7 @@ impl Node {
             Node::Level => Some(&mut p.agc),
             Node::Eq => Some(&mut p.eq),
             Node::Deess => Some(&mut p.deess),
+            Node::Warmth => Some(&mut p.warmth),
             Node::Comp => Some(&mut p.comp),
             Node::Input | Node::Echo | Node::Limiter | Node::Output => None,
         }
@@ -398,6 +403,7 @@ impl Node {
             Node::Level => (p.agc_target_db, p.agc_max_gain_db) = (d.agc_target_db, d.agc_max_gain_db),
             Node::Eq => p.bands = d.bands,
             Node::Deess => p.deess_threshold_db = d.deess_threshold_db,
+            Node::Warmth => p.warmth_amount = d.warmth_amount,
             Node::Comp => {
                 (p.comp_threshold_db, p.comp_ratio, p.comp_makeup_db) = (d.comp_threshold_db, d.comp_ratio, d.comp_makeup_db);
                 (p.comp_attack_ms, p.comp_release_ms) = (d.comp_attack_ms, d.comp_release_ms);
@@ -407,7 +413,7 @@ impl Node {
     }
 
     /// The boxes Smart setup chooses settings for.
-    const SMART: [Node; 8] = [Node::Input, Node::Noise, Node::Gate, Node::Eq, Node::Deess, Node::Comp, Node::Limiter, Node::Output];
+    const SMART: [Node; 9] = [Node::Input, Node::Noise, Node::Gate, Node::Eq, Node::Deess, Node::Warmth, Node::Comp, Node::Limiter, Node::Output];
 
     /// Copies what Smart setup chose (`s`) for this box. Other boxes are left alone.
     fn suggest(self, p: &mut Params, s: &Params) {
@@ -418,6 +424,7 @@ impl Node {
             Node::Gate => p.gate_threshold_db = (s.gate_threshold_db + p.input_gain_db - s.input_gain_db).clamp(-80.0, -10.0),
             Node::Eq => p.bands = s.bands,
             Node::Deess => p.deess_threshold_db = s.deess_threshold_db,
+            Node::Warmth => (p.warmth, p.warmth_amount) = (s.warmth, s.warmth_amount),
             Node::Comp => (p.comp_threshold_db, p.comp_ratio, p.comp_makeup_db) = (s.comp_threshold_db, s.comp_ratio, s.comp_makeup_db),
             Node::Limiter | Node::Output => p.output_gain_db = s.output_gain_db,
             Node::Echo | Node::Level => {}
@@ -1579,7 +1586,7 @@ impl App {
         let groups: [(&str, &[Node]); 5] = [
             ("", &[Node::Input]),
             ("Clean up", &[Node::Echo, Node::Noise, Node::Gate]),
-            ("Shape", &[Node::Level, Node::Eq, Node::Deess]),
+            ("Shape", &[Node::Level, Node::Eq, Node::Deess, Node::Warmth]),
             ("Protect", &[Node::Comp, Node::Limiter]),
             ("", &[Node::Output]),
         ];
@@ -1644,6 +1651,7 @@ impl App {
                 (Curve(dsp::eq_curve(pr, &freqs)), format!("{bands} band{}", if bands == 1 { "" } else { "s" }))
             }
             Node::Deess => (Change(-m.deess_db), cut(m.deess_db)),
+            Node::Warmth => (Level(m.warmth_db), format!("{:.0}%", pr.warmth_amount * 100.0)),
             Node::Comp => (Change(-m.gr_db), cut(m.gr_db)),
             Node::Limiter => (Change(-m.lim_db), if m.lim_db > 0.1 { cut(m.lim_db) } else { "idle".into() }),
             Node::Output => match self.rates[1] {
@@ -1981,6 +1989,17 @@ impl App {
                     ab_row(ui, Stage::Deess, shown, hold, can_hear);
                     ui::row(ui, "Threshold", |ui| {
                         slider(ui, &mut pr.deess_threshold_db, -50.0..=0.0, " dB");
+                    });
+                });
+            }
+            Node::Warmth => {
+                let desc = "Soft saturation, like tube gear and tape: adds harmonics that make a voice sound fuller";
+                ui::group(ui, icon::MUSIC, Node::Warmth.title(), desc, Some(&mut pr.warmth), |ui| {
+                    let added = if snap.warmth { format!("{:.0} dB", m.warmth_db) } else { "off".into() };
+                    graphs::meter_row(ui, "Harmonics added", m.warmth_db, -60.0, 0.0, None, p.accent, &added);
+                    ab_row(ui, Stage::Warmth, shown, hold, can_hear);
+                    ui::row(ui, "Amount", |ui| {
+                        ui.add(egui::Slider::new(&mut pr.warmth_amount, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
                     });
                 });
             }

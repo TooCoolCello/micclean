@@ -55,8 +55,12 @@ const INPUT_LEVEL: f32 = -26.0;
 /// is left for shouts. Working on every word, it squashes the voice and sounds like clipping.
 const OUT_PEAK: f32 = -6.0;
 
-/// The highest Smart setup raises the low cut for room rumble. It never lowers yours.
+/// The highest Smart setup raises the low cut for room rumble.
 const MAX_LOW_CUT: f32 = 170.0;
+
+/// Your lows (135..250 Hz) are aimed this much over average speech: EQ'd onto the average
+/// itself, voices came out thin.
+const WARMTH: f32 = 2.0;
 
 /// Long-term average spectrum of speech at normal effort: ANSI S3.5-1997 Table 3 spectrum
 /// levels (dB/Hz) at the 1/3-octave centres. Only its shape is used, as the EQ target.
@@ -213,6 +217,11 @@ pub fn analyse(p: &Params, quiet: &[Quiet], talk: &[Take]) -> Result<Outcome, St
     };
     s.comp_threshold_db = (c50 - 6.0).clamp(-50.0, 0.0).round();
     s.comp_makeup_db = step((c50 - s.comp_threshold_db).max(0.0) * (1.0 - 1.0 / s.comp_ratio)).clamp(0.0, 12.0);
+
+    // Warmth: on at its gentle default, for a fuller voice. An Amount you chose stays.
+    if !p.warmth {
+        (s.warmth, s.warmth_amount) = (true, Params::default().warmth_amount);
+    }
     Ok(Outcome { params: s, full_eq, notes, measured })
 }
 
@@ -242,16 +251,16 @@ pub fn output_gain(p: &Params, prof: &dsp::Profiles, audio: &[f32]) -> f32 {
     p.output_gain_db.min(step(OUT_PEAK - pct(&mut peaks, 0.99))).max(-20.0)
 }
 
-/// Never below your current low cut. Otherwise 3/4 of your lowest notes, or higher (up to
-/// 170 Hz) through each bottom band where the room's noise is within 25 dB of your voice:
-/// noise removal can't take that out from under your voice, but the low cut can.
+/// 3/4 of your lowest notes, or higher (up to 170 Hz) through each bottom band where the
+/// room's noise is within 25 dB of your voice: noise removal can't take that out from under
+/// your voice, but the low cut can. The room is measured, so a low cut set higher than that
+/// (by hand, or an older setup) comes down: it was cutting into your voice.
 fn low_cut(p: &Params, voice: &[f32; NB], room: &[f32; NB], notes_hz: Option<(f32, f32)>) -> f32 {
     let current = p.bands.iter().flatten().find(|b| b.kind == BandKind::LowCut).map(|b| b.freq);
     let for_voice = notes_hz.map_or(current.unwrap_or(80.0), |(lowest, _)| 0.75 * lowest);
     let rumble = (0..3).take_while(|&b| voice[b] - room[b] < 25.0).count();
     let for_room = if rumble > 0 { dsp::band_edge(rumble) } else { 0.0 };
-    let chosen = ((for_voice.max(for_room) / 5.0).round() * 5.0).clamp(60.0, MAX_LOW_CUT);
-    chosen.max(current.unwrap_or(0.0))
+    ((for_voice.max(for_room) / 5.0).round() * 5.0).clamp(60.0, MAX_LOW_CUT)
 }
 
 /// Your bands with the low cut moved to `freq` (or added in a free slot).
@@ -268,7 +277,7 @@ fn with_low_cut(mut bands: [Option<Band>; dsp::BANDS], freq: f32) -> [Option<Ban
 }
 
 /// Five gentle bands from how your spectrum differs from the speech target, compared at
-/// 0.9..2.7 kHz: the low cut, then boom, mud, presence and air. Cuts go to 4 dB, boosts to
+/// 0.9..2.7 kHz: the low cut, then warmth, mud, presence and air. Cuts go to 4 dB, boosts to
 /// 3 dB, and anything under 1 dB is left out. `notes_hz`: your lowest (10th percentile) and
 /// typical pitch.
 fn fit_eq(avg: &[f32; NB], low_cut: f32, notes_hz: Option<(f32, f32)>) -> [Option<Band>; dsp::BANDS] {
@@ -290,17 +299,20 @@ fn fit_eq(avg: &[f32; NB], low_cut: f32, notes_hz: Option<(f32, f32)>) -> [Optio
             0.0
         }
     };
-    // The target averages men and women: a voice whose fundamental sits in the boom range
-    // (135..330 Hz, most women) has more there by nature, not from mic boom.
-    let boom_allow = match notes_hz {
-        Some((_, typical)) if (dsp::band_edge(1)..dsp::band_edge(3)).contains(&typical) => 6.0,
-        _ => 2.0,
+    // Warmth: the lows go to WARMTH over the target, so a voice right on it gets a gentle lift
+    // and one with boom a cut. The target averages men and women: a voice whose fundamental
+    // sits in the boom range (135..330 Hz, most women) has 4 dB more there by nature, not
+    // from mic boom.
+    let natural = match notes_hz {
+        Some((_, typical)) if (dsp::band_edge(1)..dsp::band_edge(3)).contains(&typical) => 4.0,
+        _ => 0.0,
     };
+    let warmth = (WARMTH - (over(1, 2) - natural)).clamp(-4.0, 3.0);
     let (mud_band, mud) = (3..=5).map(|b| (b, over(b, b))).max_by(|a, b| a.1.total_cmp(&b.1)).expect("non-empty range");
     let air = over(14, 15);
     [
         Some(Band { kind: BandKind::LowCut, freq: low_cut, q: 0.707, gain_db: 0.0, on: true }),
-        band(BandKind::LowShelf, 200.0, 0.707, fix(over(1, 2), boom_allow, false)),
+        band(BandKind::LowShelf, 200.0, 0.707, warmth),
         band(BandKind::Bell, centre(mud_band), 1.4, fix(mud, 2.0, false)),
         band(BandKind::Bell, 3200.0, 1.0, fix(over(11, 12), 1.5, true)),
         // Over 12 dB short means the mic (or the call) cuts off there: lifting it adds only hiss.
@@ -360,6 +372,9 @@ pub fn changes(old: &Params, new: &Params) -> Vec<String> {
         line("Tone", &[Some(bands.join(", "))]);
     }
     line("Soften S sounds", &[db("starts at ", old.deess_threshold_db, new.deess_threshold_db)]);
+    let warmth = (old.warmth != new.warmth || old.warmth_amount != new.warmth_amount)
+        .then(|| if new.warmth { format!("on, {:.0}%", new.warmth_amount * 100.0) } else { "off".into() });
+    line("Warmth", &[warmth]);
     let ratio = (old.comp_ratio != new.comp_ratio).then(|| format!("strength {:.0}:1 → {:.0}:1", old.comp_ratio, new.comp_ratio));
     line(
         "Tame loud parts",
@@ -420,16 +435,18 @@ mod tests {
     }
 
     #[test]
-    fn your_eq_stays_and_the_low_cut_only_goes_up() {
+    fn your_eq_stays_and_only_the_low_cut_moves() {
         let bell = Band { kind: BandKind::Bell, freq: 300.0, gain_db: 2.5, q: 1.0, on: true };
-        let cut = Band { kind: BandKind::LowCut, freq: 120.0, gain_db: 0.0, q: 0.707, on: true };
+        let cut = Band { kind: BandKind::LowCut, freq: 170.0, gain_db: 0.0, q: 0.707, on: true };
         let mine = Params { bands: [Some(cut), Some(bell), None, None, None], ..Params::default() };
         let talk = vec![take(-22.0, -20.0, -40.0); 200];
 
-        // Quiet room: the voice rule would say 90 Hz, but yours (120) stays, and so does the bell.
+        // Quiet room: the low cut comes down from 170 to under your lowest notes (90 Hz), where
+        // it stops cutting into your voice. The bell stays.
         let o = analyse(&mine, &quiet(-70.0), &talk).unwrap();
-        assert!(o.params.bands == mine.bands);
-        assert!(o.full_eq != mine.bands && o.notes.iter().any(|n| n.contains("Suggest")));
+        assert_eq!(o.params.bands[0].map(|b| b.freq), Some(90.0));
+        assert!(o.params.bands[1] == mine.bands[1]);
+        assert!(o.full_eq != o.params.bands && o.notes.iter().any(|n| n.contains("Suggest")));
 
         // Rumble within 25 dB of the voice in the room's two lowest bands: the low cut goes up
         // past them (182 Hz), stopping at 170.
@@ -443,10 +460,11 @@ mod tests {
     }
 
     #[test]
-    fn a_voice_like_the_target_gets_only_a_low_cut_under_its_lowest_notes() {
+    fn a_voice_like_the_target_gets_a_low_cut_under_its_lowest_notes_and_some_warmth() {
         let o = analyse(&Params::default(), &quiet(-70.0), &vec![take(-22.0, -20.0, -40.0); 200]).unwrap();
         assert_eq!(o.params.bands[0].map(|b| (b.kind, b.freq)), Some((BandKind::LowCut, 90.0)), "3/4 of 120 Hz");
-        assert!(o.params.bands[1..].iter().all(Option::is_none), "{:?}", changes(&Params::default(), &o.params));
+        assert_eq!(o.params.bands[1].map(|b| (b.kind, b.gain_db)), Some((BandKind::LowShelf, WARMTH)));
+        assert!(o.params.bands[2..].iter().all(Option::is_none), "{:?}", changes(&Params::default(), &o.params));
     }
 
     #[test]
@@ -469,7 +487,7 @@ mod tests {
         t.bands[14] -= 15.0;
         t.bands[15] -= 15.0;
         let o = analyse(&Params::default(), &quiet(-70.0), &vec![t; 200]).unwrap();
-        assert_eq!(gain(&o, 1), -2.0, "8 dB over, 6 dB of it allowed");
+        assert_eq!(gain(&o, 1), -2.0, "8 dB over: 4 of it natural, 2 kept as warmth");
         assert_eq!(gain(&o, 4), 0.0, "nothing up there to lift");
     }
 
@@ -594,6 +612,11 @@ mod tests {
         let mut talk: Vec<Take> = (0..200).map(|i| take(-22.0, -20.0, -45.0 + (i % 10) as f32 * 2.0)).collect();
         for t in talk.iter_mut().skip(170) {
             t.comp = -10.0;
+        }
+        // Already warm, so no warmth is added.
+        for t in &mut talk {
+            t.bands[1] += WARMTH;
+            t.bands[2] += WARMTH;
         }
         let o = analyse(&Params::default(), &quiet(-70.0), &talk).unwrap();
         // Auto level ends at its target either way and only a low cut is added: levels there

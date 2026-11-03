@@ -56,6 +56,9 @@ pub struct Params {
     pub comp_attack_ms: f32,
     pub comp_release_ms: f32,
     pub comp_makeup_db: f32,
+    /// Warmth: soft saturation, the harmonics of tube gear and tape. 0..1, how hard it drives.
+    pub warmth: bool,
+    pub warmth_amount: f32,
     pub output_gain_db: f32,
 }
 
@@ -89,6 +92,8 @@ impl Default for Params {
             comp_attack_ms: 5.0,
             comp_release_ms: 120.0,
             comp_makeup_db: 4.0,
+            warmth: false,
+            warmth_amount: 0.3,
             output_gain_db: 0.0,
         }
     }
@@ -122,6 +127,7 @@ impl Params {
         fix(&mut self.comp_attack_ms, 0.5, 50.0, d.comp_attack_ms);
         fix(&mut self.comp_release_ms, 20.0, 1000.0, d.comp_release_ms);
         fix(&mut self.comp_makeup_db, 0.0, 24.0, d.comp_makeup_db);
+        fix(&mut self.warmth_amount, 0.0, 1.0, d.warmth_amount);
         fix(&mut self.output_gain_db, -20.0, 30.0, d.output_gain_db);
         for b in self.bands.iter_mut().flatten() {
             fix(&mut b.freq, 20.0, 20_000.0, 1000.0);
@@ -324,6 +330,8 @@ pub struct Meters {
     pub deess_level_db: f32,
     /// Limiter gain reduction over the last frame.
     pub lim_db: f32,
+    /// Harmonics Warmth added, against the voice (dB).
+    pub warmth_db: f32,
     /// Distance from each learned sound (first MATCH_BARS) and from the learned voice.
     pub match_dist: [f32; MATCH_BARS],
     pub keep_dist: f32,
@@ -364,6 +372,7 @@ pub struct Chain {
     eq: Eq,
     deess: DeEsser,
     gr_db: f32,
+    warmth: Warmth,
     lim_env: f32,
     pub meters: Meters,
 }
@@ -388,6 +397,7 @@ impl Default for Chain {
             eq: Eq::default(),
             deess: DeEsser::default(),
             gr_db: 0.0,
+            warmth: Warmth::default(),
             lim_env: 0.0,
             meters: Meters::default(),
         }
@@ -610,6 +620,19 @@ impl Chain {
             self.meters.deess_level_db = 20.0 * self.deess.env.max(1e-6).log10();
         }
 
+        // After auto level, so the level it drives is steady and it colours every word alike,
+        // and after the de-esser, so S sounds are tamed before they could add grit.
+        self.meters.warmth_db = -120.0;
+        if p.warmth {
+            let (mut e_x, mut e_h) = (1e-12f32, 1e-12f32);
+            for s in x.iter_mut() {
+                let h = self.warmth.run(*s, p.warmth_amount);
+                (e_x, e_h) = (e_x + *s * *s, e_h + h * h);
+                *s += h;
+            }
+            self.meters.warmth_db = 10.0 * (e_h / e_x).log10();
+        }
+
         self.meters.gr_db = 0.0;
         if p.comp {
             let (att, rel) = (coef(p.comp_attack_ms), coef(p.comp_release_ms));
@@ -625,6 +648,7 @@ impl Chain {
             self.meters.gr_db = self.gr_db;
             self.meters.comp_in_db = 20.0 * peak.log10();
         }
+
 
         self.limit(x, p.output_gain_db);
     }
@@ -864,6 +888,47 @@ impl Learner {
     }
 }
 
+/// How hard Warmth drives at full Amount, and how lopsided its curve is (even harmonics, as
+/// tube gear makes, next to tape's odd ones).
+const WARMTH_DRIVE_DB: f32 = 18.0;
+const WARMTH_BIAS: f32 = 0.3;
+
+/// Warmth: soft saturation run on the voice under 6 kHz, added on top as just the harmonics it
+/// makes. The voice itself keeps its level and timing, and the harmonics that matter (up to
+/// the 3rd of 6 kHz) stay under the 24 kHz limit instead of folding back down as grit.
+// ponytail: no oversampling, the drive is gentle and a 12 dB/octave low-pass feeds it.
+// Oversample if high Amounts ever sound gritty.
+struct Warmth {
+    lp: Biquad,
+    dc_x: f32,
+    dc_y: f32,
+}
+
+impl Default for Warmth {
+    fn default() -> Self {
+        let mut lp = Biquad::default();
+        lp.set(BandKind::HighCut, 6000.0, 0.707, 0.0);
+        Self { lp, dc_x: 0.0, dc_y: 0.0 }
+    }
+}
+
+impl Warmth {
+    /// The harmonics to add to `x` at `amount` (0..1).
+    fn run(&mut self, x: f32, amount: f32) -> f32 {
+        let l = self.lp.run(x);
+        let drive = db2lin(WARMTH_DRIVE_DB * amount);
+        let t = WARMTH_BIAS.tanh();
+        // The curve scaled to slope 1 at rest, minus the input: what's left is the harmonics.
+        let h = ((l * drive + WARMTH_BIAS).tanh() - t) / (drive * (1.0 - t * t)) - l;
+        // The lopsided curve leaves a little DC: a 10 Hz high-pass takes it out.
+        let y = h - self.dc_x + 0.9987 * self.dc_y;
+        (self.dc_x, self.dc_y) = (h, y);
+        // Even undriven the curve makes some (2.6% on a voice-level tone): it fades in over the
+        // first quarter of Amount, so 0 is clean.
+        y * (4.0 * amount).min(1.0)
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Biquad {
     b: [f32; 3],
@@ -1014,7 +1079,35 @@ fn rms_db(x: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f32::consts::TAU;
+
+    #[test]
+    fn warmth_adds_harmonics_and_keeps_the_voice_level() {
+        // A 200 Hz tone at -18 dBFS RMS, a voice's level after auto level and a little EQ.
+        let tone = |i: usize| (std::f32::consts::TAU * 200.0 * i as f32 / SR).sin() * 0.178;
+        // Distortion (harmonics against the fundamental, %) and the fundamental's change (dB).
+        let measure = |amount: f32| {
+            let mut w = Warmth::default();
+            let (mut s, mut c, mut all, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let mut out = Vec::new();
+            for i in 0..SR as usize {
+                let y = tone(i) + w.run(tone(i), amount);
+                if i >= 9600 {
+                    let ph = std::f64::consts::TAU * 200.0 * i as f64 / SR as f64;
+                    (s, c, all, n) = (s + y as f64 * ph.sin(), c + y as f64 * ph.cos(), all + (y as f64).powi(2), n + 1.0);
+                    out.push(y);
+                }
+            }
+            let fund = 4.0 * (s * s + c * c) / (n * n); // amplitude squared
+            let harm = all / n - fund / 2.0;
+            ((harm / (fund / 2.0)).max(0.0).sqrt() * 100.0, 10.0 * (fund / (0.178f64 * 0.178)).log10())
+        };
+        let thd: Vec<(f32, f64, f64)> = [0.0, 0.1, 0.3, 0.6, 1.0].into_iter().map(|a| (a, measure(a).0, measure(a).1)).collect();
+        assert!(thd[0].1 < 0.05, "Amount 0 adds nothing: {thd:?}");
+        assert!(thd.windows(2).all(|w| w[1].1 > w[0].1), "more Amount, more harmonics: {thd:?}");
+        assert!((2.0..8.0).contains(&thd[2].1), "the default (30%) is a gentle few %: {thd:?}");
+        assert!(thd[4].1 > 10.0 && thd[4].1 < 20.0, "full Amount is plainly saturated: {thd:?}");
+        assert!(thd[..4].iter().all(|t| t.2 > -1.0), "the voice keeps its level: {thd:?}");
+    }    use std::f32::consts::TAU;
 
     fn tone(f0: f32, n: usize, amp: f32) -> Vec<f32> {
         // Five harmonics with 5 Hz vibrato: a crude held sung vowel.
