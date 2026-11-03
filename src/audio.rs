@@ -3,13 +3,13 @@
 //! cpal's; the two it can't open (exclusive output, every app but this one as the echo
 //! source) run on their own threads with the wasapi crate.
 
-use crate::dsp::{Chain, FRAME, Learner, Meters, Params, Profiles, SR};
+use crate::dsp::{Chain, FRAME, Learner, Meters, Params, Profiles, SR, db2lin};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use serde::{Deserialize, Serialize};
-use sonora::config::{EchoCanceller, MaxProcessingRate, Pipeline};
+use sonora::config::{EchoCanceller, MaxProcessingRate, Pipeline, TransparentModeType};
 use sonora::{AudioProcessing, Config, StreamConfig};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -272,16 +272,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
         info += &format!(" (couldn't open {name}: {why})");
     }
 
-    let mut apm = AudioProcessing::builder()
-        .config(Config {
-            pipeline: Pipeline { maximum_internal_processing_rate: MaxProcessingRate::Rate48kHz, ..Default::default() },
-            echo_canceller: echo.as_ref().map(|_| EchoCanceller::default()),
-            ..Default::default()
-        })
-        .capture_config(StreamConfig::new(rate, 1))
-        .render_config(StreamConfig::new(echo.as_ref().map_or(rate, |e| e.1), 1))
-        .build();
-    // The APM also resamples the mic to 48 kHz when it runs at e.g. 44.1 kHz.
+    let mut apm = new_apm(rate, echo.as_ref().map(|e| e.1));
     let in_cfg = StreamConfig::new(rate, 1);
     let out_cfg = StreamConfig::new(SR as u32, 1);
     let mut chain = Chain::default();
@@ -369,7 +360,8 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
                 }
             }
 
-            let _ = apm.process_capture_f32_with_config(&[&acc], &in_cfg, &out_cfg, &mut [&mut frame]);
+            let pre = if echo.is_some() { db2lin(params.input_gain_db) } else { 1.0 };
+            capture(&mut apm, &mut acc, pre, &in_cfg, &out_cfg, &mut frame);
             acc.clear();
             if echo.is_some() {
                 let st = apm.statistics(); // a borrowed struct, nothing computed here
@@ -399,6 +391,32 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     })?);
 
     Ok(Engine { _streams: streams, _workers: workers, info, shared_output, missing, failed })
+}
+
+/// The audio processing module: echo cancellation against a reference at `echo_rate`, if any,
+/// and resampling the mic to 48 kHz when it runs at e.g. 44.1 kHz.
+fn new_apm(rate: u32, echo_rate: Option<u32>) -> AudioProcessing {
+    // HMM is WebRTC's own default. Sonora's Legacy one rarely notices headphones (nothing to
+    // cancel), so it kept cutting into the voice whenever music played.
+    let echo = EchoCanceller { transparent_mode: TransparentModeType::Hmm, ..EchoCanceller::default() };
+    AudioProcessing::builder()
+        .config(Config {
+            pipeline: Pipeline { maximum_internal_processing_rate: MaxProcessingRate::Rate48kHz, ..Default::default() },
+            echo_canceller: echo_rate.map(|_| echo),
+            ..Default::default()
+        })
+        .capture_config(StreamConfig::new(rate, 1))
+        .render_config(StreamConfig::new(echo_rate.unwrap_or(rate), 1))
+        .build()
+}
+
+/// The APM's capture step, with the mic `pre` (input gain) louder. AEC3 judges echo by absolute
+/// level: a quiet mic's voice (-46 dBFS on a real one) reads as echo next to music in the
+/// reference, and gets cut. The gain comes back off before the chain applies its own.
+fn capture(apm: &mut AudioProcessing, mic: &mut [f32], pre: f32, in_cfg: &StreamConfig, out_cfg: &StreamConfig, out: &mut [f32]) {
+    mic.iter_mut().for_each(|s| *s *= pre);
+    let _ = apm.process_capture_f32_with_config(&[&*mic], in_cfg, out_cfg, &mut [&mut *out]);
+    out.iter_mut().for_each(|s| *s /= pre);
 }
 
 fn open_echo_ref(
@@ -520,6 +538,66 @@ mod tests {
         assert!((peak - 0.5).abs() < 0.05, "peak {peak}");
     }
 
+    #[test]
+    fn music_in_the_echo_reference_leaves_a_quiet_voice_alone() {
+        // Headphones: music in the reference, none of it in the mic (a quiet one: voice about
+        // -46 dBFS, so +20 dB input gain), the way people listen to music while they talk.
+        let n = 15 * SR as usize;
+        let mut seed = 7u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed as f32 / u32::MAX as f32 - 0.5
+        };
+        let tau = std::f32::consts::TAU;
+        // Speech-like: a gliding 110-150 Hz buzz in 4 Hz syllables, words of 1.2 s, 0.4 s apart.
+        let voice: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / SR;
+                let f0 = 130.0 + 20.0 * (tau * 0.3 * t).sin();
+                let buzz: f32 = (1..30).map(|k| (tau * f0 * k as f32 * t).sin() / k as f32).sum();
+                let syllable = (tau * 2.0 * t).sin().powi(2) * f32::from(t % 1.6 < 1.2);
+                buzz * syllable * 0.01
+            })
+            .collect();
+        // Music: a chord every half second, plucked, with a hi-hat on the off-beats.
+        let chords = [[220.0, 277.2, 329.6], [196.0, 246.9, 293.7], [174.6, 220.0, 261.6], [196.0, 246.9, 311.1]];
+        let music: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / SR;
+                let (beat, since) = ((t * 2.0) as usize, t % 0.5);
+                let notes: f32 = chords[beat % 4].iter().flat_map(|f| (1..6).map(move |k| (tau * f * k as f32 * t).sin() / k as f32)).sum();
+                let hat = if since > 0.25 { rnd() * (-(since - 0.25) * 40.0).exp() } else { 0.0 };
+                notes * (-since * 4.0).exp() * 0.08 + hat * 0.3
+            })
+            .collect();
+        let run = |reference: &[f32]| {
+            let cfg = StreamConfig::new(SR as u32, 1);
+            let mut apm = new_apm(SR as u32, Some(SR as u32));
+            let mut out = vec![0.0f32; n];
+            let mut scratch = [0.0f32; FRAME];
+            for k in 0..n / FRAME {
+                let r = k * FRAME..(k + 1) * FRAME;
+                apm.process_render_f32_with_config(&[&reference[r.clone()]], &cfg, &cfg, &mut [&mut scratch]).unwrap();
+                let mut mic = voice[r.clone()].to_vec();
+                capture(&mut apm, &mut mic, db2lin(20.0), &cfg, &cfg, &mut out[r]);
+            }
+            out
+        };
+        // How much of the voice the canceller sends with nothing in the reference survives the
+        // music, per spoken frame (the first 2 s are it settling).
+        let (alone, with_music) = (run(&vec![0.0; n]), run(&music));
+        let spoken: Vec<f32> = (200..n / FRAME)
+            .filter_map(|k| {
+                let (a, m) = (&alone[k * FRAME..(k + 1) * FRAME], &with_music[k * FRAME..(k + 1) * FRAME]);
+                let aa: f32 = a.iter().map(|s| s * s).sum();
+                (aa > FRAME as f32 * 1e-6).then(|| a.iter().zip(m).map(|(x, y)| x * y).sum::<f32>() / aa)
+            })
+            .collect();
+        let cut = spoken.iter().filter(|&&g| g < 0.316).count() as f32 / spoken.len() as f32;
+        assert!(spoken.len() > 500, "{} spoken frames", spoken.len());
+        // 0.9.0 (Legacy, raw mic level): 39%. Now 6%.
+        assert!(cut < 0.15, "{:.0}% of spoken frames cut by over 10 dB", cut * 100.0);
+    }
     #[test]
     fn drift_reader_rides_out_clock_drift() {
         for ppm in [-400.0, 400.0] {
