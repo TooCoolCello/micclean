@@ -2,7 +2,7 @@
 //! reading. It works on numbers the chain measures anyway and runs once, so it costs nothing
 //! while you talk. Every choice is a plain rule on top of those measurements.
 
-use crate::dsp::{self, Band, BandKind, NB, Params};
+use crate::dsp::{self, Band, BandKind, Fx, FxKind, NB, Params, Slot};
 
 /// One audio frame of you talking, as the meters saw it. During setup the gate is held open
 /// and the de-esser and compressor are on, so all of these are live.
@@ -187,11 +187,13 @@ pub fn analyse(p: &Params, quiet: &[Quiet], talk: &[Take]) -> Result<Outcome, St
     let cut = low_cut(p, &avg, &room_bands, notes_hz);
     let full_eq = fit_eq(&avg, cut, notes_hz);
     // Bands you tuned yourself stay and only the low cut moves; the full EQ waits behind the
-    // Equalizer's Suggest button.
-    let tuned = p.bands.iter().flatten().any(|b| b.kind != BandKind::LowCut);
-    s.bands = if tuned { with_low_cut(p.bands, cut) } else { full_eq };
-    if s.bands != full_eq {
-        notes.push("Kept your own Tone bands and only set the low cut. Suggest in Tone (Advanced) has a full EQ for your voice.".into());
+    // Equalizer's Suggest button. Like everything below, it's the first Tone in the rack.
+    if let Some(bands) = s.bands_mut() {
+        let tuned = bands.iter().flatten().any(|b| b.kind != BandKind::LowCut);
+        *bands = if tuned { with_low_cut(*bands, cut) } else { full_eq };
+        if *bands != full_eq {
+            notes.push("Kept your own Tone bands and only set the low cut. Suggest in Tone (Advanced) has a full EQ for your voice.".into());
+        }
     }
 
     // The de-esser and compressor sit after auto level and the EQ, so their levels move by
@@ -203,24 +205,30 @@ pub fn analyse(p: &Params, quiet: &[Quiet], talk: &[Take]) -> Result<Outcome, St
     let (mid, high) = (level_change(0..=12), level_change(13..=NB - 1));
 
     // De-esser: only your strongest S sounds (top 10% of the 5 kHz+ level) get trimmed.
-    s.deess_threshold_db = (pct(&mut col(|t| t.deess), 0.9) + high - 3.0).clamp(-50.0, 0.0).round();
+    let deess = (pct(&mut col(|t| t.deess), 0.9) + high - 3.0).clamp(-50.0, 0.0).round();
+    if let Some(t) = s.deess_threshold_mut() {
+        *t = deess;
+    }
 
     // Compressor: the threshold sits 6 dB under your typical peaks, so they lose about 4 dB
     // (at 3:1) and makeup gives that back. The wider the gap to your loud peaks, the higher
     // the ratio.
     let mut peaks = col(|t| t.comp);
     let (c50, c95) = (pct(&mut peaks, 0.5) + mid, pct(&mut peaks, 0.95) + mid);
-    s.comp_ratio = match c95 - c50 {
-        x if x > 12.0 => 4.0,
-        x if x > 8.0 => 3.0,
-        _ => 2.0,
-    };
-    s.comp_threshold_db = (c50 - 6.0).clamp(-50.0, 0.0).round();
-    s.comp_makeup_db = step((c50 - s.comp_threshold_db).max(0.0) * (1.0 - 1.0 / s.comp_ratio)).clamp(0.0, 12.0);
+    if let Some(c) = s.comp_mut() {
+        c.ratio = match c95 - c50 {
+            x if x > 12.0 => 4.0,
+            x if x > 8.0 => 3.0,
+            _ => 2.0,
+        };
+        c.threshold_db = (c50 - 6.0).clamp(-50.0, 0.0).round();
+        c.makeup_db = step((c50 - c.threshold_db).max(0.0) * (1.0 - 1.0 / c.ratio)).clamp(0.0, 12.0);
+    }
 
-    // Warmth: on at its gentle default, for a fuller voice. An Amount you chose stays.
-    if !p.warmth {
-        (s.warmth, s.warmth_amount) = (true, Params::default().warmth_amount);
+    // Warmth: on at its gentle default, for a fuller voice. An Amount you chose stays, and a
+    // rack without Warmth (you took it out) stays without.
+    if let Some(w) = s.first_mut(FxKind::Warmth).filter(|w| !w.on) {
+        (w.on, w.fx) = (true, FxKind::Warmth.new());
     }
     Ok(Outcome { params: s, full_eq, notes, measured })
 }
@@ -256,7 +264,7 @@ pub fn output_gain(p: &Params, prof: &dsp::Profiles, audio: &[f32]) -> f32 {
 /// your voice, but the low cut can. The room is measured, so a low cut set higher than that
 /// (by hand, or an older setup) comes down: it was cutting into your voice.
 fn low_cut(p: &Params, voice: &[f32; NB], room: &[f32; NB], notes_hz: Option<(f32, f32)>) -> f32 {
-    let current = p.bands.iter().flatten().find(|b| b.kind == BandKind::LowCut).map(|b| b.freq);
+    let current = p.bands().and_then(|b| b.iter().flatten().find(|b| b.kind == BandKind::LowCut)).map(|b| b.freq);
     let for_voice = notes_hz.map_or(current.unwrap_or(80.0), |(lowest, _)| 0.75 * lowest);
     let rumble = (0..3).take_while(|&b| voice[b] - room[b] < 25.0).count();
     let for_room = if rumble > 0 { dsp::band_edge(rumble) } else { 0.0 };
@@ -324,7 +332,10 @@ fn fit_eq(avg: &[f32; NB], low_cut: f32, notes_hz: Option<(f32, f32)>) -> [Optio
 /// weighted by how much of your voice is in each.
 fn eq_change(old: &Params, new: &Params, avg: &[f32; NB], bands: std::ops::RangeInclusive<usize>) -> f32 {
     let freqs: Vec<f32> = (0..NB).map(centre).collect();
-    let curve = |p: &Params| if p.eq { dsp::eq_curve(p, &freqs) } else { vec![0.0; NB] };
+    let curve = |p: &Params| match p.first(FxKind::Eq) {
+        Some(Slot { on: true, fx: Fx::Eq { bands }, .. }) => dsp::eq_curve(bands, &freqs),
+        _ => vec![0.0; NB],
+    };
     let (a, b) = (curve(old), curve(new));
     let (mut num, mut den) = (0.0, 0.0);
     for i in bands {
@@ -355,9 +366,8 @@ pub fn changes(old: &Params, new: &Params) -> Vec<String> {
         .then(|| format!("strength {:.0}% → {:.0}%", old.denoise_strength * 100.0, new.denoise_strength * 100.0));
     line("Noise removal", &[strength]);
     line("Mute between words", &[db("mutes below ", old.gate_threshold_db, new.gate_threshold_db)]);
-    if old.bands != new.bands {
-        let bands: Vec<String> = new
-            .bands
+    if let Some(new_bands) = new.bands().filter(|&b| old.bands() != Some(b)) {
+        let bands: Vec<String> = new_bands
             .iter()
             .flatten()
             .map(|b| match b.kind {
@@ -371,15 +381,25 @@ pub fn changes(old: &Params, new: &Params) -> Vec<String> {
             .collect();
         line("Tone", &[Some(bands.join(", "))]);
     }
-    line("Soften S sounds", &[db("starts at ", old.deess_threshold_db, new.deess_threshold_db)]);
-    let warmth = (old.warmth != new.warmth || old.warmth_amount != new.warmth_amount)
-        .then(|| if new.warmth { format!("on, {:.0}%", new.warmth_amount * 100.0) } else { "off".into() });
-    line("Warmth", &[warmth]);
-    let ratio = (old.comp_ratio != new.comp_ratio).then(|| format!("strength {:.0}:1 → {:.0}:1", old.comp_ratio, new.comp_ratio));
-    line(
-        "Tame loud parts",
-        &[db("starts at ", old.comp_threshold_db, new.comp_threshold_db), ratio, db("boost after ", old.comp_makeup_db, new.comp_makeup_db)],
-    );
+    // The rack's first of each kind, as Smart setup sets them.
+    let deess = |p: &Params| match p.first(FxKind::Deess) {
+        Some(Slot { fx: Fx::Deess { threshold_db }, .. }) => Some(*threshold_db),
+        _ => None,
+    };
+    if let (Some(a), Some(b)) = (deess(old), deess(new)) {
+        line("Soften S sounds", &[db("starts at ", a, b)]);
+    }
+    let warmth = |p: &Params| match p.first(FxKind::Warmth) {
+        Some(Slot { on, fx: Fx::Warmth { amount }, .. }) => Some((*on, *amount)),
+        _ => None,
+    };
+    if let (Some(a), Some((on, amount))) = (warmth(old), warmth(new)) {
+        line("Warmth", &[(a != (on, amount)).then(|| if on { format!("on, {:.0}%", amount * 100.0) } else { "off".into() })]);
+    }
+    if let (Some(a), Some(b)) = (old.comp(), new.comp()) {
+        let ratio = (a.ratio != b.ratio).then(|| format!("strength {:.0}:1 → {:.0}:1", a.ratio, b.ratio));
+        line("Tame loud parts", &[db("starts at ", a.threshold_db, b.threshold_db), ratio, db("boost after ", a.makeup_db, b.makeup_db)]);
+    }
     line("Loudness", &[db("", old.output_gain_db, new.output_gain_db)]);
     out
 }
@@ -438,15 +458,16 @@ mod tests {
     fn your_eq_stays_and_only_the_low_cut_moves() {
         let bell = Band { kind: BandKind::Bell, freq: 300.0, gain_db: 2.5, q: 1.0, on: true };
         let cut = Band { kind: BandKind::LowCut, freq: 170.0, gain_db: 0.0, q: 0.707, on: true };
-        let mine = Params { bands: [Some(cut), Some(bell), None, None, None], ..Params::default() };
+        let mine = Params::default().with_bands([Some(cut), Some(bell), None, None, None]);
         let talk = vec![take(-22.0, -20.0, -40.0); 200];
 
         // Quiet room: the low cut comes down from 170 to under your lowest notes (90 Hz), where
         // it stops cutting into your voice. The bell stays.
         let o = analyse(&mine, &quiet(-70.0), &talk).unwrap();
-        assert_eq!(o.params.bands[0].map(|b| b.freq), Some(90.0));
-        assert!(o.params.bands[1] == mine.bands[1]);
-        assert!(o.full_eq != o.params.bands && o.notes.iter().any(|n| n.contains("Suggest")));
+        let (b, m) = (o.params.bands().unwrap(), mine.bands().unwrap());
+        assert_eq!(b[0].map(|b| b.freq), Some(90.0));
+        assert!(b[1] == m[1]);
+        assert!(o.full_eq != *b && o.notes.iter().any(|n| n.contains("Suggest")));
 
         // Rumble within 25 dB of the voice in the room's two lowest bands: the low cut goes up
         // past them (182 Hz), stopping at 170.
@@ -455,16 +476,18 @@ mod tests {
             (q.bands[0], q.bands[1]) = (talk[0].bands[0] - 10.0, talk[0].bands[1] - 10.0);
         }
         let o = analyse(&mine, &room, &talk).unwrap();
-        assert_eq!(o.params.bands[0].map(|b| b.freq), Some(170.0));
-        assert!(o.params.bands[1] == mine.bands[1]);
+        let (b, m) = (o.params.bands().unwrap(), mine.bands().unwrap());
+        assert_eq!(b[0].map(|b| b.freq), Some(170.0));
+        assert!(b[1] == m[1]);
     }
 
     #[test]
     fn a_voice_like_the_target_gets_a_low_cut_under_its_lowest_notes_and_some_warmth() {
         let o = analyse(&Params::default(), &quiet(-70.0), &vec![take(-22.0, -20.0, -40.0); 200]).unwrap();
-        assert_eq!(o.params.bands[0].map(|b| (b.kind, b.freq)), Some((BandKind::LowCut, 90.0)), "3/4 of 120 Hz");
-        assert_eq!(o.params.bands[1].map(|b| (b.kind, b.gain_db)), Some((BandKind::LowShelf, WARMTH)));
-        assert!(o.params.bands[2..].iter().all(Option::is_none), "{:?}", changes(&Params::default(), &o.params));
+        let b = o.params.bands().unwrap();
+        assert_eq!(b[0].map(|b| (b.kind, b.freq)), Some((BandKind::LowCut, 90.0)), "3/4 of 120 Hz");
+        assert_eq!(b[1].map(|b| (b.kind, b.gain_db)), Some((BandKind::LowShelf, WARMTH)));
+        assert!(b[2..].iter().all(Option::is_none), "{:?}", changes(&Params::default(), &o.params));
     }
 
     #[test]
@@ -476,7 +499,7 @@ mod tests {
             t.bands[b] -= 5.0; // a dull mic
         }
         let o = analyse(&Params::default(), &quiet(-70.0), &vec![t; 200]).unwrap();
-        let gain = |o: &Outcome, i: usize| o.params.bands[i].map_or(0.0, |b| b.gain_db);
+        let gain = |o: &Outcome, i: usize| o.params.bands().unwrap()[i].map_or(0.0, |b| b.gain_db);
         assert_eq!(gain(&o, 1), -4.0, "boom cut, capped at 4 dB");
         assert_eq!(gain(&o, 3), 3.0, "presence lifted, capped at 3 dB");
         assert_eq!(gain(&o, 4), 3.0, "air lifted");
@@ -520,29 +543,18 @@ mod tests {
         let data = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
         let voice: Vec<f32> = bytes[data..].chunks_exact(2 * ch).map(|f| i16::from_le_bytes([f[0], f[1]]) as f32 / 32768.0).collect();
         let band = |kind, freq, gain_db, q| Some(Band { kind, freq, gain_db, q, on: true });
-        let tuned = Params {
-            input_gain_db: 16.0,
-            agc_target_db: -14.0,
-            bands: [
-                band(BandKind::LowCut, 165.0, 0.0, 0.707),
-                band(BandKind::Bell, 300.0, 2.5, 1.0),
-                band(BandKind::HighShelf, 4271.0, 3.0, 0.707),
-                None,
-                None,
-            ],
-            ..Params::default()
-        };
+        let tuned = Params { input_gain_db: 16.0, agc_target_db: -14.0, ..Params::default() }.with_bands([
+            band(BandKind::LowCut, 165.0, 0.0, 0.707),
+            band(BandKind::Bell, 300.0, 2.5, 1.0),
+            band(BandKind::HighShelf, 4271.0, 3.0, 0.707),
+            None,
+            None,
+        ]);
         // As saved when a real Smart setup measured voice -45 dB RMS at +16 dB input gain.
-        let quiet_input = Params {
-            input_gain_db: 16.0,
-            gate_threshold_db: -74.0,
-            agc_target_db: -14.0,
-            bands: [band(BandKind::LowCut, 170.0, 0.0, 0.707), None, None, band(BandKind::Bell, 3200.0, 1.0, 1.0), None],
-            deess_threshold_db: -23.0,
-            comp_threshold_db: -14.0,
-            output_gain_db: 4.0,
-            ..Params::default()
-        };
+        let mut quiet_input = Params { input_gain_db: 16.0, gate_threshold_db: -74.0, agc_target_db: -14.0, output_gain_db: 4.0, ..Params::default() }
+            .with_bands([band(BandKind::LowCut, 170.0, 0.0, 0.707), None, None, band(BandKind::Bell, 3200.0, 1.0, 1.0), None]);
+        *quiet_input.deess_threshold_mut().unwrap() = -23.0;
+        quiet_input.comp_mut().unwrap().threshold_db = -14.0;
         // Name, settings, voice and noise level (dB), rumble.
         let runs = [
             ("defaults", Params::default(), 0.0, 0.0, false),
@@ -563,13 +575,18 @@ mod tests {
                 })
                 .collect();
             // What the app runs during setup: the gate open, the de-esser and compressor on.
-            let p = Params { gate: false, deess: true, comp: true, ..base.clone() };
+            let mut p = Params { gate: false, ..base.clone() };
+            for k in [FxKind::Deess, FxKind::Comp] {
+                p.first_mut(k).unwrap().on = true;
+            }
+            let at = |k| p.rack.iter().position(|s| s.is_some_and(|s| s.fx.kind() == k)).unwrap();
+            let (deess_at, comp_at) = (at(FxKind::Deess), at(FxKind::Comp));
             let (mut quiet, mut talk) = (Vec::new(), Vec::new());
             play(&x, &p, |i, m| {
                 if (50..300).contains(&i) {
                     quiet.push(Quiet { level: m.gate_level_db, peak: m.in_db, bands: m.bands_db });
                 } else if i >= 300 && m.vad >= 0.5 {
-                    let (level, peak, agc, deess, comp) = (m.gate_level_db, m.in_db, m.agc_db, m.deess_level_db, m.comp_in_db);
+                    let (level, peak, agc, deess, comp) = (m.gate_level_db, m.in_db, m.agc_db, m.fx[deess_at].level_db, m.fx[comp_at].level_db);
                     talk.push(Take { level, peak, agc, deess, comp, pitch: m.pitch_hz, bands: m.bands_db });
                 }
             });
@@ -598,7 +615,7 @@ mod tests {
     #[test]
     fn output_gain_keeps_the_loudest_peaks_at_minus_6_and_never_turns_up() {
         // Every effect off: what goes in comes out, so peaks are the recording's own.
-        let p = Params { denoise: false, gate: false, agc: false, eq: false, deess: false, comp: false, output_gain_db: 4.0, ..Params::default() };
+        let p = Params { denoise: false, gate: false, agc: false, output_gain_db: 4.0, ..Params::default() }.only_fx(&[]);
         let tone = |amp: f32| -> Vec<f32> { (0..200 * dsp::FRAME).map(|n| amp * (n as f32 * 0.05).sin()).collect() };
         let prof = dsp::Profiles::default();
         assert_eq!(output_gain(&p, &prof, &tone(1.0)), -6.0, "peaks at 0 dBFS: 6 dB down");
@@ -621,9 +638,10 @@ mod tests {
         let o = analyse(&Params::default(), &quiet(-70.0), &talk).unwrap();
         // Auto level ends at its target either way and only a low cut is added: levels there
         // don't move.
-        assert_eq!(o.params.comp_threshold_db, -26.0, "6 dB under typical peaks");
-        assert_eq!(o.params.comp_ratio, 3.0, "10 dB from typical to loud peaks");
-        assert_eq!(o.params.comp_makeup_db, 4.0, "what typical peaks lose at 3:1");
-        assert_eq!(o.params.deess_threshold_db, -32.0, "3 dB under where the top 10% of S levels start (-29)");
+        let c = o.params.comp().unwrap();
+        assert_eq!(c.threshold_db, -26.0, "6 dB under typical peaks");
+        assert_eq!(c.ratio, 3.0, "10 dB from typical to loud peaks");
+        assert_eq!(c.makeup_db, 4.0, "what typical peaks lose at 3:1");
+        assert_eq!(o.params.deess_threshold(), -32.0, "3 dB under where the top 10% of S levels start (-29)");
     }
 }

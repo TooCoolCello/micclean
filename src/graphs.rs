@@ -318,17 +318,18 @@ fn level_graph(
 }
 
 /// Compressor curve with the live level, plus a gain-reduction bar. Returns a dragged threshold.
-pub fn comp_graph(ui: &mut egui::Ui, p: &Params, m: &Meters) -> Option<f32> {
+pub fn comp_graph(ui: &mut egui::Ui, c: &dsp::Comp, m: &dsp::FxMeter) -> Option<f32> {
     let pal = ui::pal(ui);
+    let gr = -m.change_db;
     ui.horizontal(|ui| {
-        let dot = (m.comp_in_db, m.comp_in_db - m.gr_db + p.comp_makeup_db, pal.text);
-        let t = level_graph(ui, -60.0, 12.0, p.comp_threshold_db, None, |i| dsp::comp_curve_db(p, i), Some(dot));
+        let dot = (m.level_db, m.level_db - gr + c.makeup_db, pal.text);
+        let t = level_graph(ui, -60.0, 12.0, c.threshold_db, None, |i| dsp::comp_curve_db(c, i), Some(dot));
         let (bar, _) = ui.allocate_exact_size(Vec2::new(10.0, 200.0), Sense::hover());
         ui.painter().rect_filled(bar, 3.0, pal.field);
-        let h = bar.height() * (m.gr_db / 24.0).clamp(0.0, 1.0);
+        let h = bar.height() * (gr / 24.0).clamp(0.0, 1.0);
         ui.painter().rect_filled(Rect::from_min_size(bar.min, Vec2::new(bar.width(), h)), 3.0, AMBER);
         ui.vertical(|ui| {
-            ui.label(RichText::new(format!("-{:.1} dB", m.gr_db)).font(ui::semibold(20.0)));
+            ui.label(RichText::new(format!("-{gr:.1} dB")).font(ui::semibold(20.0)));
             ui.label(RichText::new("gain reduction").small().color(pal.text2));
             ui.add_space(8.0);
             ui.label(RichText::new("Drag across the graph to move the threshold.").small().color(pal.text2));
@@ -549,7 +550,8 @@ pub fn rack_row(ui: &mut egui::Ui, on: Option<&mut bool>, icon: &str, name: &str
             }
         }
         ui.add_space(6.0);
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
+        // Drag too: the rack's effects can be dragged to a new place.
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click_and_drag());
         let painter = ui.painter();
         if resp.hovered() {
             painter.rect_filled(rect.expand2(Vec2::new(4.0, 2.0)), 4.0, pal.nav_hover);

@@ -1,6 +1,8 @@
-//! Device I/O. All processing runs inside the mic callback. The speaker loopback (echo
-//! reference) and the output devices talk to it through lock-free rings. Most streams are
-//! cpal's; the two it can't open (exclusive output, every app but this one as the echo
+//! Device I/O. The mic callback only hands its samples over: all processing (echo
+//! cancellation, the chain, plugins) runs on its own thread, so a slow frame never holds up
+//! the capture and the output rings' cushion rides it out. The mic, the speaker loopback (echo
+//! reference) and the output devices talk to that thread through lock-free rings. Most streams
+//! are cpal's; the two it can't open (exclusive output, every app but this one as the echo
 //! source) run on their own threads with the wasapi crate.
 
 use crate::dsp::{Chain, FRAME, Learner, Meters, Params, Profiles, SR, db2lin};
@@ -11,6 +13,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use serde::{Deserialize, Serialize};
 use sonora::config::{EchoCanceller, MaxProcessingRate, Pipeline, TransparentModeType};
 use sonora::{AudioProcessing, Config, StreamConfig};
+use sonora_aec3::config::EchoCanceller3Config;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,7 +21,7 @@ use std::time::{Duration, Instant};
 /// Input channels with their own level meter.
 pub const MAX_CH: usize = 8;
 
-/// GUI <-> mic callback mailbox. The callback only ever try_locks it, and never allocates or
+/// GUI <-> processing thread mailbox. The thread only ever try_locks it, and never allocates or
 /// frees through it: whatever it lets go of goes back here for the GUI to drop.
 #[derive(Default)]
 pub struct Shared {
@@ -29,6 +32,12 @@ pub struct Shared {
     /// A new copy of them for the callback to swap in; it hands its old one back in `old_profiles`.
     pub new_profiles: Option<Profiles>,
     pub old_profiles: Option<Profiles>,
+    /// The loaded plugins, the same way: a new list in, the old one back. The GUI keeps its
+    /// own handle on each, so none is ever freed on the audio thread.
+    pub new_plugins: Option<crate::plugins::Procs>,
+    pub old_plugins: Option<crate::plugins::Procs>,
+    /// DeepFilterNet once the GUI has loaded it; the callback takes its own handle.
+    pub deep: Option<crate::dsp::Deep>,
     /// Learn run from the GUI, and the same run back with all its frames.
     pub learn: Option<Learner>,
     pub learned: Option<Learner>,
@@ -166,7 +175,10 @@ fn on_error(shared: Arc<Mutex<Shared>>, dev: String) -> impl FnMut(cpal::Error) 
     }
 }
 
-/// Keeps the streams alive; dropping it stops everything.
+/// What the glitch count names when the processing thread fell 100 ms behind.
+const PROCESSING: &str = "MicClean (processing fell behind)";
+
+/// Keeps the streams alive; dropping it stops everything (the streams first, then the threads).
 pub struct Engine {
     _streams: Vec<cpal::Stream>,
     _workers: Vec<Worker>,
@@ -193,8 +205,8 @@ fn skipped(name: &str, err: String, missing: &mut Vec<String>, failed: &mut Vec<
 }
 
 pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String> {
-    let mic = find(true, &dev.input)?;
-    let mic_cfg = mic.default_input_config().map_err(es)?;
+    let mic_dev = find(true, &dev.input)?;
+    let mic_cfg = mic_dev.default_input_config().map_err(es)?;
     let rate = mic_cfg.sample_rate();
     if rate % 100 != 0 {
         return Err(format!("{} runs at {rate} Hz; set it to 48000 Hz in Windows sound settings", dev.input));
@@ -286,108 +298,150 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
         sh.new_profiles = Some(sh.profiles.clone());
     }
     let frame_in = rate as usize / 100;
-    let mut acc = Vec::with_capacity(frame_in);
+    // Half a second of mic: the processing thread is never meant to be that far behind.
+    let (mut mic_in, mut mic) = HeapRb::<f32>::new(rate as usize / 2).split();
+    let peaks: Arc<[AtomicU32; MAX_CH]> = Arc::new(Default::default());
+    let mut acc = vec![0.0f32; frame_in];
     let mut frame = [0.0f32; FRAME];
     let (mut params, mut params_ver) = (Params::default(), u64::MAX);
     let ref_n = echo.as_ref().map_or(0, |e| e.1 as usize / 100);
     let (mut ref_in, mut ref_out) = (vec![0.0f32; ref_n], vec![0.0f32; ref_n]);
-    let mut starved = 0;
+    let (mut starved, mut behind) = (0, 0u32);
     let (mut rec, mut rec_pos) = (None::<Vec<f32>>, 0);
     let (mut mute_monitor, mut mute_sent) = (false, false);
-    let mut ch_peak = [0.0f32; MAX_CH];
     let sh = shared.clone();
+    let mic_peaks = peaks.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
 
-    streams.push(open_input(&mic, &mic_cfg, dev.input_channel, shared, move |mono, peaks, lag| {
+    let processing = std::thread::Builder::new()
+        .name("micclean processing".into())
+        .spawn(move || {
+            pro_audio_priority();
+            while !st.load(Relaxed) {
+                if mic.occupied_len() < frame_in {
+                    // The mic callback wakes it; the timeout is only for stopping.
+                    std::thread::park_timeout(Duration::from_millis(50));
+                    continue;
+                }
+                // 100 ms behind (a long stall): drop it rather than play it late from now on.
+                let backlog = mic.occupied_len();
+                if backlog > frame_in * 10 {
+                    mic.skip(backlog - backlog % frame_in - frame_in);
+                    behind += 1;
+                }
+                mic.pop_slice(&mut acc);
+                let t0 = Instant::now();
+                if let Ok(mut sh) = sh.try_lock() {
+                    if sh.params_ver != params_ver {
+                        params = sh.params.clone();
+                        params_ver = sh.params_ver;
+                    }
+                    if let Some(mut p) = sh.new_profiles.take() {
+                        std::mem::swap(&mut profiles, &mut p);
+                        sh.old_profiles = Some(p);
+                    }
+                    if chain.deep.is_none()
+                        && let Some(d) = &sh.deep
+                    {
+                        chain.deep = Some(d.clone());
+                    }
+                    if let Some(mut p) = sh.new_plugins.take() {
+                        std::mem::swap(&mut chain.plugins, &mut p);
+                        sh.old_plugins = Some(p);
+                    }
+                    if let Some(l) = sh.learn.take() {
+                        chain.start_learning(l);
+                    }
+                    if let Some(l) = chain.take_learned() {
+                        sh.learned = Some(l);
+                    }
+                    if let Some(buf) = sh.record.take() {
+                        sh.discarded = rec.replace(buf);
+                        rec_pos = 0;
+                    }
+                    // The GUI empties these when it reads them.
+                    for (a, p) in sh.channel_peak.iter_mut().zip(mic_peaks.iter()) {
+                        *a = a.max(f32::from_bits(p.swap(0, Relaxed)));
+                    }
+                    if behind > 0 {
+                        sh.glitches += std::mem::take(&mut behind);
+                        sh.glitch_dev = PROCESSING.into();
+                    }
+                    sh.record_progress = rec.as_ref().map(|r| rec_pos as f32 / r.len() as f32);
+                    if rec.as_ref().is_some_and(|r| rec_pos == r.len()) {
+                        sh.recorded = rec.take();
+                    }
+                    (mute_monitor, mute_sent) = (sh.mute_monitor, sh.mute_sent);
+                    chain.viz = sh.viz;
+                    sh.meters = chain.meters.clone();
+                }
+
+                if let Some((cons, ref_rate)) = &mut echo {
+                    let rc = StreamConfig::new(*ref_rate, 1);
+                    let backlog = cons.occupied_len();
+                    if backlog > ref_n * 20 {
+                        cons.skip(backlog - ref_n * 4); // fell 200 ms behind: catch up
+                    }
+                    let mut fed = false;
+                    let mut peak = 1e-6f32;
+                    while cons.occupied_len() >= ref_n {
+                        cons.pop_slice(&mut ref_in);
+                        peak = ref_in.iter().fold(peak, |m, s| m.max(s.abs()));
+                        let _ = apm.process_render_f32_with_config(&[&ref_in], &rc, &rc, &mut [&mut ref_out]);
+                        fed = true;
+                    }
+                    chain.meters.echo_ref_db = 20.0 * peak.log10();
+                    // WASAPI loopback goes quiet when nothing plays. After 30 ms of nothing, feed
+                    // silence so AEC3 keeps its timeline; shorter gaps are just callback jitter.
+                    starved = if fed { 0 } else { starved + 1 };
+                    if starved > 3 {
+                        ref_in.fill(0.0);
+                        let _ = apm.process_render_f32_with_config(&[&ref_in], &rc, &rc, &mut [&mut ref_out]);
+                    }
+                }
+
+                let pre = if echo.is_some() { db2lin(params.input_gain_db) } else { 1.0 };
+                capture(&mut apm, &mut acc, pre, &in_cfg, &out_cfg, &mut frame);
+                if echo.is_some() {
+                    let st = apm.statistics(); // a borrowed struct, nothing computed here
+                    chain.meters.echo_erle_db = st.echo_return_loss_enhancement.map(|v| v as f32);
+                    chain.meters.echo_delay_ms = st.delay_ms;
+                }
+                if let Some(r) = &mut rec {
+                    let k = (r.len() - rec_pos).min(FRAME);
+                    r[rec_pos..rec_pos + k].copy_from_slice(&frame[..k]);
+                    rec_pos += k;
+                }
+                chain.process(&params, &profiles, &mut frame);
+                for (o, is_monitor) in &mut outs {
+                    match (*is_monitor, mute_monitor, mute_sent) {
+                        (true, true, _) => {}
+                        (false, _, true) => {
+                            o.push_slice(&[0.0; FRAME]);
+                        }
+                        _ => {
+                            o.push_slice(&frame);
+                        }
+                    }
+                }
+                let load = t0.elapsed().as_secs_f32() / 0.01;
+                chain.meters.dsp_load += (load - chain.meters.dsp_load) * 0.02;
+            }
+        })
+        .map_err(es)?;
+    let wake = processing.thread().clone();
+    workers.push(Worker { stop, thread: Some(processing) });
+
+    // The mic callback: hand the samples over and wake the processing thread. Nothing here
+    // waits, locks or allocates.
+    streams.push(open_input(&mic_dev, &mic_cfg, dev.input_channel, shared, move |mono, p, lag| {
         latency.capture_us.store(lag.as_micros() as u32, Relaxed);
-        ch_peak.iter_mut().zip(peaks).for_each(|(a, p)| *a = a.max(*p));
-        for &s in mono {
-            acc.push(s);
-            if acc.len() < frame_in {
-                continue;
-            }
-            let t0 = Instant::now();
-            if let Ok(mut sh) = sh.try_lock() {
-                if sh.params_ver != params_ver {
-                    params = sh.params.clone();
-                    params_ver = sh.params_ver;
-                }
-                if let Some(mut p) = sh.new_profiles.take() {
-                    std::mem::swap(&mut profiles, &mut p);
-                    sh.old_profiles = Some(p);
-                }
-                if let Some(l) = sh.learn.take() {
-                    chain.start_learning(l);
-                }
-                if let Some(l) = chain.take_learned() {
-                    sh.learned = Some(l);
-                }
-                if let Some(buf) = sh.record.take() {
-                    sh.discarded = rec.replace(buf);
-                    rec_pos = 0;
-                }
-                // The GUI empties these when it reads them.
-                sh.channel_peak.iter_mut().zip(std::mem::take(&mut ch_peak)).for_each(|(a, p)| *a = a.max(p));
-                sh.record_progress = rec.as_ref().map(|r| rec_pos as f32 / r.len() as f32);
-                if rec.as_ref().is_some_and(|r| rec_pos == r.len()) {
-                    sh.recorded = rec.take();
-                }
-                (mute_monitor, mute_sent) = (sh.mute_monitor, sh.mute_sent);
-                chain.viz = sh.viz;
-                sh.meters = chain.meters.clone();
-            }
-
-            if let Some((cons, ref_rate)) = &mut echo {
-                let rc = StreamConfig::new(*ref_rate, 1);
-                let backlog = cons.occupied_len();
-                if backlog > ref_n * 20 {
-                    cons.skip(backlog - ref_n * 4); // fell 200 ms behind: catch up
-                }
-                let mut fed = false;
-                let mut peak = 1e-6f32;
-                while cons.occupied_len() >= ref_n {
-                    cons.pop_slice(&mut ref_in);
-                    peak = ref_in.iter().fold(peak, |m, s| m.max(s.abs()));
-                    let _ = apm.process_render_f32_with_config(&[&ref_in], &rc, &rc, &mut [&mut ref_out]);
-                    fed = true;
-                }
-                chain.meters.echo_ref_db = 20.0 * peak.log10();
-                // WASAPI loopback goes quiet when nothing plays. After 30 ms of nothing, feed
-                // silence so AEC3 keeps its timeline; shorter gaps are just callback jitter.
-                starved = if fed { 0 } else { starved + 1 };
-                if starved > 3 {
-                    ref_in.fill(0.0);
-                    let _ = apm.process_render_f32_with_config(&[&ref_in], &rc, &rc, &mut [&mut ref_out]);
-                }
-            }
-
-            let pre = if echo.is_some() { db2lin(params.input_gain_db) } else { 1.0 };
-            capture(&mut apm, &mut acc, pre, &in_cfg, &out_cfg, &mut frame);
-            acc.clear();
-            if echo.is_some() {
-                let st = apm.statistics(); // a borrowed struct, nothing computed here
-                chain.meters.echo_erle_db = st.echo_return_loss_enhancement.map(|v| v as f32);
-                chain.meters.echo_delay_ms = st.delay_ms;
-            }
-            if let Some(r) = &mut rec {
-                let k = (r.len() - rec_pos).min(FRAME);
-                r[rec_pos..rec_pos + k].copy_from_slice(&frame[..k]);
-                rec_pos += k;
-            }
-            chain.process(&params, &profiles, &mut frame);
-            for (o, is_monitor) in &mut outs {
-                match (*is_monitor, mute_monitor, mute_sent) {
-                    (true, true, _) => {}
-                    (false, _, true) => {
-                        o.push_slice(&[0.0; FRAME]);
-                    }
-                    _ => {
-                        o.push_slice(&frame);
-                    }
-                }
-            }
-            let load = t0.elapsed().as_secs_f32() / 0.01;
-            chain.meters.dsp_load += (load - chain.meters.dsp_load) * 0.02;
+        for (a, p) in peaks.iter().zip(p) {
+            a.fetch_max(p.to_bits(), Relaxed); // non-negative floats order like their bits
         }
+        mic_in.push_slice(mono);
+        wake.unpark();
     })?);
 
     Ok(Engine { _streams: streams, _workers: workers, info, shared_output, missing, failed })
@@ -396,10 +450,35 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
 /// The audio processing module: echo cancellation against a reference at `echo_rate`, if any,
 /// and resampling the mic to 48 kHz when it runs at e.g. 44.1 kHz.
 fn new_apm(rate: u32, echo_rate: Option<u32>) -> AudioProcessing {
+    apm_with(rate, echo_rate, aec3_tuning())
+}
+
+/// AEC3's tuning (sonora is patched to take one). Measured with aec_tuning_sweep (a TTS voice
+/// and a sung take at -46 dBFS, a friend's voice or music in the reference): voice frames cut
+/// with headphones went from 5-15% to 1-4%, and talking over speaker echo from 23-31% to
+/// 17-23%, for about 5 dB less echo removed through speakers (22-36 dB left; on the steady
+/// synthetic music in speaker_echo_is_still_removed, 43 -> 22 dB). ponytail: the faster rise
+/// in normal_tuning costs most of that; near-end only keeps speakers at the default but
+/// halves the gain for headphones. Two changes:
+fn aec3_tuning() -> EchoCanceller3Config {
+    let mut c = EchoCanceller3Config::default();
+    // Until AEC3 knows how loud the speakers come back (or that they don't: headphones), it
+    // assumed as loud as they play, so anything louder than your voice in the reference cut
+    // you for the first seconds. 20 dB down is still a strong echo.
+    c.ep_strength.default_gain = 0.1;
+    // How fast the suppressor lets you back in after it held a pause down: 2x per 4 ms block
+    // kept the first ~70 ms of each word cut. 6x is back in ~25 ms.
+    c.suppressor.normal_tuning.max_inc_factor = 6.0;
+    c.suppressor.nearend_tuning.max_inc_factor = 6.0;
+    c
+}
+
+fn apm_with(rate: u32, echo_rate: Option<u32>, tuning: EchoCanceller3Config) -> AudioProcessing {
     // HMM is WebRTC's own default. Sonora's Legacy one rarely notices headphones (nothing to
     // cancel), so it kept cutting into the voice whenever music played.
     let echo = EchoCanceller { transparent_mode: TransparentModeType::Hmm, ..EchoCanceller::default() };
     AudioProcessing::builder()
+        .aec3_config(tuning)
         .config(Config {
             pipeline: Pipeline { maximum_internal_processing_rate: MaxProcessingRate::Rate48kHz, ..Default::default() },
             echo_canceller: echo_rate.map(|_| echo),
@@ -595,9 +674,210 @@ mod tests {
             .collect();
         let cut = spoken.iter().filter(|&&g| g < 0.316).count() as f32 / spoken.len() as f32;
         assert!(spoken.len() > 500, "{} spoken frames", spoken.len());
-        // 0.9.0 (Legacy, raw mic level): 39%. Now 6%.
-        assert!(cut < 0.15, "{:.0}% of spoken frames cut by over 10 dB", cut * 100.0);
+        // 0.9.0 (Legacy, raw mic level): 39%. 0.9.1: 6%. Tuned AEC3: 1%.
+        assert!(cut < 0.04, "{:.0}% of spoken frames cut by over 10 dB", cut * 100.0);
     }
+
+    #[test]
+    fn speaker_echo_is_still_removed() {
+        // The tuning lets more through to keep voices whole; music from speakers must still go.
+        // 43 dB with AEC3's default tuning, 22 dB tuned: still well under a voice.
+        let n = 12 * SR as usize;
+        let tau = std::f32::consts::TAU;
+        let music: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / SR;
+                let since = t % 0.5;
+                let notes: f32 = [196.0, 246.9, 293.7].iter().flat_map(|f| (1..6).map(move |k| (tau * f * k as f32 * t).sin() / k as f32)).sum();
+                let hat = ((i as u32).wrapping_mul(2654435761) as f32 / u32::MAX as f32 - 0.5) * (-since * 40.0).exp();
+                notes * (-since * 4.0).exp() * 0.08 + hat * 0.3
+            })
+            .collect();
+        let far = at_db(&music, -20.0);
+        let echo = at_db(&room(&far), -50.0);
+        let out = through(&aec3_tuning(), &far, &echo);
+        let late = 5 * SR as usize..n;
+        let removed = level_db(&echo[late.clone()]) - level_db(&out[late]);
+        assert!(removed > 15.0, "only {removed:.0} dB of speaker echo removed");
+    }
+
+    /// Mono 48 kHz WAV samples (16-bit or float).
+    fn read_wav(path: &str) -> Vec<f32> {
+        let b = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut i = 12;
+        while i + 8 <= b.len() {
+            let len = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap()) as usize;
+            if &b[i..i + 4] == b"data" {
+                let d = &b[i + 8..(i + 8 + len).min(b.len())];
+                // 16-bit PCM, or 32-bit float (as the capture probe writes).
+                return if u16::from_le_bytes([b[34], b[35]]) == 32 {
+                    d.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+                } else {
+                    d.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect()
+                };
+            }
+            i += 8 + len + (len & 1);
+        }
+        panic!("no samples in {path}");
+    }
+
+    fn level_db(x: &[f32]) -> f32 {
+        10.0 * (x.iter().map(|s| s * s).sum::<f32>() / x.len().max(1) as f32).max(1e-20).log10()
+    }
+
+    fn at_db(x: &[f32], db: f32) -> Vec<f32> {
+        let g = db2lin(db - level_db(x));
+        x.iter().map(|s| s * g).collect()
+    }
+
+    /// Speakers in a small room: what the reference plays comes back to the mic 40 ms later
+    /// (output buffers plus the air), then 40 reflections dying away over 300 ms, through a
+    /// speaker that saturates a little.
+    fn room(x: &[f32]) -> Vec<f32> {
+        let mut seed = 99u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed as f32 / u32::MAX as f32
+        };
+        let first = 1920 + 192;
+        let taps: Vec<(usize, f32)> = std::iter::once((first, 1.0))
+            .chain((0..40).map(|_| {
+                let d = 240 + (rnd() * 14_000.0) as usize;
+                (first + d, (rnd() - 0.5) * 1.2 * (-(d as f32) / SR * 23.0).exp())
+            }))
+            .collect();
+        let y: Vec<f32> = x.iter().map(|s| (s * 3.0).tanh() / 3.0).collect();
+        (0..x.len()).map(|n| taps.iter().filter(|(d, _)| *d <= n).map(|(d, g)| y[n - d] * g).sum()).collect()
+    }
+
+    /// The mic (`mic`, before input gain, +20 dB like a quiet one) through the echo canceller
+    /// against `far`, frame by frame as in the app.
+    fn through(tuning: &EchoCanceller3Config, far: &[f32], mic: &[f32]) -> Vec<f32> {
+        let cfg = StreamConfig::new(SR as u32, 1);
+        let mut apm = apm_with(SR as u32, Some(SR as u32), tuning.clone());
+        let mut out = vec![0.0f32; mic.len()];
+        let mut scratch = [0.0f32; FRAME];
+        for k in 0..mic.len() / FRAME {
+            let r = k * FRAME..(k + 1) * FRAME;
+            apm.process_render_f32_with_config(&[&far[r.clone()]], &cfg, &cfg, &mut [&mut scratch]).unwrap();
+            let mut m = mic[r.clone()].to_vec();
+            capture(&mut apm, &mut m, db2lin(20.0), &cfg, &cfg, &mut out[r]);
+        }
+        out
+    }
+
+    /// Share of spoken frames (after the first 2 s) that `with` cuts by over 10 dB against
+    /// `alone` (the same voice with nothing playing).
+    fn cut_share(alone: &[f32], with: &[f32]) -> f32 {
+        let spoken: Vec<f32> = (200..alone.len() / FRAME)
+            .filter_map(|k| {
+                let (a, m) = (&alone[k * FRAME..(k + 1) * FRAME], &with[k * FRAME..(k + 1) * FRAME]);
+                let aa: f32 = a.iter().map(|s| s * s).sum();
+                (aa > FRAME as f32 * 1e-6).then(|| a.iter().zip(m).map(|(x, y)| x * y).sum::<f32>() / aa)
+            })
+            .collect();
+        spoken.iter().filter(|&&g| g < 0.316).count() as f32 / spoken.len().max(1) as f32
+    }
+
+    /// A real capture through the echo canceller as the app runs it: MC_CAPTURE=<folder with
+    /// mic1.wav and ref.wav, as recorded> MC_GAIN=<input gain dB>. Prints voice frames cut per
+    /// second against the same mic with nothing in the reference.
+    #[test]
+    #[ignore]
+    fn aec_on_a_capture() {
+        let dir = std::env::var("MC_CAPTURE").expect("MC_CAPTURE");
+        let gain: f32 = std::env::var("MC_GAIN").ok().and_then(|g| g.parse().ok()).unwrap_or(20.0);
+        let (mic, far) = (read_wav(&format!("{dir}/mic1.wav")), read_wav(&format!("{dir}/ref.wav")));
+        let n = mic.len().min(far.len()) / FRAME * FRAME;
+        let run = |tuning: &EchoCanceller3Config, far: &[f32]| {
+            let cfg = StreamConfig::new(SR as u32, 1);
+            let mut apm = apm_with(SR as u32, Some(SR as u32), tuning.clone());
+            let mut out = vec![0.0f32; n];
+            let mut scratch = [0.0f32; FRAME];
+            for k in 0..n / FRAME {
+                let r = k * FRAME..(k + 1) * FRAME;
+                apm.process_render_f32_with_config(&[&far[r.clone()]], &cfg, &cfg, &mut [&mut scratch]).unwrap();
+                let mut m = mic[r.clone()].to_vec();
+                capture(&mut apm, &mut m, db2lin(gain), &cfg, &cfg, &mut out[r]);
+            }
+            out
+        };
+        for (name, tuning) in [("AEC3 default", EchoCanceller3Config::default()), ("MicClean", aec3_tuning())] {
+            let alone = run(&tuning, &vec![0.0; n]);
+            let with = run(&tuning, &far[..n]);
+            let per_s: Vec<String> = (0..n / FRAME / 100)
+                .map(|s| {
+                    let (mut spoken, mut cut) = (0, 0);
+                    for k in s * 100..(s + 1) * 100 {
+                        let (a, m) = (&alone[k * FRAME..(k + 1) * FRAME], &with[k * FRAME..(k + 1) * FRAME]);
+                        let aa: f32 = a.iter().map(|x| x * x).sum();
+                        if aa > FRAME as f32 * 3.2e-6 {
+                            spoken += 1;
+                            cut += usize::from(a.iter().zip(m).map(|(x, y)| x * y).sum::<f32>() / aa < 0.316);
+                        }
+                    }
+                    format!("{cut}/{spoken}")
+                })
+                .collect();
+            println!("{name}: voice frames cut / spoken, per second: {per_s:?}");
+        }
+    }
+
+    /// Tuning sweep on real recordings: MC_NEAR=<your voice wav> MC_FAR=<a friend's voice wav>
+    /// (16-bit mono 48 kHz) `cargo test --release -- --ignored aec_tuning_sweep --nocapture`.
+    /// For each tuning: voice cut with headphones (far end in the reference only), echo removed
+    /// with speakers (first 3 s, then from 5 s), and both at once.
+    #[test]
+    #[ignore]
+    fn aec_tuning_sweep() {
+        let n = 15 * SR as usize;
+        let take = |v: Vec<f32>| v.into_iter().chain(std::iter::repeat(0.0)).take(n).collect::<Vec<f32>>();
+        let near = at_db(&take(read_wav(&std::env::var("MC_NEAR").expect("MC_NEAR"))), -46.0);
+        let tau = std::f32::consts::TAU;
+        let chords = [[220.0, 277.2, 329.6], [196.0, 246.9, 293.7], [174.6, 220.0, 261.6], [196.0, 246.9, 311.1]];
+        let music: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / SR;
+                let (beat, since) = ((t * 2.0) as usize, t % 0.5);
+                let notes: f32 = chords[beat % 4].iter().flat_map(|f| (1..6).map(move |k| (tau * f * k as f32 * t).sin() / k as f32)).sum();
+                let hat = if since > 0.25 { ((i as u32).wrapping_mul(2654435761) as f32 / u32::MAX as f32 - 0.5) * (-(since - 0.25) * 40.0).exp() } else { 0.0 };
+                notes * (-since * 4.0).exp() * 0.08 + hat * 0.3
+            })
+            .collect();
+        let fars = [("friend", at_db(&take(read_wav(&std::env::var("MC_FAR").expect("MC_FAR"))), -20.0)), ("music", at_db(&music, -20.0))];
+        // Add tunings to try here.
+        let tunings = [("AEC3 default", EchoCanceller3Config::default()), ("MicClean", aec3_tuning())];
+        println!("{:<18} {:>14} {:>22} {:>22} {:>22}", "tuning", "headphones cut", "speakers ERLE 0-3s/5s+", "double talk cut", "double talk ERLE gaps");
+        for (name, tuning) in &tunings {
+            let alone = through(tuning, &vec![0.0; n], &near);
+            let mut row = Vec::new();
+            for (_, far) in &fars {
+                let echo = at_db(&room(far), -50.0);
+                let headphones = through(tuning, far, &near);
+                let speakers = through(tuning, far, &echo);
+                let both: Vec<f32> = near.iter().zip(&echo).map(|(a, b)| a + b).collect();
+                let double = through(tuning, far, &both);
+                let erle = |out: &[f32], r: std::ops::Range<usize>| level_db(&echo[r.clone()]) - level_db(&out[r]);
+                // Echo left where you're quiet: frames with no voice in `alone`.
+                let gaps: Vec<usize> = (200..n / FRAME).filter(|&k| level_db(&alone[k * FRAME..(k + 1) * FRAME]) < -70.0).collect();
+                let pick = |x: &[f32]| gaps.iter().flat_map(|&k| x[k * FRAME..(k + 1) * FRAME].to_vec()).collect::<Vec<f32>>();
+                row.push((
+                    cut_share(&alone, &headphones) * 100.0,
+                    (erle(&speakers, 0..3 * SR as usize), erle(&speakers, 5 * SR as usize..n)),
+                    cut_share(&alone, &double) * 100.0,
+                    level_db(&pick(&echo)) - level_db(&pick(&double)),
+                ));
+            }
+            let f = |i: usize| -> [String; 4] {
+                let r = &row[i];
+                [format!("{:.0}%", r.0), format!("{:.0}/{:.0}", r.1.0, r.1.1), format!("{:.0}%", r.2), format!("{:.0}", r.3)]
+            };
+            let (a, b) = (f(0), f(1));
+            println!("{name:<18} {:>14} {:>22} {:>22} {:>22}", format!("{} {}", a[0], b[0]), format!("{} {}", a[1], b[1]), format!("{} {}", a[2], b[2]), format!("{} {}", a[3], b[3]));
+        }
+        println!("(each cell: friend's voice, then music, in the reference)");
+    }
+
     #[test]
     fn drift_reader_rides_out_clock_drift() {
         for ppm in [-400.0, 400.0] {
@@ -693,25 +973,31 @@ mod tests {
         assert!(shared.lock().unwrap().error.is_none(), "{:?}", shared.lock().unwrap().error);
     }
 
-    /// Needs real devices: `cargo test -- --ignored`. Runs default mic -> default output with
-    /// echo cancellation against that same output for 2 s and checks frames came through.
+    /// Needs real devices: `cargo test -- --ignored`. Runs default mic -> default output (or
+    /// MC_OUT, with every app as the echo source) with echo cancellation against that output
+    /// for 3 s and checks the processing thread kept up with the mic.
     #[test]
     #[ignore]
     fn engine_runs_on_default_devices() {
         let host = cpal::default_host();
         let name = |d: Option<cpal::Device>| d.and_then(|d| d.description().ok()).map(|d| d.name().to_string());
         let input = name(host.default_input_device()).expect("no input device");
-        let output = name(host.default_output_device()).expect("no output device");
-        println!("in: {input}\nout: {output}");
-        let dev = Devices { input, output: output.clone(), echo_ref: Some(output), ..Devices::default() };
+        let (output, echo) = match std::env::var("MC_OUT") {
+            Ok(o) => (o, EVERYTHING.to_string()),
+            Err(_) => (name(host.default_output_device()).expect("no output device"), name(host.default_output_device()).unwrap()),
+        };
+        println!("in: {input}\nout: {output}\necho: {echo}");
+        let dev = Devices { input, output, echo_ref: Some(echo), ..Devices::default() };
         let shared = Arc::new(Mutex::new(Shared::default()));
         let engine = start(&dev, shared.clone()).expect("start");
         println!("{}", engine.info);
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(3));
         let sh = shared.lock().unwrap();
         assert!(sh.error.is_none(), "{:?}", sh.error);
         assert!(!sh.meters.reason.is_empty(), "no frames processed");
-        println!("in {:.0} dB, gate {}", sh.meters.in_db, sh.meters.reason);
+        // 3 s is 300 frames; the first few go to opening the streams.
+        assert!(sh.meters.frames > 270, "{} frames processed in 3 s", sh.meters.frames);
+        println!("{} frames, in {:.0} dB, gate {}, DSP {:.1}%, glitches {} ({})", sh.meters.frames, sh.meters.in_db, sh.meters.reason, sh.meters.dsp_load * 100.0, sh.glitches, sh.glitch_dev);
     }
 }
 
@@ -828,6 +1114,7 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Relaxed);
         if let Some(t) = self.thread.take() {
+            t.thread().unpark();
             let _ = t.join();
         }
     }
@@ -881,7 +1168,7 @@ fn wasapi_err(e: wasapi::WasapiError) -> String {
 }
 
 /// What cpal does for its own audio threads: MMCSS "Pro Audio", so other work can't starve it.
-fn pro_audio_priority() {
+pub(crate) fn pro_audio_priority() {
     let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
     let mut index = 0u32;
     // SAFETY: a NUL-terminated name that outlives the call; Windows drops the registration

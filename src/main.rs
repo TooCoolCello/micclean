@@ -7,12 +7,13 @@ mod dsp;
 mod graphs;
 mod install;
 mod logfile;
+mod plugins;
 mod smart;
 mod ui;
 mod update;
 
 use audio::{Devices, Engine, Shared};
-use dsp::{Band, BandKind, Kind, Meters, NoiseProfile, Params, Profiles, SPEC_BINS, SPEC_LO, SPEC_SPAN};
+use dsp::{Band, BandKind, Denoiser, Fx, FxKind, Kind, Meters, NoiseProfile, Params, Profiles, SPEC_BINS, SPEC_LO, SPEC_SPAN};
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText, Stroke, ViewportCommand};
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -34,6 +35,17 @@ static SHOW: AtomicBool = AtomicBool::new(false);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 fn main() -> eframe::Result {
+    // A plugin search runs each plugin file in a copy of this exe, which only lists it.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--scan-plugin") {
+        plugins::scan_main(&args[2..]);
+        return Ok(());
+    }
+    // Each plugin in the rack runs in a copy of this exe of its own.
+    if args.get(1).is_some_and(|a| a == "--plugin-host") {
+        plugins::host_main(&args[2..]);
+        return Ok(());
+    }
     // Settings -> Apps -> Uninstall runs this, before the single-instance check below.
     if std::env::args().any(|a| a == "--uninstall") {
         install::uninstall(std::env::args().any(|a| a == "--silent"));
@@ -145,6 +157,12 @@ struct Saved {
     smart: Option<Params>,
     /// Setup has been seen, so the app opens on Home.
     setup_done: bool,
+    /// Plugins in the rack and in presets, by key, with their settings.
+    plugins: Vec<plugins::Entry>,
+    /// What the last plugin search found.
+    plugin_list: Vec<plugins::Info>,
+    /// Folders you added for the plugin search, on top of the usual ones.
+    plugin_dirs: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -153,20 +171,25 @@ struct Preset {
     params: Params,
 }
 
-/// `current` with a preset picked: a preset is a style, so what Smart setup measured for your
-/// mic and voice (input gain, gate level, EQ, compressor level, loudness) stays, and so does
-/// Bypass (a listening aid, not part of a preset).
+/// `current` with a preset picked: a preset is a style (its rack included), so what Smart
+/// setup measured for your mic and voice (input gain, gate level, the first Tone's EQ, the
+/// first compressor's level, loudness) stays, and so does Bypass (a listening aid, not part of
+/// a preset).
 fn with_preset(current: &Params, preset: &Params) -> Params {
-    Params {
+    let mut p = Params {
         bypass: current.bypass,
         input_gain_db: current.input_gain_db,
         gate_threshold_db: current.gate_threshold_db,
-        bands: current.bands,
-        comp_threshold_db: current.comp_threshold_db,
-        comp_makeup_db: current.comp_makeup_db,
         output_gain_db: current.output_gain_db,
         ..preset.clone()
+    };
+    if let (Some(b), Some(mine)) = (p.bands_mut(), current.bands()) {
+        *b = *mine;
     }
+    if let (Some(c), Some(mine)) = (p.comp_mut(), current.comp()) {
+        (c.threshold_db, c.makeup_db) = (mine.threshold_db, mine.makeup_db);
+    }
+    p
 }
 
 /// The current settings are this preset's style.
@@ -178,14 +201,13 @@ fn same_preset(preset: &Params, current: &Params) -> bool {
 /// so your EQ and gains carry into all three.
 fn starter_presets(current: &Params) -> Vec<Preset> {
     let talking = Params { bypass: false, ..current.clone() };
-    let singing = Params {
-        sing_protect: 0.7,
-        gate_hold_ms: 900.0,
-        gate_hysteresis_db: 10.0,
-        comp_ratio: 2.0,
-        deess_threshold_db: current.deess_threshold_db + 4.0,
-        ..talking.clone()
-    };
+    let mut singing = Params { sing_protect: 0.7, gate_hold_ms: 900.0, gate_hysteresis_db: 10.0, ..talking.clone() };
+    if let Some(c) = singing.comp_mut() {
+        c.ratio = 2.0;
+    }
+    if let Some(t) = singing.deess_threshold_mut() {
+        *t += 4.0;
+    }
     let gaming = Params { denoise_strength: 1.0, sing_protect: 0.1, gate_hold_ms: 250.0, vad_threshold: 0.6, ..talking.clone() };
     [("Talking", talking), ("Singing", singing), ("Gaming", gaming)]
         .into_iter()
@@ -199,10 +221,8 @@ enum Stage {
     Denoise,
     Gate,
     Agc,
-    Eq,
-    Deess,
-    Warmth,
-    Comp,
+    /// A rack effect, by position.
+    Fx(usize),
 }
 
 impl Stage {
@@ -211,10 +231,11 @@ impl Stage {
             Stage::Denoise => p.denoise = false,
             Stage::Gate => p.gate = false,
             Stage::Agc => p.agc = false,
-            Stage::Eq => p.eq = false,
-            Stage::Deess => p.deess = false,
-            Stage::Warmth => p.warmth = false,
-            Stage::Comp => p.comp = false,
+            Stage::Fx(i) => {
+                if let Some(s) = &mut p.rack[i] {
+                    s.on = false;
+                }
+            }
         }
     }
 }
@@ -247,6 +268,97 @@ struct OldSave {
     params: OldEq,
 }
 
+/// Before the rack (0.10 and older), the effects in it were fixed fields, in this order. Read
+/// from a save that has no rack yet; their defaults are the old ones. Air (new with the rack)
+/// joins them, off.
+#[derive(Deserialize)]
+#[serde(default)]
+struct OldFx {
+    /// The save has a rack: nothing to convert.
+    #[serde(deserialize_with = "present")]
+    rack: bool,
+    eq: bool,
+    bands: [Option<Band>; dsp::BANDS],
+    deess: bool,
+    deess_threshold_db: f32,
+    warmth: bool,
+    warmth_amount: f32,
+    comp: bool,
+    comp_threshold_db: f32,
+    comp_ratio: f32,
+    comp_attack_ms: f32,
+    comp_release_ms: f32,
+    comp_makeup_db: f32,
+}
+
+impl Default for OldFx {
+    fn default() -> Self {
+        let comp = dsp::Comp { threshold_db: -24.0, ratio: 3.0, attack_ms: 5.0, release_ms: 120.0, makeup_db: 4.0 };
+        let Fx::Eq { bands } = FxKind::Eq.new() else { unreachable!() };
+        Self {
+            rack: false,
+            eq: true,
+            bands,
+            deess: true,
+            deess_threshold_db: -24.0,
+            warmth: false,
+            warmth_amount: 0.3,
+            comp: true,
+            comp_threshold_db: comp.threshold_db,
+            comp_ratio: comp.ratio,
+            comp_attack_ms: comp.attack_ms,
+            comp_release_ms: comp.release_ms,
+            comp_makeup_db: comp.makeup_db,
+        }
+    }
+}
+
+impl OldFx {
+    /// `p` with these as its rack, if the save had none.
+    fn convert(&self, p: &mut Params) {
+        if self.rack {
+            return;
+        }
+        let comp = dsp::Comp {
+            threshold_db: self.comp_threshold_db,
+            ratio: self.comp_ratio,
+            attack_ms: self.comp_attack_ms,
+            release_ms: self.comp_release_ms,
+            makeup_db: self.comp_makeup_db,
+        };
+        let fx = [
+            (self.eq, Fx::Eq { bands: self.bands }),
+            (false, FxKind::Air.new()),
+            (self.deess, Fx::Deess { threshold_db: self.deess_threshold_db }),
+            (self.warmth, Fx::Warmth { amount: self.warmth_amount }),
+            (self.comp, Fx::Comp(comp)),
+        ];
+        p.rack = [None; dsp::RACK];
+        for (i, (on, fx)) in fx.into_iter().enumerate() {
+            p.rack[i] = Some(dsp::Slot { id: i as u32 + 1, on, fx });
+        }
+    }
+}
+
+/// For `OldFx::rack`: true when the field is there at all.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(d).map(|_| true)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct OldRack {
+    params: OldFx,
+    presets: Vec<OldPreset>,
+    smart: Option<OldFx>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct OldPreset {
+    params: OldFx,
+}
+
 fn load(storage: &dyn eframe::Storage) -> Saved {
     parse_saved(storage.get_string(eframe::APP_KEY).as_deref()).unwrap_or_else(|e| {
         // The file itself is still in the backups.
@@ -256,16 +368,27 @@ fn load(storage: &dyn eframe::Storage) -> Saved {
 }
 
 /// Settings from their saved text (eframe's "app" value; restoring a backup uses it too),
-/// turning an old fixed EQ into the same filters as bands and old learned-sound floors into
-/// ones before input gain, and every value into its slider's range. The next save writes the
-/// new forms, so each converts once.
+/// turning an old fixed EQ into the same filters as bands, old fixed effects into a rack, old
+/// learned-sound floors into ones before input gain, and every value into its slider's range.
+/// The next save writes the new forms, so each converts once.
 // ponytail: drop OldEq once nobody has a pre-parametric save left.
 fn parse_saved(text: Option<&str>) -> Result<Saved, ron::error::SpannedError> {
     let mut saved: Saved = text.map(ron::from_str).transpose()?.unwrap_or_default();
-    if let Some(OldSave { params: o }) = text.and_then(|t| ron::from_str(t).ok()) {
+    if let Some(old) = text.and_then(|t| ron::from_str::<OldRack>(t).ok()) {
+        old.params.convert(&mut saved.params);
+        for (p, o) in saved.presets.iter_mut().zip(&old.presets) {
+            o.params.convert(&mut p.params);
+        }
+        if let (Some(s), Some(o)) = (&mut saved.smart, &old.smart) {
+            o.convert(s);
+        }
+    }
+    if let Some(OldSave { params: o }) = text.and_then(|t| ron::from_str(t).ok())
+        && let Some(bands) = saved.params.bands_mut()
+    {
         let band = |kind, freq, q, gain_db| Some(Band { kind, freq, gain_db, q, on: true });
         let boost = |kind, freq, q, gain_db: f32| if gain_db != 0.0 { band(kind, freq, q, gain_db) } else { None };
-        saved.params.bands = [
+        *bands = [
             band(BandKind::LowCut, o.low_cut_hz, 0.707, 0.0),
             boost(BandKind::LowShelf, 200.0, 0.707, o.low_gain_db),
             boost(BandKind::Bell, o.mid_freq_hz, 1.0, o.mid_gain_db),
@@ -349,10 +472,8 @@ enum Node {
     Noise,
     Gate,
     Level,
-    Eq,
-    Deess,
-    Warmth,
-    Comp,
+    /// A rack effect, by position.
+    Fx(usize),
     Limiter,
     Output,
 }
@@ -365,12 +486,20 @@ impl Node {
             Node::Noise => "Noise removal",
             Node::Gate => "Mute between words",
             Node::Level => "Even out volume",
-            Node::Eq => "Tone",
-            Node::Deess => "Soften S sounds",
-            Node::Warmth => "Warmth",
-            Node::Comp => "Tame loud parts",
+            Node::Fx(_) => "Effect",
             Node::Limiter => "Clip guard",
             Node::Output => "What gets sent",
+        }
+    }
+
+    /// Its title, a rack effect's by its kind (a plugin's by its own name).
+    fn name(self, p: &Params, plugins: &[plugins::Entry]) -> String {
+        match self {
+            Node::Fx(i) => match p.rack[i] {
+                Some(dsp::Slot { fx: Fx::Plugin { key }, .. }) => plugins.iter().find(|e| e.key == key).map_or("Plugin".into(), |e| e.info.name.clone()),
+                s => s.map_or("Effect", |s| s.fx.kind().title()).into(),
+            },
+            n => n.title().into(),
         }
     }
 
@@ -380,10 +509,7 @@ impl Node {
             Node::Noise => Some(&mut p.denoise),
             Node::Gate => Some(&mut p.gate),
             Node::Level => Some(&mut p.agc),
-            Node::Eq => Some(&mut p.eq),
-            Node::Deess => Some(&mut p.deess),
-            Node::Warmth => Some(&mut p.warmth),
-            Node::Comp => Some(&mut p.comp),
+            Node::Fx(i) => p.rack[i].as_mut().map(|s| &mut s.on),
             Node::Input | Node::Echo | Node::Limiter | Node::Output => None,
         }
     }
@@ -401,19 +527,31 @@ impl Node {
                 p.gate_floor_db = d.gate_floor_db;
             }
             Node::Level => (p.agc_target_db, p.agc_max_gain_db) = (d.agc_target_db, d.agc_max_gain_db),
-            Node::Eq => p.bands = d.bands,
-            Node::Deess => p.deess_threshold_db = d.deess_threshold_db,
-            Node::Warmth => p.warmth_amount = d.warmth_amount,
-            Node::Comp => {
-                (p.comp_threshold_db, p.comp_ratio, p.comp_makeup_db) = (d.comp_threshold_db, d.comp_ratio, d.comp_makeup_db);
-                (p.comp_attack_ms, p.comp_release_ms) = (d.comp_attack_ms, d.comp_release_ms);
+            Node::Fx(i) => {
+                // A plugin's settings are its own (in its window).
+                if let Some(s) = p.rack[i].as_mut().filter(|s| s.fx.kind() != FxKind::Plugin) {
+                    s.fx = s.fx.kind().new();
+                }
             }
             Node::Limiter | Node::Output => p.output_gain_db = d.output_gain_db,
         }
     }
 
-    /// The boxes Smart setup chooses settings for.
-    const SMART: [Node; 9] = [Node::Input, Node::Noise, Node::Gate, Node::Eq, Node::Deess, Node::Warmth, Node::Comp, Node::Limiter, Node::Output];
+    /// Smart setup chooses settings for this box: the fixed steps it sets, and the first rack
+    /// effect of each kind it sets.
+    fn smart(self, p: &Params) -> bool {
+        match self {
+            Node::Input | Node::Noise | Node::Gate | Node::Limiter | Node::Output => true,
+            Node::Fx(i) => p.rack[i].is_some_and(|s| s.fx.kind() != FxKind::Plugin && p.first(s.fx.kind()).is_some_and(|f| f.id == s.id)),
+            Node::Echo | Node::Level => false,
+        }
+    }
+
+    /// The boxes Smart setup chooses settings for in `p`.
+    fn smart_nodes(p: &Params) -> Vec<Node> {
+        let fixed = [Node::Input, Node::Noise, Node::Gate, Node::Limiter, Node::Output];
+        fixed.into_iter().chain((0..dsp::RACK).map(Node::Fx)).filter(|n| n.smart(p)).collect()
+    }
 
     /// Copies what Smart setup chose (`s`) for this box. Other boxes are left alone.
     fn suggest(self, p: &mut Params, s: &Params) {
@@ -422,16 +560,23 @@ impl Node {
             Node::Noise => p.denoise_strength = s.denoise_strength,
             // Chosen for the suggested input gain, so it follows the gain you actually have.
             Node::Gate => p.gate_threshold_db = (s.gate_threshold_db + p.input_gain_db - s.input_gain_db).clamp(-80.0, -10.0),
-            Node::Eq => p.bands = s.bands,
-            Node::Deess => p.deess_threshold_db = s.deess_threshold_db,
-            Node::Warmth => (p.warmth, p.warmth_amount) = (s.warmth, s.warmth_amount),
-            Node::Comp => (p.comp_threshold_db, p.comp_ratio, p.comp_makeup_db) = (s.comp_threshold_db, s.comp_ratio, s.comp_makeup_db),
+            Node::Fx(i) => {
+                let Some(mine) = &mut p.rack[i] else { return };
+                let Some(chosen) = s.first(mine.fx.kind()) else { return };
+                match (&mut mine.fx, chosen.fx) {
+                    (Fx::Eq { bands }, Fx::Eq { bands: b }) => *bands = b,
+                    (Fx::Deess { threshold_db }, Fx::Deess { threshold_db: t }) => *threshold_db = t,
+                    (Fx::Warmth { .. }, Fx::Warmth { .. }) => (mine.on, mine.fx) = (chosen.on, chosen.fx),
+                    // Attack and release stay yours.
+                    (Fx::Comp(c), Fx::Comp(cs)) => (c.threshold_db, c.ratio, c.makeup_db) = (cs.threshold_db, cs.ratio, cs.makeup_db),
+                    _ => {}
+                }
+            }
             Node::Limiter | Node::Output => p.output_gain_db = s.output_gain_db,
             Node::Echo | Node::Level => {}
         }
     }
 }
-
 /// Smart setup in progress: room noise first, then you reading, one sample per audio frame.
 struct Calib {
     start: Instant,
@@ -539,6 +684,39 @@ struct App {
     logged_update: Option<std::mem::Discriminant<update::State>>,
     hwnd: Option<isize>,
     title_dark: Option<bool>,
+    /// The loaded plugins (GUI side), a search in progress, and the plugin the last run
+    /// crashed in.
+    plugins: plugins::Host,
+    search: Option<Arc<Mutex<plugins::Search>>>,
+    plugin_crash: Option<String>,
+    /// What the plugin list in "Add effect" is filtered by.
+    plugin_filter: String,
+    /// The rack effect being dragged to a new place.
+    drag_fx: Option<Drag>,
+    /// One effect row's height plus the gap under it, as last drawn, for laying them out while
+    /// one is dragged.
+    row_pitch: f32,
+    /// The plugin search's bar is folded down to its tab.
+    search_folded: bool,
+    /// When the last plugin search ended, and how many effects it found.
+    search_done: Option<(Instant, usize)>,
+    /// The settings as last written to the safe copy (backup::keep).
+    kept: String,
+    /// DeepFilterNet: loading, loaded (handed to the audio), or why it couldn't load.
+    deep_load: Option<std::thread::JoinHandle<Result<dsp::Deep, String>>>,
+    deep_ready: bool,
+    deep_error: Option<String>,
+    /// The recording being cleaned up for "Cleaned", off the GUI thread.
+    rendering: Option<std::thread::JoinHandle<Vec<f32>>>,
+}
+
+/// An effect being dragged: its place, where the pointer holds it (from its top), and the
+/// drag's start time (a fresh set of slide animations each drag).
+#[derive(Clone, Copy)]
+struct Drag {
+    from: usize,
+    grab: f32,
+    started: u64,
 }
 
 impl App {
@@ -643,6 +821,19 @@ impl App {
             logged_update: None,
             hwnd,
             title_dark: None,
+            plugins: plugins::Host::default(),
+            search: None,
+            plugin_crash: None,
+            plugin_filter: String::new(),
+            drag_fx: None,
+            row_pitch: 44.0,
+            search_folded: false,
+            search_done: None,
+            kept: String::new(),
+            deep_load: None,
+            deep_ready: false,
+            deep_error: None,
+            rendering: None,
         };
         if app.installed {
             if let Ok(old) = install::old_exe() {
@@ -688,6 +879,7 @@ impl App {
 
     fn restart(&mut self) {
         self.engine = None; // stop old streams before opening the devices again
+        self.plugins.resend = true; // the new chain starts without them
         self.engine_devices = self.saved.devices.clone();
         self.stats = Stats::default();
         self.last_beat = Instant::now();
@@ -752,6 +944,58 @@ impl App {
         self.engine.is_some() && (self.calib.is_some() || self.record_progress.is_some() || self.meters.learning.is_some())
     }
 
+    /// Loads and unloads plugins as the rack changes, hands the list to the audio thread and
+    /// runs their GUI-thread chores. A finished plugin search comes in here too.
+    /// Loads DeepFilterNet the first time it's picked, off the GUI thread, and hands it to the
+    /// audio. ponytail: it stays loaded until MicClean quits, even after switching back.
+    fn deep_tick(&mut self) {
+        if let Some(h) = self.deep_load.take_if(|h| h.is_finished()) {
+            match h.join().unwrap_or_else(|_| Err("it crashed while loading".into())) {
+                Ok(d) => {
+                    self.shared.lock().unwrap().deep = Some(d);
+                    self.deep_ready = true;
+                }
+                Err(e) => {
+                    logfile::line(&format!("DeepFilterNet didn't load: {e}"));
+                    self.deep_error = Some(e);
+                }
+            }
+        }
+        let wanted = self.saved.params.denoiser == Denoiser::DeepFilterNet;
+        if wanted && !self.deep_ready && self.deep_load.is_none() && self.deep_error.is_none() {
+            self.deep_load = Some(std::thread::spawn(dsp::load_deep));
+        }
+        if let Some(h) = self.rendering.take_if(|h| h.is_finished())
+            && let Ok(clip) = h.join()
+        {
+            self.start_playback(clip);
+        }
+    }
+
+    fn plugin_tick(&mut self) {
+        let wanted: Vec<u32> = self.saved.params.plugins().collect();
+        if let Some(list) = self.plugins.sync(&wanted, &mut self.saved.plugins) {
+            self.shared.lock().unwrap().new_plugins = Some(list);
+        }
+        // A plugin whose process crashed or hung stays off (and unloaded) until "Try again".
+        for (key, why) in self.plugins.idle() {
+            if let Some(e) = self.saved.plugins.iter_mut().find(|e| e.key == key) {
+                e.crashed = true;
+                self.plugin_crash = Some(format!("{} ({why})", e.info.name));
+                self.dismissed.retain(|d| *d != "plugin_crash");
+            }
+            for s in self.saved.params.rack.iter_mut().flatten().filter(|s| s.fx == Fx::Plugin { key }) {
+                s.on = false;
+            }
+        }
+        if let Some(found) = self.search.as_ref().and_then(|s| s.lock().unwrap().found.take()) {
+            logfile::line(&format!("Plugin search found {} effects", found.len()));
+            self.search_done = Some((Instant::now(), found.len()));
+            self.saved.plugin_list = found;
+            self.search = None;
+        }
+    }
+
     fn sync(&mut self) {
         let mut sh = self.shared.lock().unwrap();
         let mut want = self.saved.params.clone();
@@ -760,8 +1004,13 @@ impl App {
         }
         if self.calib.is_some() {
             // Smart setup needs every stage's meter on your voice: nothing bypassed, the gate
-            // open, the de-esser and compressor running.
-            (want.bypass, want.gate, want.deess, want.comp) = (false, false, true, true);
+            // open, the (first) de-esser and compressor running.
+            (want.bypass, want.gate) = (false, false);
+            for k in [FxKind::Deess, FxKind::Comp] {
+                if let Some(s) = want.first_mut(k) {
+                    s.on = true;
+                }
+            }
         }
         if sh.params != want {
             sh.params = want;
@@ -771,7 +1020,7 @@ impl App {
         sh.mute_sent = self.calib.is_some();
         self.latency_us = (sh.latency.capture_us.load(Ordering::Relaxed), sh.latency.output_us.load(Ordering::Relaxed));
         // Dropped here, on the GUI thread: the audio thread never frees anything.
-        (sh.old_profiles, sh.discarded) = (None, None);
+        (sh.old_profiles, sh.discarded, sh.old_plugins) = (None, None, None);
         if let Some(l) = sh.learned.take() {
             match l.finish() {
                 Err(why) => self.learn_msg = why.into(),
@@ -836,12 +1085,18 @@ impl App {
     fn play(&mut self, processed: bool) {
         self.stop_playback();
         let Some(raw) = &self.clip else { return };
-        let clip = if processed {
-            // What friends get with cleaning on, whatever Bypass is set to right now.
-            dsp::render(raw, &Params { bypass: false, ..self.saved.params.clone() }, &self.saved.profiles)
+        if processed {
+            // What friends get with cleaning on, whatever Bypass is set to right now. On its
+            // own thread: with DeepFilterNet that takes a couple of seconds.
+            let (raw, prof) = (raw.clone(), self.saved.profiles.clone());
+            let p = Params { bypass: false, ..self.saved.params.clone() };
+            self.rendering = Some(std::thread::spawn(move || dsp::render(&raw, &p, &prof)));
         } else {
-            raw.clone()
-        };
+            self.start_playback(raw.clone());
+        }
+    }
+
+    fn start_playback(&mut self, clip: Vec<f32>) {
         let end = Instant::now() + Duration::from_secs_f32(clip.len() as f32 / dsp::SR);
         let monitor = self.saved.devices.monitor.clone();
         match audio::play(monitor.as_deref(), clip) {
@@ -855,6 +1110,7 @@ impl App {
 
     fn stop_playback(&mut self) {
         self.playback = None;
+        self.rendering = None;
         self.shared.lock().unwrap().mute_monitor = false;
     }
 
@@ -936,6 +1192,12 @@ impl App {
         if self.saved.params.bypass {
             let desc = "Your mic is being sent without any cleaning.".into();
             return Some(("bypass", "Bypass is on".into(), desc, Some(Fix::BypassOff)));
+        }
+        if let Some(name) = &self.plugin_crash
+            && open("plugin_crash")
+        {
+            let desc = "MicClean kept running without it. It stays off until you try it again in its box in Advanced.".into();
+            return Some(("plugin_crash", format!("Plugin {name} stopped"), desc, None));
         }
         if audio::is_cable(&d.input) && open("mic_cable") {
             let desc = "MicClean would hear its own output and loop it back. Pick your real mic in Setup.".into();
@@ -1056,7 +1318,7 @@ impl App {
                         }
                     }
                     let old = self.saved.params.clone();
-                    for n in Node::SMART {
+                    for n in Node::smart_nodes(&self.saved.params) {
                         n.suggest(&mut self.saved.params, &o.params);
                     }
                     self.smart_report = smart::changes(&old, &self.saved.params);
@@ -1065,7 +1327,11 @@ impl App {
                     }
                     self.smart_report.extend(o.notes);
                     // Suggest offers the full EQ, even where setup kept your own bands.
-                    self.saved.smart = Some(Params { bands: o.full_eq, ..o.params });
+                    let mut chosen = o.params;
+                    if let Some(b) = chosen.bands_mut() {
+                        *b = o.full_eq;
+                    }
+                    self.saved.smart = Some(chosen);
                     self.smart_undo = Some(old);
                 }
                 Err(e) => self.smart_report = vec![e],
@@ -1073,10 +1339,12 @@ impl App {
             logfile::line(&format!("Smart setup: {}", self.smart_report.join(" / ")));
             return;
         }
-        let m = &self.meters;
+        let (m, p) = (&self.meters, &self.saved.params);
         if m.frames == c.frame {
             return;
         }
+        // What the first effect of a kind measures (-120: there's none).
+        let fx_level = |k| p.rack.iter().position(|s| s.is_some_and(|s| s.fx.kind() == k)).map_or(-120.0, |i| m.fx[i].level_db);
         c.frame = m.frames;
         if t < CALIB_QUIET {
             if t > 0.5 {
@@ -1085,7 +1353,7 @@ impl App {
             }
         } else if m.vad >= 0.5 {
             // Talking, not the pauses between words.
-            let (level, peak, agc, deess, comp) = (m.gate_level_db, m.in_db, m.agc_db, m.deess_level_db, m.comp_in_db);
+            let (level, peak, agc, deess, comp) = (m.gate_level_db, m.in_db, m.agc_db, fx_level(FxKind::Deess), fx_level(FxKind::Comp));
             c.talk.push(smart::Take { level, peak, agc, deess, comp, pitch: m.pitch_hz, bands: m.bands_db });
         }
     }
@@ -1093,6 +1361,8 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.plugin_tick();
+        self.deep_tick();
         self.sync();
         self.viz = false; // set again by ui() if the window still draws
         self.watchdog();
@@ -1211,6 +1481,8 @@ impl eframe::App for App {
         // folded with the menu button.
         let narrow = ui.available_width() < 720.0;
         let compact = self.saved.nav_compact || narrow;
+        // First, so it spans the whole window's width under the nav rail too.
+        self.search_strip(ui);
         egui::Panel::left("nav")
             .exact_size(if compact { 56.0 } else { 240.0 })
             .resizable(false)
@@ -1244,8 +1516,70 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.plugins.store(&mut self.saved.plugins);
+        // Plugins nothing uses any more (not the rack, a preset, Smart setup or an Undo).
+        let s = &self.saved;
+        let used: Vec<u32> = [Some(&s.params), s.smart.as_ref(), self.reset_undo.as_ref(), self.smart_undo.as_ref()]
+            .into_iter()
+            .flatten()
+            .chain(s.presets.iter().map(|p| &p.params))
+            .flat_map(|p| p.plugins())
+            .collect();
+        self.saved.plugins.retain(|e| used.contains(&e.key));
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
+        // eframe saves every 30 s; the safe copy is only rewritten when something changed.
+        if let Ok(text) = ron::to_string(&self.saved)
+            && text != self.kept
+        {
+            match backup::keep(&text) {
+                Ok(()) => self.kept = text,
+                Err(e) => logfile::line(&format!("Couldn't save the settings' safe copy: {e}")),
+            }
+        }
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Audio first: nothing may still be processing a plugin when it unloads.
+        self.engine = None;
+        self.plugins.shutdown();
+    }
+}
+
+/// One format's plugins in "Add effect", filtered by `filter`; `pick` gets the list index.
+fn plugin_menu(ui: &mut egui::Ui, list: &[plugins::Info], f: plugins::Format, filter: &mut String, pick: &mut Option<usize>) {
+    ui.set_min_width(320.0);
+    if !list.iter().any(|p| p.format == f) {
+        ui.label(if list.is_empty() { "Search for plugins first" } else { "None found" });
+        return;
+    }
+    ui.add(egui::TextEdit::singleline(filter).hint_text("Find a plugin"));
+    let q = filter.to_lowercase();
+    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+        for (i, p) in list.iter().enumerate().filter(|(_, p)| p.format == f) {
+            if !q.is_empty() && !format!("{} {}", p.name, p.vendor).to_lowercase().contains(&q) {
+                continue;
+            }
+            if ui.button(format!("{}    {}", p.name, p.vendor)).clicked() {
+                *pick = Some(i);
+                ui.close();
+            }
+        }
+    });
+}
+
+/// A plugin search's progress: files checked of those found.
+fn search_bar(ui: &mut egui::Ui, (done, of): (usize, usize)) {
+    let (frac, text) = match of {
+        0 => (0.0, "Looking for plugin files…".to_string()),
+        of => (done as f32 / of as f32, format!("Checked {done} of {of} plugin files")),
+    };
+    ui.add(egui::ProgressBar::new(frac).desired_width(280.0).text(text));
+}
+
+fn search_button(ui: &mut egui::Ui, again: bool) -> bool {
+    ui.button(if again { "Search again" } else { "Search for plugins" })
+        .on_hover_text("Finds the VST3 and CLAP effects in the usual folders and the ones added in Settings. Each file is tried in its own copy of MicClean, so a broken plugin can't take this one down")
+        .clicked()
 }
 
 /// Section title between card groups, like the Settings app.
@@ -1312,7 +1646,7 @@ impl App {
             self.meters.clone()
         } else {
             let quiet = -120.0;
-            Meters { in_db: quiet, out_db: quiet, comp_in_db: quiet, gate_level_db: quiet, reason: "no audio", ..Default::default() }
+            Meters { in_db: quiet, out_db: quiet, gate_level_db: quiet, reason: "no audio", ..Default::default() }
         }
     }
 
@@ -1403,8 +1737,10 @@ impl App {
         let desc = "Record 10 seconds, then play it as it was and cleaned up, on Hear myself's device or your speakers";
         ui::card(ui, |ui| {
             ui::header(ui, icon::RECORD, "Hear the difference", desc, |ui| {
-                stop = ui::icon_button(ui, self.playback.is_some(), icon::STOP, "Stop").clicked();
-                processed = ui::icon_button(ui, has_clip, icon::PLAY, "Cleaned").clicked();
+                let rendering = self.rendering.is_some();
+                stop = ui::icon_button(ui, self.playback.is_some() || rendering, icon::STOP, "Stop").clicked();
+                let label = if rendering { "Cleaning..." } else { "Cleaned" };
+                processed = ui::icon_button(ui, has_clip && !rendering, icon::PLAY, label).clicked();
                 original = ui::icon_button(ui, has_clip, icon::PLAY, "Original").clicked();
                 record = ui::accent_button(ui, can_record, "Record").clicked();
             });
@@ -1583,42 +1919,311 @@ impl App {
                 }
             });
         });
+        let rack: Vec<Node> = (0..dsp::RACK).filter(|&i| self.saved.params.rack[i].is_some()).map(Node::Fx).collect();
         let groups: [(&str, &[Node]); 5] = [
             ("", &[Node::Input]),
-            ("Clean up", &[Node::Echo, Node::Noise, Node::Gate]),
-            ("Shape", &[Node::Level, Node::Eq, Node::Deess, Node::Warmth]),
-            ("Protect", &[Node::Comp, Node::Limiter]),
+            ("Clean up", &[Node::Echo, Node::Noise, Node::Gate, Node::Level]),
+            ("Effects", &rack),
+            ("Protect", &[Node::Limiter]),
             ("", &[Node::Output]),
         ];
+        // Moving or removing an effect waits for the end of the list, which is drawn by position.
+        let mut edit = None;
         for (group, nodes) in groups {
             if !group.is_empty() {
                 ui.add_space(4.0);
                 ui.label(RichText::new(group).small().color(p.text2));
+            }
+            if group == "Effects"
+                && let Some(d) = self.drag_fx
+            {
+                self.drag_rack(ui, m, d);
+                self.add_effect(ui);
+                continue;
             }
             for &n in nodes {
                 let (bar, value) = self.row_state(n, m);
                 let open = self.node == Some(n);
                 // Echo cancellation is on when it has something to cancel.
                 let mut echo_on = self.saved.devices.echo_ref.is_some();
+                let title = n.name(&self.saved.params, &self.saved.plugins);
                 let on = if n == Node::Echo { Some(&mut echo_on) } else { n.switch(&mut self.saved.params) };
                 let icon = match n {
                     Node::Input => icon::MIC,
                     Node::Output => icon::SPEAKERS,
                     _ => icon::VOLUME,
                 };
-                if ui::slim_card(ui, |ui| graphs::rack_row(ui, on, icon, n.title(), &bar, &value, open)).clicked() {
+                let top = ui.cursor().top();
+                let row = ui::slim_card(ui, |ui| graphs::rack_row(ui, on, icon, &title, &bar, &value, open));
+                if row.clicked() {
                     self.node = if open { None } else { Some(n) };
+                }
+                if let Node::Fx(i) = n {
+                    if !open {
+                        self.row_pitch = ui.cursor().top() - top;
+                    }
+                    if row.drag_started() {
+                        let (press, time) = ui.input(|i| (i.pointer.press_origin(), i.time));
+                        self.drag_fx = Some(Drag { from: i, grab: press.map_or(0.0, |p| p.y - top), started: time.to_bits() });
+                    }
                 }
                 if echo_on != self.saved.devices.echo_ref.is_some() {
                     self.saved.devices.echo_ref = echo_on.then(|| audio::EVERYTHING.to_string());
                 }
                 if self.node == Some(n) {
-                    self.expanded(ui, n, m);
+                    edit = self.expanded(ui, n, m).or(edit);
                 }
+            }
+            if group == "Effects" {
+                self.add_effect(ui);
+            }
+        }
+        if let Some((i, by)) = edit {
+            let pr = &mut self.saved.params;
+            self.node = match by {
+                0 => {
+                    pr.remove_fx(i);
+                    None
+                }
+                by => Some(Node::Fx(pr.move_fx(i, by))),
+            };
+        }
+    }
+
+    /// The effects while one is dragged: it follows the pointer, see-through, over the others,
+    /// which slide out of its way; on release it lands in the gap. Open settings fold away
+    /// meanwhile (and come back after).
+    fn drag_rack(&mut self, ui: &mut egui::Ui, m: &Meters, d: Drag) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let (pitch, gap) = (self.row_pitch, ui.spacing().item_spacing.y);
+        let n = self.saved.params.rack.iter().flatten().count();
+        let (block, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), n as f32 * pitch - gap), egui::Sense::hover());
+        let size = egui::vec2(block.width(), pitch - gap);
+        // The lifted one's top, kept within half a row of the list.
+        let y = ui.ctx().pointer_latest_pos().map_or(block.top(), |p| p.y - d.grab);
+        let top = y.clamp(block.top() - pitch / 2.0, block.bottom() - size.y + pitch / 2.0);
+        let to = ((top - block.top()) / pitch).round().clamp(0.0, n.saturating_sub(1) as f32) as usize;
+        for (k, i) in (0..n).filter(|&i| i != d.from).enumerate() {
+            let place = if k < to { k } else { k + 1 };
+            let id = egui::Id::unique(("fx_slide", self.saved.params.rack[i].map_or(0, |s| s.id), d.started));
+            let at = ui.ctx().animate_value_with_time(id, place as f32, 0.12);
+            self.fx_row(ui, m, i, Rect::from_min_size(Pos2::new(block.left(), block.top() + at * pitch), size), false);
+        }
+        self.fx_row(ui, m, d.from, Rect::from_min_size(Pos2::new(block.left(), top), size), true);
+        if ui.input(|i| !i.pointer.any_down()) {
+            self.drag_fx = None;
+            let pr = &mut self.saved.params;
+            // The open one stays open, wherever it ends up.
+            let open = match self.node {
+                Some(Node::Fx(j)) => pr.rack[j].map(|s| s.id),
+                _ => None,
+            };
+            pr.move_fx_to(d.from, to);
+            if let Some(id) = open {
+                self.node = pr.rack.iter().position(|s| s.is_some_and(|s| s.id == id)).map(Node::Fx);
             }
         }
     }
 
+    /// One effect's row at `rect`, while one is dragged. `lifted` is the dragged one: on a layer
+    /// above the rest, see-through.
+    fn fx_row(&self, ui: &mut egui::Ui, m: &Meters, i: usize, rect: Rect, lifted: bool) {
+        let n = Node::Fx(i);
+        let (bar, value) = self.row_state(n, m);
+        let title = n.name(&self.saved.params, &self.saved.plugins);
+        let mut on = self.saved.params.rack[i].is_some_and(|s| s.on);
+        let mut b = egui::UiBuilder::new().max_rect(rect);
+        if lifted {
+            b = b.layer_id(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("fx_lifted")));
+        }
+        // A child that takes no space: the list's own space was set aside in one piece.
+        let mut row = ui.new_child(b);
+        if lifted {
+            row.multiply_opacity(0.75);
+        }
+        ui::slim_card(&mut row, |ui| graphs::rack_row(ui, Some(&mut on), icon::VOLUME, &title, &bar, &value, false));
+    }
+
+    /// The plugin search along the bottom of the window, on every page. The tab on its right
+    /// folds it down to just the tab. It stays a few seconds after the search ends.
+    fn search_strip(&mut self, ui: &mut egui::Ui) {
+        let p = ui::pal(ui);
+        let (frac, text, short) = match (self.search_progress(), self.search_done) {
+            (Some((done, of)), _) => {
+                let f = if of == 0 { 0.0 } else { done as f32 / of as f32 };
+                let text = if of == 0 { "Looking for plugin files…".to_string() } else { format!("Searching for plugins: checked {done} of {of} files") };
+                (f, text, format!("{:.0}%", f * 100.0))
+            }
+            (None, Some((t, n))) if t.elapsed() < Duration::from_secs(6) => (1.0, format!("Plugin search done: {n} effects found"), "done".to_string()),
+            _ => return,
+        };
+        let bottom = ui.ctx().content_rect().bottom();
+        let bar_top = if self.search_folded {
+            bottom
+        } else {
+            let frame = egui::Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.card_stroke)).inner_margin(egui::Margin::symmetric(12, 7));
+            egui::Panel::bottom("plugin_search")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(frame)
+                .show(ui, |ui| ui.add(egui::ProgressBar::new(frac).desired_width(ui.available_width()).text(text)))
+                .response
+                .rect
+                .top()
+        };
+        // The tab, on the right, sitting on the bar (or on the window's edge when folded).
+        let tab = egui::Frame::new()
+            .fill(p.card)
+            .stroke(Stroke::new(1.0, p.card_stroke))
+            .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
+            .inner_margin(egui::Margin::symmetric(10, 3));
+        let folded = self.search_folded;
+        let clicked = egui::Area::new(egui::Id::unique("plugin_search_tab"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, bar_top - bottom))
+            .show(ui.ctx(), |ui| {
+                tab.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(if folded { format!("Plugins {short}") } else { "Plugins".into() }).small());
+                        let arrow = if folded { icon::CHEVRON_UP } else { icon::CHEVRON_DOWN };
+                        ui.label(RichText::new(arrow).font(ui::icon_font(10.0)));
+                    });
+                })
+                .response
+                .interact(egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(if folded { "Show the plugin search" } else { "Fold it away. The search carries on" })
+                .clicked()
+            })
+            .inner;
+        self.search_folded ^= clicked;
+    }
+    fn start_search(&mut self) {
+        if self.search.is_none() {
+            self.search = Some(plugins::search(self.saved.plugin_dirs.clone()));
+        }
+    }
+
+    /// Files checked and found, while a plugin search runs.
+    fn search_progress(&self) -> Option<(usize, usize)> {
+        self.search.as_ref().map(|s| s.lock().unwrap().progress)
+    }
+
+    /// The "Add effect" menu under the rack's effects: MicClean's own that aren't in the rack
+    /// yet, then the plugins the last search found, VST3 and CLAP apart.
+    fn add_effect(&mut self, ui: &mut egui::Ui) {
+        let pr = &self.saved.params;
+        let full = pr.rack.iter().all(Option::is_some);
+        let empty = pr.rack.iter().all(Option::is_none);
+        let missing: Vec<FxKind> = FxKind::ALL.into_iter().filter(|&k| pr.first(k).is_none()).collect();
+        let (mut added, mut plugin, mut search) = (None, None, false);
+        let progress = self.search_progress();
+        let (list, filter) = (&self.saved.plugin_list, &mut self.plugin_filter);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!full, |ui| {
+                ui.menu_button(ui::icon_text(ui, icon::ADD, "Add effect"), |ui| {
+                    for k in &missing {
+                        if ui.button(k.title()).clicked() {
+                            added = Some(k.new());
+                            ui.close();
+                        }
+                    }
+                    if !missing.is_empty() {
+                        ui.separator();
+                    }
+                    for f in [plugins::Format::Vst3, plugins::Format::Clap] {
+                        ui.menu_button(format!("{} plugins", f.name()), |ui| plugin_menu(ui, list, f, filter, &mut plugin));
+                    }
+                    ui.separator();
+                    match progress {
+                        Some(pr) => search_bar(ui, pr),
+                        None => search = search_button(ui, !list.is_empty()),
+                    }
+                })
+                .response
+                .on_disabled_hover_text(format!("The rack holds {} effects", dsp::RACK));
+            });
+            if empty {
+                ui.label(RichText::new("No effects: your voice goes straight from cleaning up to the clip guard").small());
+            }
+        });
+        if search {
+            self.start_search();
+        }
+        if let Some(i) = plugin {
+            // A key nothing has used, not even a preset whose plugin entry is gone.
+            let s = &self.saved;
+            let used = s.plugins.iter().map(|e| e.key).chain(s.presets.iter().flat_map(|p| p.params.plugins())).chain(s.params.plugins());
+            let key = used.max().unwrap_or(0) + 1;
+            let info = self.saved.plugin_list[i].clone();
+            self.saved.plugins.push(plugins::Entry { key, info, state: String::new(), crashed: false });
+            added = Some(Fx::Plugin { key });
+        }
+        let pr = &mut self.saved.params;
+        if let Some(fx) = added
+            && pr.add_fx(fx)
+        {
+            // Opens it, at the end of the rack.
+            self.node = pr.rack.iter().rposition(Option::is_some).map(Node::Fx);
+        }
+    }
+
+    /// Settings' Plugins card: the search and its progress, and the folders it looks in.
+    fn plugin_settings(&mut self, ui: &mut egui::Ui) {
+        let p = ui::pal(ui);
+        let progress = self.search_progress();
+        let list = &self.saved.plugin_list;
+        let count = |f| list.iter().filter(|i| i.format == f).count();
+        let desc = match progress {
+            Some(_) => "Searching. Each file is tried in its own copy of MicClean, so a broken plugin can't take this one down".to_string(),
+            None if list.is_empty() => "VST3 and CLAP effects for the rack. Search to find the ones on this PC".to_string(),
+            None => format!("{} effects found: {} VST3, {} CLAP", list.len(), count(plugins::Format::Vst3), count(plugins::Format::Clap)),
+        };
+        let (mut search, mut add, mut remove) = (false, false, None);
+        ui::card(ui, |ui| {
+            ui::header(ui, icon::EQ, "Plugins", &desc, |ui| {
+                if progress.is_none() {
+                    search = search_button(ui, !list.is_empty());
+                }
+            });
+            if let Some(pr) = progress {
+                search_bar(ui, pr);
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new("Folders it searches").small().color(p.text2));
+            let folder = |ui: &mut egui::Ui, d: &std::path::Path, note: &str| {
+                let text = format!("{}{note}", d.display());
+                ui.add(egui::Label::new(RichText::new(text).small()).truncate());
+            };
+            for d in plugins::default_dirs() {
+                ui.horizontal(|ui| folder(ui, &d, if d.is_dir() { "" } else { "  (not on this PC)" }));
+            }
+            for (i, d) in self.saved.plugin_dirs.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui::icon_button(ui, true, icon::DELETE, "Remove").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| folder(ui, d, ""));
+                    });
+                });
+            }
+            ui.add_space(4.0);
+            add = ui::icon_button(ui, true, icon::ADD, "Add folder").on_hover_text("Plugins kept somewhere else. VST3 and CLAP files in it and its subfolders are found").clicked();
+        });
+        if let Some(i) = remove {
+            self.saved.plugin_dirs.remove(i);
+        }
+        if add && let Some(d) = plugins::pick_folder(self.hwnd) {
+            if !self.saved.plugin_dirs.contains(&d) && !plugins::default_dirs().contains(&d) {
+                self.saved.plugin_dirs.push(d);
+            }
+            search = true; // what's in it shows up in "Add effect"
+        }
+        if search {
+            self.start_search();
+        }
+    }
     /// A chain row's bar and value: what that step is doing right now.
     fn row_state(&self, n: Node, m: &Meters) -> (graphs::RowBar, String) {
         use graphs::RowBar::{Change, Curve, Empty, Level};
@@ -1645,14 +2250,26 @@ impl App {
             Node::Noise => (Change(-m.denoise_db), cut(m.denoise_db)),
             Node::Gate => (Change(m.gate_gain_db), if m.gate_open { "open" } else { "muted" }.into()),
             Node::Level => (Change(m.agc_db), format!("{:+.1} dB", m.agc_db)),
-            Node::Eq => {
-                let freqs: Vec<f32> = (0..32).map(|i| 60.0 * (16_000f32 / 60.0).powf(i as f32 / 31.0)).collect();
-                let bands = pr.bands.iter().flatten().filter(|b| b.on).count();
-                (Curve(dsp::eq_curve(pr, &freqs)), format!("{bands} band{}", if bands == 1 { "" } else { "s" }))
+            Node::Fx(i) => {
+                let fm = m.fx[i];
+                match pr.rack[i].map(|s| s.fx) {
+                    Some(Fx::Eq { bands }) => {
+                        let freqs: Vec<f32> = (0..32).map(|i| 60.0 * (16_000f32 / 60.0).powf(i as f32 / 31.0)).collect();
+                        let n = bands.iter().flatten().filter(|b| b.on).count();
+                        (Curve(dsp::eq_curve(&bands, &freqs)), format!("{n} band{}", if n == 1 { "" } else { "s" }))
+                    }
+                    Some(Fx::Deess { .. } | Fx::Comp(_)) => (Change(fm.change_db), cut(-fm.change_db)),
+                    Some(Fx::Warmth { amount }) => (Level(fm.level_db), format!("{:.0}%", amount * 100.0)),
+                    Some(Fx::Air { amount }) => (Change(fm.change_db), format!("{:.0}%", amount * 100.0)),
+                    Some(Fx::Plugin { key }) => match self.plugins.get(key) {
+                        Some(Ok(_)) => (Change(fm.change_db), format!("{:+.1} dB", fm.change_db)),
+                        Some(Err(_)) => (Empty, "didn't load".into()),
+                        None if self.saved.plugins.iter().any(|e| e.key == key && e.crashed) => (Empty, "kept off".into()),
+                        None => (Empty, "loading".into()),
+                    },
+                    None => (Empty, String::new()),
+                }
             }
-            Node::Deess => (Change(-m.deess_db), cut(m.deess_db)),
-            Node::Warmth => (Level(m.warmth_db), format!("{:.0}%", pr.warmth_amount * 100.0)),
-            Node::Comp => (Change(-m.gr_db), cut(m.gr_db)),
             Node::Limiter => (Change(-m.lim_db), if m.lim_db > 0.1 { cut(m.lim_db) } else { "idle".into() }),
             Node::Output => match self.rates[1] {
                 Some(r) if r != dsp::SR as u32 => (Level(m.out_db), "set 48 kHz".into()),
@@ -1661,15 +2278,35 @@ impl App {
         }
     }
 
-    /// An open row's settings, right under it: Suggest and Reset, then the step's panel.
-    fn expanded(&mut self, ui: &mut egui::Ui, n: Node, m: &Meters) {
-        ui.indent(n.title(), |ui| {
+    /// An open row's settings, right under it: Suggest and Reset (and for a rack effect, move
+    /// and remove), then the step's panel. Returns a rack effect to move by one place (-1, 1)
+    /// or remove (0), for the caller to do once the rack is drawn.
+    fn expanded(&mut self, ui: &mut egui::Ui, n: Node, m: &Meters) -> Option<(usize, isize)> {
+        let mut edit = None;
+        let id = match n {
+            Node::Fx(i) => format!("fx{i}"),
+            n => n.title().into(),
+        };
+        ui.indent(id, |ui| {
             let (mut reset, mut suggest) = (false, false);
             {
-                let (params, smart) = (&self.saved.params, self.saved.smart.as_ref().filter(|_| Node::SMART.contains(&n)));
+                let (params, smart) = (&self.saved.params, self.saved.smart.as_ref().filter(|_| n.smart(&self.saved.params)));
                 ui.horizontal(|ui| {
+                    if let Node::Fx(i) = n {
+                        let last = params.rack.get(i + 1).is_none_or(Option::is_none);
+                        if ui::icon_button(ui, i > 0, icon::CHEVRON_UP, "Earlier").on_hover_text("Moves it one step earlier in the chain").clicked() {
+                            edit = Some((i, -1));
+                        }
+                        if ui::icon_button(ui, !last, icon::CHEVRON_DOWN, "Later").on_hover_text("Moves it one step later in the chain").clicked() {
+                            edit = Some((i, 1));
+                        }
+                        if ui::icon_button(ui, true, icon::DELETE, "Remove").on_hover_text("Takes it out of the chain").clicked() {
+                            edit = Some((i, 0));
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if n != Node::Echo {
+                        let plugin = matches!(n, Node::Fx(i) if params.rack[i].is_some_and(|s| s.fx.kind() == FxKind::Plugin));
+                        if n != Node::Echo && !plugin {
                             reset = ui::icon_button(ui, true, icon::REFRESH, "Reset")
                                 .on_hover_text("Back to the defaults for this step. On/off stays as it is")
                                 .clicked();
@@ -1699,6 +2336,7 @@ impl App {
             }
         });
         ui.add_space(6.0);
+        edit
     }
 
     /// Save and recall whole settings. Picking one keeps Bypass as it is.
@@ -1854,7 +2492,9 @@ impl App {
         let (d, inputs, outputs) = (&mut self.saved.devices, &self.inputs, &self.outputs);
         let (rates, in_channels) = (self.rates, self.in_channels);
         let off_rate = |i: usize| rates[i].filter(|&r| r != dsp::SR as u32);
+        let deep_state = (self.deep_ready, self.deep_error.clone());
         let pr = &mut self.saved.params;
+        let (host, entries, owner) = (&mut self.plugins, &mut self.saved.plugins, self.hwnd);
         let mut refresh = false;
         let refresh_button = |ui: &mut egui::Ui| ui.button("Refresh list").on_hover_text("Plugged something in?").clicked();
         match node {
@@ -1914,6 +2554,17 @@ impl App {
                 ui::row(ui, "Strength", |ui| {
                     ui.add(egui::Slider::new(&mut pr.denoise_strength, 0.0..=1.0));
                 });
+                ui::row(ui, "Model", |ui| {
+                    ui.selectable_value(&mut pr.denoiser, Denoiser::DeepFilterNet, "DeepFilterNet");
+                    ui.selectable_value(&mut pr.denoiser, Denoiser::RNNoise, "RNNoise");
+                });
+                let note = match (pr.denoiser, &deep_state) {
+                    (Denoiser::RNNoise, _) => "Light on the CPU, and gentle on held sung notes. DeepFilterNet gives a cleaner voice in loud rooms for about 10% of one CPU core".to_string(),
+                    (Denoiser::DeepFilterNet, (true, _)) => "A cleaner voice in loud rooms, for about 10% of one CPU core. RNNoise is lighter and gentler on held sung notes".to_string(),
+                    (Denoiser::DeepFilterNet, (_, Some(e))) => format!("DeepFilterNet didn't load ({e}), so RNNoise is running"),
+                    (Denoiser::DeepFilterNet, _) => "Loading DeepFilterNet... RNNoise runs until it's ready".to_string(),
+                };
+                ui.label(RichText::new(note).small().color(p.text2));
                 more(ui, "noise", |ui| {
                     ui::row(ui, "Back off while singing", |ui| {
                         ui.add(egui::Slider::new(&mut pr.sing_protect, 0.0..=1.0))
@@ -1975,62 +2626,132 @@ impl App {
                     });
                 });
             }
-            Node::Eq => ui::group(ui, icon::EQ, Node::Eq.title(), "Up to 5 bands over your live output spectrum", Some(&mut pr.eq), |ui| {
-                eq_ui.show(ui, &mut pr.bands, &m.spec_out);
-                ab_row(ui, Stage::Eq, shown, hold, can_hear);
-            }),
-            Node::Deess => {
-                let desc = format!("Tames harsh S sounds · now -{:.1} dB", m.deess_db);
-                ui::group(ui, icon::MUSIC, Node::Deess.title(), &desc, Some(&mut pr.deess), |ui| {
-                    let (lvl, thr) = (m.deess_level_db, snap.deess_threshold_db);
-                    let hot = if lvl > thr { graphs::AMBER } else { p.accent };
-                    graphs::meter_row(ui, "S sounds (5 kHz+)", lvl, -60.0, 0.0, Some(thr), hot, &format!("{lvl:.0} dB"));
-                    graphs::meter_row(ui, "Cutting them by", m.deess_db, 0.0, 12.0, None, graphs::AMBER, &format!("-{:.1} dB", m.deess_db));
-                    ab_row(ui, Stage::Deess, shown, hold, can_hear);
-                    ui::row(ui, "Threshold", |ui| {
-                        slider(ui, &mut pr.deess_threshold_db, -50.0..=0.0, " dB");
-                    });
-                });
-            }
-            Node::Warmth => {
-                let desc = "Soft saturation, like tube gear and tape: adds harmonics that make a voice sound fuller";
-                ui::group(ui, icon::MUSIC, Node::Warmth.title(), desc, Some(&mut pr.warmth), |ui| {
-                    let added = if snap.warmth { format!("{:.0} dB", m.warmth_db) } else { "off".into() };
-                    graphs::meter_row(ui, "Harmonics added", m.warmth_db, -60.0, 0.0, None, p.accent, &added);
-                    ab_row(ui, Stage::Warmth, shown, hold, can_hear);
-                    ui::row(ui, "Amount", |ui| {
-                        ui.add(egui::Slider::new(&mut pr.warmth_amount, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-                    });
-                });
-            }
-            Node::Comp => {
-                let desc = format!("Keeps loud parts in check · now -{:.1} dB", m.gr_db);
-                ui::group(ui, icon::EQ, Node::Comp.title(), &desc, Some(&mut pr.comp), |ui| {
-                    if let Some(t) = graphs::comp_graph(ui, &snap, m) {
-                        pr.comp_threshold_db = t.clamp(-50.0, 0.0);
+            Node::Fx(i) => {
+                let Some(dsp::Slot { on, fx, .. }) = &mut pr.rack[i] else { return };
+                let (fm, stage) = (m.fx[i], Stage::Fx(i));
+                let title = fx.kind().title();
+                match fx {
+                    Fx::Eq { bands } => ui::group(ui, icon::EQ, title, "Up to 5 bands over your live output spectrum", Some(on), |ui| {
+                        eq_ui.show(ui, bands, &m.spec_out);
+                        ab_row(ui, stage, shown, hold, can_hear);
+                    }),
+                    Fx::Deess { threshold_db } => {
+                        let cut = -fm.change_db;
+                        let desc = format!("Tames harsh S sounds · now -{cut:.1} dB");
+                        ui::group(ui, icon::MUSIC, title, &desc, Some(on), |ui| {
+                            let (lvl, thr) = (fm.level_db, *threshold_db);
+                            let hot = if lvl > thr { graphs::AMBER } else { p.accent };
+                            graphs::meter_row(ui, "S sounds (5 kHz+)", lvl, -60.0, 0.0, Some(thr), hot, &format!("{lvl:.0} dB"));
+                            graphs::meter_row(ui, "Cutting them by", cut, 0.0, 12.0, None, graphs::AMBER, &format!("-{cut:.1} dB"));
+                            ab_row(ui, stage, shown, hold, can_hear);
+                            ui::row(ui, "Threshold", |ui| {
+                                slider(ui, threshold_db, -50.0..=0.0, " dB");
+                            });
+                        });
                     }
-                    ui.add_space(6.0);
-                    ab_row(ui, Stage::Comp, shown, hold, can_hear);
-                    ui::row(ui, "Threshold", |ui| {
-                        slider(ui, &mut pr.comp_threshold_db, -50.0..=0.0, " dB");
-                    });
-                    ui::row(ui, "Ratio", |ui| {
-                        ui.add(egui::Slider::new(&mut pr.comp_ratio, 1.0..=20.0).logarithmic(true).suffix(":1"));
-                    });
-                    more(ui, "comp", |ui| {
-                        ui::row(ui, "Attack", |ui| {
-                            slider(ui, &mut pr.comp_attack_ms, 0.5..=50.0, " ms");
+                    Fx::Warmth { amount } => {
+                        let desc = "Soft saturation, like tube gear and tape: adds harmonics that make a voice sound fuller";
+                        let added = if *on { format!("{:.0} dB", fm.level_db) } else { "off".into() };
+                        ui::group(ui, icon::MUSIC, title, desc, Some(on), |ui| {
+                            graphs::meter_row(ui, "Harmonics added", fm.level_db, -60.0, 0.0, None, p.accent, &added);
+                            ab_row(ui, stage, shown, hold, can_hear);
+                            ui::row(ui, "Amount", |ui| {
+                                ui.add(egui::Slider::new(amount, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                            });
                         });
-                        ui::row(ui, "Release", |ui| {
-                            slider(ui, &mut pr.comp_release_ms, 20.0..=1000.0, " ms");
+                    }
+                    Fx::Air { amount } => {
+                        let desc = "Opens up the top end for a clearer, more present voice, and backs off on S sounds so they never get harsh";
+                        let lift = if *on { format!("+{:.1} dB", fm.change_db) } else { "off".into() };
+                        ui::group(ui, icon::MUSIC, title, desc, Some(on), |ui| {
+                            graphs::meter_row(ui, "Top end lifted by", fm.change_db, 0.0, dsp::AIR_MAX_DB, None, p.good, &lift);
+                            ab_row(ui, stage, shown, hold, can_hear);
+                            ui::row(ui, "Amount", |ui| {
+                                ui.add(egui::Slider::new(amount, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                            });
                         });
-                        ui::row(ui, "Makeup gain", |ui| {
-                            slider(ui, &mut pr.comp_makeup_db, 0.0..=24.0, " dB");
+                    }
+                    Fx::Plugin { key } => {
+                        let key = *key;
+                        let entry = entries.iter_mut().find(|e| e.key == key);
+                        let (name, desc) = match &entry {
+                            Some(e) => (e.info.name.clone(), format!("{} · {} plugin", e.info.vendor, e.info.format.name())),
+                            None => ("Plugin".to_string(), "Its settings are missing".to_string()),
+                        };
+                        let (mut retry, mut again) = (false, false);
+                        let change = if *on { format!("{:+.1} dB", fm.change_db) } else { "off".into() };
+                        ui::group(ui, icon::EQ, &name, &desc, Some(on), |ui| match (entry, host.get_mut(key)) {
+                            (Some(e), _) if e.crashed => {
+                                ui.label("It crashed or stopped responding while it ran, so it's kept off. MicClean kept running without it.");
+                                if ui.button("Try again").clicked() {
+                                    e.crashed = false;
+                                    again = true;
+                                }
+                            }
+                            (_, Some(Ok(inst))) => {
+                                ui::row(ui, "Plugin window", |ui| {
+                                    let open = inst.editor_open();
+                                    if ui.button(if open { "Close" } else { "Open" }).clicked() {
+                                        if open {
+                                            inst.close_editor();
+                                        } else {
+                                            inst.open_editor(owner, ui.visuals().dark_mode);
+                                        }
+                                    }
+                                });
+                                if let Some(why) = &inst.editor_error {
+                                    ui.label(RichText::new(why).color(graphs::AMBER));
+                                }
+                                ui::row(ui, "Level change", |ui| {
+                                    ui.label(change);
+                                });
+                                ab_row(ui, stage, shown, hold, can_hear);
+                            }
+                            (_, Some(Err(why))) => {
+                                ui.label(format!("It didn't load: {why}"));
+                                retry = ui.button("Try again").clicked();
+                            }
+                            (None, _) => {
+                                ui.label("This plugin isn't in your settings any more. Remove it, then add it again.");
+                            }
+                            _ => {
+                                ui.label("Loading…");
+                            }
                         });
-                    });
-                });
-            }
-            Node::Limiter => ui::group(ui, icon::VOLUME, Node::Limiter.title(), "Always on, so nothing you send can clip", None, |ui| {
+                        if retry {
+                            host.retry(key);
+                        }
+                        *on |= again;
+                    }
+                    Fx::Comp(c) => {
+                        let desc = format!("Keeps loud parts in check · now -{:.1} dB", -fm.change_db);
+                        ui::group(ui, icon::EQ, title, &desc, Some(on), |ui| {
+                            if let Some(t) = graphs::comp_graph(ui, &{ *c }, &fm) {
+                                c.threshold_db = t.clamp(-50.0, 0.0);
+                            }
+                            ui.add_space(6.0);
+                            ab_row(ui, stage, shown, hold, can_hear);
+                            ui::row(ui, "Threshold", |ui| {
+                                slider(ui, &mut c.threshold_db, -50.0..=0.0, " dB");
+                            });
+                            ui::row(ui, "Ratio", |ui| {
+                                ui.add(egui::Slider::new(&mut c.ratio, 1.0..=20.0).logarithmic(true).suffix(":1"));
+                            });
+                            more(ui, "comp", |ui| {
+                                ui::row(ui, "Attack", |ui| {
+                                    slider(ui, &mut c.attack_ms, 0.5..=50.0, " ms");
+                                });
+                                ui::row(ui, "Release", |ui| {
+                                    slider(ui, &mut c.release_ms, 20.0..=1000.0, " ms");
+                                });
+                                ui::row(ui, "Makeup gain", |ui| {
+                                    slider(ui, &mut c.makeup_db, 0.0..=24.0, " dB");
+                                });
+                            });
+                        });
+                    }
+                }
+            }            Node::Limiter => ui::group(ui, icon::VOLUME, Node::Limiter.title(), "Always on, so nothing you send can clip", None, |ui| {
                 let red = Color32::from_rgb(232, 72, 72);
                 let limiting = m.lim_db > 0.1;
                 let ceil = 20.0 * dsp::LIMIT_CEIL.log10();
@@ -2198,7 +2919,7 @@ impl App {
     }
 
     fn back_up(&self) -> Result<(), String> {
-        backup::save(ron::to_string(&self.saved).map_err(|e| e.to_string())?)
+        backup::save(&ron::to_string(&self.saved).map_err(|e| e.to_string())?)
     }
 
     /// Loads a backup or a settings file someone sent, keeping this PC's devices. The current
@@ -2243,6 +2964,7 @@ impl App {
 
     fn settings(&mut self, ui: &mut egui::Ui) {
         self.autostart_row(ui);
+        self.plugin_settings(ui);
         let (mut arm, mut reset, mut cancel, mut undo) = (false, false, false, false);
         let desc = match (self.reset_armed, self.reset_undo.is_some()) {
             (true, _) => "Every switch and slider goes back to the default, Smart setup's choices too. Learned sounds and presets stay",
@@ -2448,11 +3170,18 @@ fn spectrum_card(ui: &mut egui::Ui, m: &Meters, p: &Params) {
         painter.add(egui::Shape::line(input, Stroke::new(1.0, pal.text2)));
 
         let freqs: Vec<f32> = (0..=150).map(|i| SPEC_LO * SPEC_SPAN.powf(i as f32 / 150.0)).collect();
-        let gains = dsp::eq_curve(p, &freqs);
+        // Every Tone that's on, added up.
+        let mut gains = vec![0.0; freqs.len()];
+        let mut any = false;
+        for s in p.rack.iter().flatten().filter(|s| s.on) {
+            if let Fx::Eq { bands } = &s.fx {
+                any = true;
+                gains.iter_mut().zip(dsp::eq_curve(bands, &freqs)).for_each(|(g, b)| *g += b);
+            }
+        }
         let amber = Color32::from_rgb(240, 190, 50);
-        let col = if p.eq { amber } else { amber.gamma_multiply(0.3) };
-        let curve =
-            freqs.iter().zip(&gains).map(|(&f, &g)| Pos2::new(x_of(f), y_eq(if p.eq { g } else { 0.0 }))).collect();
+        let col = if any { amber } else { amber.gamma_multiply(0.3) };
+        let curve = freqs.iter().zip(&gains).map(|(&f, &g)| Pos2::new(x_of(f), y_eq(g))).collect();
         painter.add(egui::Shape::line(curve, Stroke::new(2.0, col)));
     });
 }
@@ -2589,12 +3318,13 @@ mod tests {
     fn a_preset_changes_the_style_but_keeps_what_smart_setup_measured() {
         // Presets made on a first start, before Smart setup ran.
         let presets = starter_presets(&Params::default());
-        let mut tuned = Params { input_gain_db: 18.0, gate_threshold_db: -38.0, output_gain_db: -4.0, comp_makeup_db: 2.0, ..Params::default() };
-        tuned.bands[1] = Some(Band { kind: BandKind::Bell, freq: 300.0, gain_db: -3.0, q: 1.0, on: true });
+        let mut tuned = Params { input_gain_db: 18.0, gate_threshold_db: -38.0, output_gain_db: -4.0, ..Params::default() };
+        tuned.comp_mut().unwrap().makeup_db = 2.0;
+        tuned.bands_mut().unwrap()[1] = Some(Band { kind: BandKind::Bell, freq: 300.0, gain_db: -3.0, q: 1.0, on: true });
         let singing = with_preset(&tuned, &presets[1].params);
         assert_eq!((singing.input_gain_db, singing.gate_threshold_db, singing.output_gain_db), (18.0, -38.0, -4.0));
-        assert_eq!((singing.bands, singing.comp_makeup_db), (tuned.bands, 2.0));
-        assert_eq!((singing.gate_hold_ms, singing.comp_ratio), (900.0, 2.0), "the Singing style itself");
+        assert_eq!((singing.bands(), singing.comp().unwrap().makeup_db), (tuned.bands(), 2.0));
+        assert_eq!((singing.gate_hold_ms, singing.comp().unwrap().ratio), (900.0, 2.0), "the Singing style itself");
         assert!(same_preset(&presets[1].params, &singing) && !same_preset(&presets[2].params, &singing));
     }
 
@@ -2606,7 +3336,7 @@ mod tests {
         let s = load(&store);
         assert_eq!(s.devices.input, "Test Microphone", "settings were thrown away");
         assert_eq!(s.params.output_gain_db, 6.0);
-        let b = s.params.bands;
+        let b = *s.params.bands().unwrap();
         assert_eq!(b[0].map(|b| (b.kind, b.freq)), Some((BandKind::LowCut, 165.0)));
         assert!(b[1].is_none(), "0 dB low shelf should not become a band");
         assert_eq!(b[2].map(|b| (b.kind, b.freq, b.gain_db)), Some((BandKind::Bell, 300.0, 2.8)));
@@ -2615,14 +3345,14 @@ mod tests {
         let names: Vec<&str> = s.presets.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["Talking", "Singing", "Gaming"]);
         assert!(same_preset(&s.presets[0].params, &s.params), "Talking should match the loaded settings");
-        assert!(s.presets.iter().all(|p| p.params.bands == s.params.bands));
+        assert!(s.presets.iter().all(|p| p.params.bands() == s.params.bands()));
 
         // After one save the file has bands only, and editing them sticks.
         let mut edited = s;
-        edited.params.bands[4] = Some(Band { kind: BandKind::Notch, freq: 60.0, gain_db: 0.0, q: 8.0, on: true });
+        edited.params.bands_mut().unwrap()[4] = Some(Band { kind: BandKind::Notch, freq: 60.0, gain_db: 0.0, q: 8.0, on: true });
         eframe::set_value(&mut store, eframe::APP_KEY, &edited);
         assert!(!store.0.contains("low_cut_hz"));
-        assert_eq!(load(&store).params.bands, edited.params.bands);
+        assert_eq!(load(&store).params.bands(), edited.params.bands());
     }
 
     #[test]
@@ -2635,6 +3365,19 @@ mod tests {
         assert_eq!((s.params.input_gain_db, s.params.learn_match, s.params.agc_target_db), (16.0, 3.9, -22.0));
         assert_eq!((s.presets.len(), s.presets[0].params.gate_floor_db), (1, -12.0));
         assert!(s.setup_done && s.auto_update && s.smart.is_some());
+        // Its fixed effects became a rack, in their old order, with their settings: in the
+        // settings, the preset and the Smart setup record alike.
+        let kinds: Vec<(FxKind, bool)> = s.params.rack.iter().flatten().map(|f| (f.fx.kind(), f.on)).collect();
+        assert_eq!(kinds, [(FxKind::Eq, true), (FxKind::Air, false), (FxKind::Deess, true), (FxKind::Warmth, false), (FxKind::Comp, true)]);
+        assert_eq!(s.params.bands().unwrap()[3].map(|b| (b.freq, b.gain_db)), Some((3200.0, 1.0)));
+        assert_eq!((s.params.deess_threshold(), s.params.comp().unwrap().threshold_db), (-39.0, -30.0));
+        let talking = &s.presets[0].params;
+        assert_eq!((talking.bands().unwrap()[2].map(|b| b.freq), talking.comp().unwrap().threshold_db), (Some(300.0), -21.0));
+        assert_eq!(s.smart.as_ref().unwrap().bands().unwrap()[4].map(|b| b.gain_db), Some(-2.0));
+        // Saved again, it has a rack and loads as it is.
+        let again = ron::to_string(&s).unwrap();
+        assert!(!again.contains("deess_threshold_db"));
+        assert!(parse_saved(Some(&again)).unwrap().params == s.params);
         // One that can't be read starts from the defaults, starter presets included.
         let bad = load(&Mem("(setup_done:Some(true))".into()));
         assert_eq!((bad.devices.input.as_str(), bad.presets.len()), ("", 3));

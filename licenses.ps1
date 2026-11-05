@@ -4,13 +4,15 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$meta = cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json
+# As hashtables: some crates have features whose names differ only in case (educe's Default
+# and default), which plain ConvertFrom-Json refuses. Each package becomes an object again.
+$meta = cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json -AsHashtable
 if ($LASTEXITCODE) { throw "cargo metadata failed" }
-$pkgs = @{}; foreach ($p in $meta.packages) { $pkgs[$p.id] = $p }
+$pkgs = @{}; foreach ($p in $meta.packages) { $pkgs[$p.id] = [pscustomobject]$p }
 $deps = @{}; foreach ($n in $meta.resolve.nodes) { $deps[$n.id] = $n.deps }
 
 # Normal dependencies only: build scripts and tests don't end up in the exe.
-$root = ($meta.packages | Where-Object name -eq 'micclean').id
+$root = ($pkgs.Values | Where-Object name -eq 'micclean').id
 $shipped = @{}
 $todo = [Collections.Generic.Queue[string]]::new()
 $todo.Enqueue($root)

@@ -12,8 +12,13 @@ path = "src/setup.rs"
 winresource = "0.1"
 
 [dependencies]
+clap-sys = "0.5"
 cpal = "0.18"
+# DeepFilterNet's noise removal with its low-latency model built in. Not on crates.io (the
+# model is too big for it), so straight from its repo at the release tag.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model-ll"] }
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
+ndarray = "0.15" # DeepFilterNet takes its frames as these
 nnnoiseless = "0.5"
 raw-window-handle = "0.6"
 realfft = "3.5.1"
@@ -23,6 +28,15 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sonora = "0.2"
+sonora-aec3 = "0.2" # the echo canceller's tuning (sonora is patched to take it, see below)
 tray-icon = "0.26.1"
+vst3 = "0.3"
 wasapi = "0.26"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Security", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+
+# sonora with one change: AudioProcessingBuilder::aec3_config, so MicClean can tune the echo
+# canceller's suppressor (sonora only exposes transparent mode). Each change is marked
+# "MicClean patch" in vendor/sonora/src.
+[patch.crates-io]
+sonora = { path = "vendor/sonora" }

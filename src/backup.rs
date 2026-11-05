@@ -2,9 +2,13 @@
 //! (so also the first start after an update, before the new version touches it), newest 10
 //! kept. A settings file that won't load (cut short by a crash mid-save) is swapped for the
 //! newest good copy before eframe reads it, instead of everything going back to defaults.
+//! eframe writes app.ron in place, so a power cut mid-save leaves it empty or zero-filled;
+//! each save also goes to settings.ron the safe way (a new file swapped in), and that copy is
+//! the one a broken app.ron comes back from, so nothing since the last start is lost.
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const KEEP: usize = 10;
@@ -31,14 +35,18 @@ fn backups(dir: &Path) -> Vec<PathBuf> {
 pub fn run(settings_dir: &Path) {
     let file = settings_dir.join("app.ron");
     let dir = backup_dir(settings_dir);
-    let Ok(text) = fs::read_to_string(&file) else { return }; // first start
+    let Ok(bytes) = fs::read(&file) else { return }; // first start
+    // Garbage that isn't even text (a power cut) is as broken as a cut-off file.
+    let text = String::from_utf8(bytes).unwrap_or_default();
     let saved = backups(&dir);
     if !loads(&text) {
         let _ = fs::rename(&file, file.with_extension("broken.ron"));
-        let good = saved.iter().rev().find_map(|p| fs::read_to_string(p).ok().filter(|t| loads(t)).map(|t| (p, t)));
+        let read = |p: &Path| fs::read_to_string(p).ok().filter(|t| loads(t));
+        let last = settings_dir.join("settings.ron");
+        let good = read(&last).map(|t| (last.clone(), t)).or_else(|| saved.iter().rev().find_map(|p| read(p).map(|t| (p.clone(), t))));
         match good {
-            Some((p, t)) if fs::write(&file, &t).is_ok() => {
-                crate::logfile::line(&format!("The settings file was damaged; loaded the backup {}", p.display()));
+            Some((p, t)) if write_safely(&file, &t).is_ok() => {
+                crate::logfile::line(&format!("The settings file was damaged; loaded {}", p.display()));
             }
             _ => crate::logfile::line("The settings file was damaged and there's no backup to load; starting fresh"),
         }
@@ -71,10 +79,35 @@ pub fn list() -> Vec<PathBuf> {
     dir().map(|d| backups(&d).into_iter().rev().collect()).unwrap_or_default()
 }
 
-/// Backs up these settings (eframe's "app" value) now.
-pub fn save(settings: String) -> Result<(), String> {
-    let text = ron::to_string(&HashMap::from([(eframe::APP_KEY.to_string(), settings)])).map_err(|e| e.to_string())?;
-    write(&dir().ok_or("there's no settings folder")?, &text)
+/// These settings (eframe's "app" value) as a whole settings file.
+fn as_file(settings: &str) -> Result<String, String> {
+    ron::to_string(&HashMap::from([(eframe::APP_KEY, settings)])).map_err(|e| e.to_string())
+}
+
+/// Backs up these settings now.
+pub fn save(settings: &str) -> Result<(), String> {
+    write(&dir().ok_or("there's no settings folder")?, &as_file(settings)?)
+}
+
+/// The safe copy of each save, for when app.ron is broken.
+pub fn keep(settings: &str) -> Result<(), String> {
+    keep_in(&eframe::storage_dir("MicClean").ok_or("there's no settings folder")?, settings)
+}
+
+fn keep_in(settings_dir: &Path, settings: &str) -> Result<(), String> {
+    fs::create_dir_all(settings_dir).map_err(|e| e.to_string())?;
+    write_safely(&settings_dir.join("settings.ron"), &as_file(settings)?).map_err(|e| e.to_string())
+}
+
+/// A crash or power cut leaves the old file or the new one, never part of one: the text goes
+/// to a new file, onto the disk, and only then takes the old one's place.
+fn write_safely(file: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = file.with_extension("ron.tmp");
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, file)
 }
 
 /// The MicClean settings in a settings file, a backup or one a friend sent, if it is one.
@@ -122,6 +155,16 @@ mod tests {
         assert_eq!(fs::read_to_string(data.join("app.ron")).unwrap(), good(11));
         assert!(data.join("app.broken.ron").exists());
         assert_eq!(settings_in(&good(11)).as_deref(), Some("settings 11"));
+
+        // With a safe copy of the last save, a zero-filled file (power cut) comes back as that
+        // save, not the older backup; so does one that isn't even text.
+        keep_in(&data, "settings 13").unwrap();
+        for junk in [vec![0u8; 64], vec![0xff, 0xfe, 0x00, 0x9c]] {
+            fs::write(data.join("app.ron"), junk).unwrap();
+            run(&data);
+            assert_eq!(settings_in(&fs::read_to_string(data.join("app.ron")).unwrap()).as_deref(), Some("settings 13"));
+        }
+        assert!(!data.join("settings.ron.tmp").exists());
         assert_eq!(settings_in("not a settings file"), None);
         assert_eq!(label(Path::new("settings-2026-10-29-192843.ron")), "2026-10-29 19:28");
         let _ = fs::remove_dir_all(&root);

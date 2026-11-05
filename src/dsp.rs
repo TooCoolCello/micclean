@@ -1,12 +1,12 @@
-//! Voice chain on 10 ms mono frames at 48 kHz (RNNoise's native frame size):
-//! denoise -> voice gate -> auto level -> EQ -> de-esser -> compressor -> limiter.
+//! Voice chain on 10 ms mono frames at 48 kHz (RNNoise's native frame size, and DeepFilterNet's
+//! hop): denoise -> voice gate -> auto level -> EQ -> de-esser -> compressor -> limiter.
 //! Echo cancellation runs before this, in audio.rs, because it needs the speaker signal.
 
 use nnnoiseless::DenoiseState;
 use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const SR: f32 = 48_000.0;
 pub const FRAME: usize = DenoiseState::FRAME_SIZE; // 480 samples = 10 ms
@@ -29,6 +29,7 @@ pub struct Params {
     pub denoise: bool,
     /// 0..1, how much of the denoised signal replaces the raw one.
     pub denoise_strength: f32,
+    pub denoiser: Denoiser,
     /// 0..1, how much denoising backs off while singing is detected.
     pub sing_protect: f32,
     pub gate: bool,
@@ -45,21 +46,144 @@ pub struct Params {
     pub agc: bool,
     pub agc_target_db: f32,
     pub agc_max_gain_db: f32,
-    pub eq: bool,
-    /// Fixed slots (None = unused) so cloning Params on the audio thread never allocates.
-    pub bands: [Option<Band>; BANDS],
-    pub deess: bool,
-    pub deess_threshold_db: f32,
-    pub comp: bool,
-    pub comp_threshold_db: f32,
-    pub comp_ratio: f32,
-    pub comp_attack_ms: f32,
-    pub comp_release_ms: f32,
-    pub comp_makeup_db: f32,
-    /// Warmth: soft saturation, the harmonics of tube gear and tape. 0..1, how hard it drives.
-    pub warmth: bool,
-    pub warmth_amount: f32,
+    /// The effects between the clean-up steps and the clip guard, in order. Packed to the
+    /// front (None = free). A fixed array, so cloning Params on the audio thread never allocates.
+    pub rack: [Option<Slot>; RACK],
     pub output_gain_db: f32,
+}
+
+/// Which noise removal runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Denoiser {
+    /// RNNoise: light on the CPU.
+    #[default]
+    RNNoise,
+    /// DeepFilterNet 3, its low-latency model: a cleaner voice in loud rooms for about 10% of
+    /// one CPU core. Same 10 ms delay as RNNoise.
+    DeepFilterNet,
+}
+
+/// DeepFilterNet with its model loaded. The GUI loads it and keeps a handle until it exits,
+/// so the audio thread never frees it, and never waits on the lock: the GUI never takes it.
+pub type Deep = Arc<Mutex<DeepFilter>>;
+
+/// DeepFilterNet's model and running state, made movable to the thread that runs it.
+pub struct DeepFilter(df::tract::DfTract);
+
+// SAFETY: what isn't Send inside (tract's Rc'd tensors and op states) is all made by
+// DfTract::new and kept inside it: its Rc clones only ever go into its own models' states.
+// Nothing outside holds one, so moving the whole thing moves every clone with it, and the
+// Mutex in `Deep` keeps it to one thread at a time.
+unsafe impl Send for DeepFilter {}
+
+/// Loads DeepFilterNet (about a third of a second: never on the audio thread).
+pub fn load_deep() -> Result<Deep, String> {
+    use df::tract::{DfParams, DfTract, RuntimeParams};
+    let d = DfTract::new(DfParams::default(), &RuntimeParams::default_with_ch(1)).map_err(|e| e.to_string())?;
+    if d.hop_size != FRAME || d.sr != SR as usize {
+        return Err(format!("DeepFilterNet runs {} samples at {} Hz", d.hop_size, d.sr));
+    }
+    Ok(Arc::new(Mutex::new(DeepFilter(d))))
+}
+
+/// Most effects the rack holds.
+pub const RACK: usize = 12;
+
+/// One effect in the rack.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Slot {
+    /// Stays with the effect when it moves, and so does its running state (filters, envelopes).
+    pub id: u32,
+    pub on: bool,
+    pub fx: Fx,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub enum Fx {
+    /// Tone: up to 5 parametric bands (None = unused).
+    Eq { bands: [Option<Band>; BANDS] },
+    /// Soften S sounds.
+    Deess { threshold_db: f32 },
+    /// Soft saturation, the harmonics of tube gear and tape. 0..1, how hard it drives.
+    Warmth { amount: f32 },
+    /// A brighter, more open top end that backs off on S sounds. 0..1.
+    Air { amount: f32 },
+    /// Tame loud parts.
+    Comp(Comp),
+    /// A VST3 or CLAP plugin: `key` is its entry in the saved plugins (which one, its settings).
+    Plugin { key: u32 },
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Comp {
+    pub threshold_db: f32,
+    pub ratio: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub makeup_db: f32,
+}
+
+/// What an effect is, without its settings.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FxKind {
+    Eq,
+    Air,
+    Deess,
+    Warmth,
+    Comp,
+    Plugin,
+}
+
+impl FxKind {
+    /// In the order "Add effect" lists them.
+    pub const ALL: [FxKind; 5] = [FxKind::Eq, FxKind::Air, FxKind::Deess, FxKind::Warmth, FxKind::Comp];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            FxKind::Eq => "Tone",
+            FxKind::Air => "Air",
+            FxKind::Deess => "Soften S sounds",
+            FxKind::Warmth => "Warmth",
+            FxKind::Comp => "Tame loud parts",
+            FxKind::Plugin => "Plugin",
+        }
+    }
+
+    /// A new one with its default settings.
+    pub fn new(self) -> Fx {
+        match self {
+            FxKind::Eq => Fx::Eq { bands: [Some(Band { kind: BandKind::LowCut, freq: 80.0, gain_db: 0.0, q: 0.707, on: true }), None, None, None, None] },
+            FxKind::Air => Fx::Air { amount: 0.5 },
+            FxKind::Deess => Fx::Deess { threshold_db: -24.0 },
+            FxKind::Warmth => Fx::Warmth { amount: 0.3 },
+            FxKind::Comp => Fx::Comp(Comp { threshold_db: -24.0, ratio: 3.0, attack_ms: 5.0, release_ms: 120.0, makeup_db: 4.0 }),
+            // Not added this way: "Add effect" makes the plugin's entry first.
+            FxKind::Plugin => Fx::Plugin { key: 0 },
+        }
+    }
+}
+
+impl Fx {
+    pub fn kind(&self) -> FxKind {
+        match self {
+            Fx::Eq { .. } => FxKind::Eq,
+            Fx::Deess { .. } => FxKind::Deess,
+            Fx::Warmth { .. } => FxKind::Warmth,
+            Fx::Air { .. } => FxKind::Air,
+            Fx::Comp(_) => FxKind::Comp,
+            Fx::Plugin { .. } => FxKind::Plugin,
+        }
+    }
+}
+
+/// The rack new settings start with: Air and Warmth are there to find, off.
+fn default_rack() -> [Option<Slot>; RACK] {
+    let fx = [(FxKind::Eq, true), (FxKind::Air, false), (FxKind::Deess, true), (FxKind::Warmth, false), (FxKind::Comp, true)];
+    let mut rack = [None; RACK];
+    for (i, (kind, on)) in fx.into_iter().enumerate() {
+        rack[i] = Some(Slot { id: i as u32 + 1, on, fx: kind.new() });
+    }
+    rack
 }
 
 impl Default for Params {
@@ -69,6 +193,7 @@ impl Default for Params {
             input_gain_db: 0.0,
             denoise: true,
             denoise_strength: 1.0,
+            denoiser: Denoiser::RNNoise,
             sing_protect: 0.3,
             gate: true,
             gate_threshold_db: -50.0,
@@ -82,18 +207,7 @@ impl Default for Params {
             agc: true,
             agc_target_db: -22.0,
             agc_max_gain_db: 15.0,
-            eq: true,
-            bands: [Some(Band { kind: BandKind::LowCut, freq: 80.0, gain_db: 0.0, q: 0.707, on: true }), None, None, None, None],
-            deess: true,
-            deess_threshold_db: -24.0,
-            comp: true,
-            comp_threshold_db: -24.0,
-            comp_ratio: 3.0,
-            comp_attack_ms: 5.0,
-            comp_release_ms: 120.0,
-            comp_makeup_db: 4.0,
-            warmth: false,
-            warmth_amount: 0.3,
+            rack: default_rack(),
             output_gain_db: 0.0,
         }
     }
@@ -121,18 +235,167 @@ impl Params {
         fix(&mut self.learn_match, 1.0, 8.0, d.learn_match);
         fix(&mut self.agc_target_db, -36.0, -10.0, d.agc_target_db);
         fix(&mut self.agc_max_gain_db, 0.0, 30.0, d.agc_max_gain_db);
-        fix(&mut self.deess_threshold_db, -50.0, 0.0, d.deess_threshold_db);
-        fix(&mut self.comp_threshold_db, -50.0, 0.0, d.comp_threshold_db);
-        fix(&mut self.comp_ratio, 1.0, 20.0, d.comp_ratio);
-        fix(&mut self.comp_attack_ms, 0.5, 50.0, d.comp_attack_ms);
-        fix(&mut self.comp_release_ms, 20.0, 1000.0, d.comp_release_ms);
-        fix(&mut self.comp_makeup_db, 0.0, 24.0, d.comp_makeup_db);
-        fix(&mut self.warmth_amount, 0.0, 1.0, d.warmth_amount);
         fix(&mut self.output_gain_db, -20.0, 30.0, d.output_gain_db);
-        for b in self.bands.iter_mut().flatten() {
-            fix(&mut b.freq, 20.0, 20_000.0, 1000.0);
-            fix(&mut b.q, 0.1, 18.0, 0.707);
-            fix(&mut b.gain_db, -24.0, 24.0, 0.0);
+        for s in self.rack.iter_mut().flatten() {
+            match &mut s.fx {
+                Fx::Eq { bands } => {
+                    for b in bands.iter_mut().flatten() {
+                        fix(&mut b.freq, 20.0, 20_000.0, 1000.0);
+                        fix(&mut b.q, 0.1, 18.0, 0.707);
+                        fix(&mut b.gain_db, -24.0, 24.0, 0.0);
+                    }
+                }
+                Fx::Deess { threshold_db } => fix(threshold_db, -50.0, 0.0, -24.0),
+                Fx::Warmth { amount } => fix(amount, 0.0, 1.0, 0.3),
+                Fx::Air { amount } => fix(amount, 0.0, 1.0, 0.5),
+                Fx::Comp(c) => {
+                    fix(&mut c.threshold_db, -50.0, 0.0, -24.0);
+                    fix(&mut c.ratio, 1.0, 20.0, 3.0);
+                    fix(&mut c.attack_ms, 0.5, 50.0, 5.0);
+                    fix(&mut c.release_ms, 20.0, 1000.0, 120.0);
+                    fix(&mut c.makeup_db, 0.0, 24.0, 4.0);
+                }
+                Fx::Plugin { .. } => {}
+            }
+        }
+        // Packed to the front, with ids that tell effects apart.
+        let mut packed = [None; RACK];
+        for (i, s) in self.rack.iter().flatten().enumerate() {
+            packed[i] = Some(*s);
+        }
+        self.rack = packed;
+        for i in 0..RACK {
+            let Some(id) = self.rack[i].map(|s| s.id) else { break };
+            if id == 0 || self.rack[..i].iter().flatten().any(|s| s.id == id) {
+                self.rack[i].as_mut().expect("checked").id = self.next_id();
+            }
+        }
+    }
+
+    /// An id no effect in the rack has.
+    pub fn next_id(&self) -> u32 {
+        self.rack.iter().flatten().map(|s| s.id).max().unwrap_or(0) + 1
+    }
+
+    /// The first effect of a kind: the one Smart setup and presets work on.
+    pub fn first(&self, k: FxKind) -> Option<&Slot> {
+        self.rack.iter().flatten().find(|s| s.fx.kind() == k)
+    }
+
+    pub fn first_mut(&mut self, k: FxKind) -> Option<&mut Slot> {
+        self.rack.iter_mut().flatten().find(|s| s.fx.kind() == k)
+    }
+
+    /// The first Tone's bands.
+    pub fn bands(&self) -> Option<&[Option<Band>; BANDS]> {
+        match self.first(FxKind::Eq)? {
+            Slot { fx: Fx::Eq { bands }, .. } => Some(bands),
+            _ => None,
+        }
+    }
+
+    pub fn bands_mut(&mut self) -> Option<&mut [Option<Band>; BANDS]> {
+        match self.first_mut(FxKind::Eq)? {
+            Slot { fx: Fx::Eq { bands }, .. } => Some(bands),
+            _ => None,
+        }
+    }
+
+    /// The first Tame loud parts' settings.
+    pub fn comp(&self) -> Option<&Comp> {
+        match self.first(FxKind::Comp)? {
+            Slot { fx: Fx::Comp(c), .. } => Some(c),
+            _ => None,
+        }
+    }
+
+    pub fn comp_mut(&mut self) -> Option<&mut Comp> {
+        match self.first_mut(FxKind::Comp)? {
+            Slot { fx: Fx::Comp(c), .. } => Some(c),
+            _ => None,
+        }
+    }
+
+    /// The first Soften S sounds' threshold.
+    pub fn deess_threshold_mut(&mut self) -> Option<&mut f32> {
+        match self.first_mut(FxKind::Deess)? {
+            Slot { fx: Fx::Deess { threshold_db }, .. } => Some(threshold_db),
+            _ => None,
+        }
+    }
+
+    /// Moves effect `i` by `by` places, if there's an effect there to swap with.
+    pub fn move_fx(&mut self, i: usize, by: isize) -> usize {
+        let j = i as isize + by;
+        if j < 0 || j as usize >= RACK || self.rack[j as usize].is_none() || self.rack[i].is_none() {
+            return i;
+        }
+        self.rack.swap(i, j as usize);
+        j as usize
+    }
+
+    /// Moves effect `from` to place `to` (counted with it taken out), as a drag drops it; the
+    /// ones between shift over.
+    pub fn move_fx_to(&mut self, from: usize, to: usize) {
+        let Some(last) = self.rack.iter().rposition(Option::is_some) else { return };
+        let to = to.min(last);
+        if from > last {
+            return;
+        }
+        if from < to {
+            self.rack[from..=to].rotate_left(1);
+        } else {
+            self.rack[to..=from].rotate_right(1);
+        }
+    }
+
+    /// Takes effect `i` out; the ones after it move up.
+    pub fn remove_fx(&mut self, i: usize) {
+        self.rack[i..].rotate_left(1);
+        self.rack[RACK - 1] = None;
+    }
+
+    /// The plugins in the rack, by key.
+    pub fn plugins(&self) -> impl Iterator<Item = u32> + '_ {
+        self.rack.iter().flatten().filter_map(|s| match s.fx {
+            Fx::Plugin { key } => Some(key),
+            _ => None,
+        })
+    }
+
+    /// Adds an effect at the end of the rack. False when it's full.
+    pub fn add_fx(&mut self, fx: Fx) -> bool {
+        let id = self.next_id();
+        match self.rack.iter_mut().find(|s| s.is_none()) {
+            Some(free) => {
+                *free = Some(Slot { id, on: true, fx });
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Params {
+    /// Only the rack effects of these kinds on.
+    pub fn only_fx(mut self, kinds: &[FxKind]) -> Self {
+        for s in self.rack.iter_mut().flatten() {
+            s.on = kinds.contains(&s.fx.kind());
+        }
+        self
+    }
+
+    /// With these as the first Tone's bands.
+    pub fn with_bands(mut self, bands: [Option<Band>; BANDS]) -> Self {
+        *self.bands_mut().expect("a Tone in the rack") = bands;
+        self
+    }
+
+    pub fn deess_threshold(&self) -> f32 {
+        match self.first(FxKind::Deess) {
+            Some(Slot { fx: Fx::Deess { threshold_db }, .. }) => *threshold_db,
+            _ => panic!("no Soften S sounds in the rack"),
         }
     }
 }
@@ -305,14 +568,12 @@ pub struct Meters {
     pub frames: u64,
     pub in_db: f32,
     pub out_db: f32,
-    pub gr_db: f32,
-    /// Peak level going into the compressor, for its graph.
-    pub comp_in_db: f32,
+    /// Each rack effect's, by position.
+    pub fx: [FxMeter; RACK],
     /// RMS level the gate judged, and the gain it applied, for its graph.
     pub gate_level_db: f32,
     pub gate_gain_db: f32,
     pub agc_db: f32,
-    pub deess_db: f32,
     pub vad: f32,
     pub pitch_hz: Option<f32>,
     pub gate_open: bool,
@@ -326,12 +587,10 @@ pub struct Meters {
     pub spec_clean: Spec,
     /// How much noise removal took out of the last frame, smoothed.
     pub denoise_db: f32,
-    /// De-esser detector (energy above 5 kHz), compared against its threshold.
-    pub deess_level_db: f32,
+
     /// Limiter gain reduction over the last frame.
     pub lim_db: f32,
-    /// Harmonics Warmth added, against the voice (dB).
-    pub warmth_db: f32,
+
     /// Distance from each learned sound (first MATCH_BARS) and from the learned voice.
     pub match_dist: [f32; MATCH_BARS],
     pub keep_dist: f32,
@@ -347,6 +606,15 @@ pub struct Meters {
     pub bands_db: [f32; NB],
 }
 
+/// A rack effect's meters. `change_db`: what it does to the level (Soften S sounds and Tame
+/// loud parts: minus their cut). `level_db`: what it measures (the de-esser's S level, the
+/// compressor's input peak, the harmonics Warmth adds against the voice).
+#[derive(Clone, Copy, Default)]
+pub struct FxMeter {
+    pub change_db: f32,
+    pub level_db: f32,
+}
+
 /// Learned sounds that get a live match bar. More can be learned; they just have no bar.
 pub const MATCH_BARS: usize = 16;
 
@@ -354,6 +622,13 @@ pub struct Chain {
     rnn: Box<DenoiseState<'static>>,
     dry: [f32; FRAME], // raw frame delayed by RNNoise's one-frame latency
     mix: f32,
+    /// DeepFilterNet once the GUI has it loaded (render loads its own), with its in and out
+    /// buffers, how much of its output is in the denoised sound (it fades in and out over a
+    /// frame) and how many frames it has run in a row.
+    pub deep: Option<Deep>,
+    deep_io: (ndarray::Array2<f32>, ndarray::Array2<f32>),
+    deep_mix: f32,
+    deep_run: u32,
     pitch: Pitch,
     an_in: Analyzer,
     an_out: Analyzer,
@@ -369,10 +644,11 @@ pub struct Chain {
     hold: u32,
     gate_gain: f32,
     agc_db: f32,
-    eq: Eq,
-    deess: DeEsser,
-    gr_db: f32,
-    warmth: Warmth,
+    /// The rack effects' running state, kept in rack order (see `arrange`).
+    fx: [FxState; RACK],
+    /// The loaded plugins' audio halves, handed over by the GUI. Empty when rendering a clip:
+    /// plugins pass the sound through there.
+    pub plugins: crate::plugins::Procs,
     lim_env: f32,
     pub meters: Meters,
 }
@@ -383,6 +659,10 @@ impl Default for Chain {
             rnn: DenoiseState::new(),
             dry: [0.0; FRAME],
             mix: 1.0,
+            deep: None,
+            deep_io: (ndarray::Array2::zeros((1, FRAME)), ndarray::Array2::zeros((1, FRAME))),
+            deep_mix: 0.0,
+            deep_run: 0,
             pitch: Pitch::default(),
             an_in: Analyzer::new(),
             an_out: Analyzer::new(),
@@ -394,10 +674,8 @@ impl Default for Chain {
             hold: 0,
             gate_gain: 1.0,
             agc_db: 0.0,
-            eq: Eq::default(),
-            deess: DeEsser::default(),
-            gr_db: 0.0,
-            warmth: Warmth::default(),
+            fx: std::array::from_fn(|_| FxState::default()),
+            plugins: Vec::new(),
             lim_env: 0.0,
             meters: Meters::default(),
         }
@@ -409,6 +687,9 @@ impl Default for Chain {
 /// and a cold chain would fade the first seconds in.
 pub fn render(raw: &[f32], p: &Params, prof: &Profiles) -> Vec<f32> {
     let mut chain = Chain::default();
+    if p.denoiser == Denoiser::DeepFilterNet {
+        chain.deep = load_deep().ok();
+    }
     let mut out = Vec::with_capacity(raw.len());
     for pass in 0..2 {
         out.clear();
@@ -432,21 +713,21 @@ pub fn band_response(b: &Band, freqs: &[f32]) -> Vec<f32> {
 }
 
 /// Whole-EQ magnitude response in dB at each frequency, for drawing the curve.
-pub fn eq_curve(p: &Params, freqs: &[f32]) -> Vec<f32> {
+pub fn eq_curve(bands: &[Option<Band>; BANDS], freqs: &[f32]) -> Vec<f32> {
     let mut sum = vec![0.0; freqs.len()];
-    for b in p.bands.iter().flatten().filter(|b| b.on) {
+    for b in bands.iter().flatten().filter(|b| b.on) {
         sum.iter_mut().zip(band_response(b, freqs)).for_each(|(s, g)| *s += g);
     }
     sum
 }
 
 /// Compressor output level for a steady input level, both dBFS, makeup included.
-pub fn comp_curve_db(p: &Params, in_db: f32) -> f32 {
-    in_db - comp_gr(in_db - p.comp_threshold_db, comp_slope(p)) + p.comp_makeup_db
+pub fn comp_curve_db(c: &Comp, in_db: f32) -> f32 {
+    in_db - comp_gr(in_db - c.threshold_db, comp_slope(c)) + c.makeup_db
 }
 
-fn comp_slope(p: &Params) -> f32 {
-    1.0 - 1.0 / p.comp_ratio.max(1.0)
+fn comp_slope(c: &Comp) -> f32 {
+    1.0 - 1.0 / c.ratio.max(1.0)
 }
 
 /// Gain reduction in dB for a level `over` dB above the threshold, with a 6 dB soft knee.
@@ -489,6 +770,32 @@ impl Chain {
         }
     }
 
+    /// DeepFilterNet, when it's picked and loaded, in place of RNNoise's output in `wet`. Both
+    /// are one frame late, so they line up. Its first frames after a pause still carry what it
+    /// heard before it, so they're left out. ponytail: it allocates a little each frame
+    /// (inside the library); a worker thread if that ever shows up as dropouts.
+    fn deep_step(&mut self, p: &Params, x: &[f32], wet: &mut [f32; FRAME]) {
+        let want = p.denoiser == Denoiser::DeepFilterNet && p.denoise && !p.bypass;
+        let lock = self.deep.as_ref().filter(|_| want || self.deep_mix > 0.0).and_then(|d| d.try_lock().ok());
+        let Some(mut d) = lock else {
+            (self.deep_mix, self.deep_run) = (0.0, 0);
+            return;
+        };
+        let (inp, out) = &mut self.deep_io;
+        inp.iter_mut().zip(x).for_each(|(a, b)| *a = *b);
+        if d.0.process(inp.view(), out.view_mut()).is_err() {
+            (self.deep_mix, self.deep_run) = (0.0, 0);
+            return;
+        }
+        self.deep_run = self.deep_run.saturating_add(1);
+        let target = if want && self.deep_run > 10 { 1.0 } else { 0.0 };
+        for (i, (w, o)) in wet.iter_mut().zip(out.iter()).enumerate() {
+            let m = self.deep_mix + (target - self.deep_mix) * i as f32 / FRAME as f32;
+            *w = *w * (1.0 - m) + o * m;
+        }
+        self.deep_mix = target;
+    }
+
     pub fn process(&mut self, p: &Params, prof: &Profiles, x: &mut [f32]) {
         assert_eq!(x.len(), FRAME);
         self.meters.frames += 1;
@@ -513,6 +820,8 @@ impl Chain {
             inp[i] = s * 32768.0; // RNNoise wants i16-scaled floats
         }
         let vad = self.rnn.process_frame(&mut wet, &inp);
+        wet.iter_mut().for_each(|s| *s /= 32768.0);
+        self.deep_step(p, x, &mut wet);
         // Pitch decides before the denoised frame comes out, so this is a free 10 ms lookahead.
         // Learned sounds are matched after noise removal, so it goes by last frame's match.
         let singing = self.pitch.track(f0, vad >= p.vad_threshold);
@@ -523,7 +832,7 @@ impl Chain {
         for (i, s) in x.iter_mut().enumerate() {
             let m = self.mix + (target - self.mix) * i as f32 / FRAME as f32;
             let dry = std::mem::replace(&mut self.dry[i], *s);
-            *s = dry * (1.0 - m) + wet[i] / 32768.0 * m;
+            *s = dry * (1.0 - m) + wet[i] * m;
             e_in += dry * dry;
             e_out += *s * *s;
         }
@@ -546,7 +855,7 @@ impl Chain {
             // a quiet mic turned up 30 dB mustn't clip hard into Discord.
             (self.class, self.meters.noise_match, self.hold) = (None, None, 0);
             (self.meters.gate_open, self.meters.reason) = (true, "bypassed");
-            (self.meters.gr_db, self.meters.deess_db) = (0.0, 0.0);
+            self.meters.fx = Default::default();
             self.limit(x, 0.0);
             return;
         }
@@ -608,49 +917,82 @@ impl Chain {
         // ponytail: switching back on jumps straight to that gain; ramp it if anyone hears a step.
         self.meters.agc_db = if p.agc { self.agc_db } else { 0.0 };
 
-        if p.eq {
-            self.eq.update(&p.bands);
-            self.eq.run(x);
-        }
-
-        self.meters.deess_db = 0.0;
-        if p.deess {
-            x.iter_mut().for_each(|s| *s = self.deess.run(*s, p.deess_threshold_db));
-            self.meters.deess_db = self.deess.gr_db;
-            self.meters.deess_level_db = 20.0 * self.deess.env.max(1e-6).log10();
-        }
-
-        // After auto level, so the level it drives is steady and it colours every word alike,
-        // and after the de-esser, so S sounds are tamed before they could add grit.
-        self.meters.warmth_db = -120.0;
-        if p.warmth {
-            let (mut e_x, mut e_h) = (1e-12f32, 1e-12f32);
-            for s in x.iter_mut() {
-                let h = self.warmth.run(*s, p.warmth_amount);
-                (e_x, e_h) = (e_x + *s * *s, e_h + h * h);
-                *s += h;
+        // The rack, in order. Its effects' state follows them when they move.
+        self.arrange(&p.rack);
+        for (i, (slot, st)) in p.rack.iter().zip(&mut self.fx).enumerate() {
+            let m = &mut self.meters.fx[i];
+            *m = FxMeter::default();
+            let Some(slot) = slot.filter(|s| s.on) else { continue };
+            match slot.fx {
+                Fx::Eq { bands } => {
+                    st.eq.update(&bands);
+                    st.eq.run(x);
+                }
+                Fx::Deess { threshold_db } => {
+                    x.iter_mut().for_each(|s| *s = st.deess.run(*s, threshold_db));
+                    (m.change_db, m.level_db) = (-st.deess.gr_db, 20.0 * st.deess.env.max(1e-6).log10());
+                }
+                Fx::Warmth { amount } => {
+                    let (mut e_x, mut e_h) = (1e-12f32, 1e-12f32);
+                    for s in x.iter_mut() {
+                        let h = st.warmth.run(*s, amount);
+                        (e_x, e_h) = (e_x + *s * *s, e_h + h * h);
+                        *s += h;
+                    }
+                    // Harmonics against the voice. With nothing coming in (between words, the gate
+                    // shut) there are none: not the 0 dB two equal floors would make, which drew
+                    // as a full red bar.
+                    m.level_db = if e_x > FRAME as f32 * 1e-9 { 10.0 * (e_h / e_x).log10() } else { -90.0 };
+                }
+                Fx::Air { amount } => {
+                    let mut lift = 0.0f32;
+                    for s in x.iter_mut() {
+                        *s = st.air.run(*s, amount);
+                        lift = lift.max(st.air.lift_db);
+                    }
+                    m.change_db = lift;
+                }
+                Fx::Comp(c) => {
+                    let (att, rel) = (coef(c.attack_ms), coef(c.release_ms));
+                    let slope = comp_slope(&c);
+                    let mut peak = 1e-6f32;
+                    for s in x.iter_mut() {
+                        peak = peak.max(s.abs());
+                        let target = comp_gr(20.0 * s.abs().max(1e-6).log10() - c.threshold_db, slope);
+                        let k = if target > st.gr_db { att } else { rel };
+                        st.gr_db = target + k * (st.gr_db - target);
+                        *s *= db2lin(c.makeup_db - st.gr_db);
+                    }
+                    (m.change_db, m.level_db) = (-st.gr_db, 20.0 * peak.log10());
+                }
+                Fx::Plugin { key } => {
+                    // Skipped (dry) while the GUI holds it: loading settings, shutting it down.
+                    let Some((_, p)) = self.plugins.iter().find(|(k, _)| *k == key) else { continue };
+                    let Ok(mut p) = p.try_lock() else { continue };
+                    let e_in = x.iter().map(|s| s * s).sum::<f32>();
+                    p.process(x);
+                    let e_out = x.iter().map(|s| s * s).sum::<f32>();
+                    m.change_db = if e_in > 1e-9 { 10.0 * (e_out.max(1e-12) / e_in).log10() } else { 0.0 };
+                }
             }
-            self.meters.warmth_db = 10.0 * (e_h / e_x).log10();
         }
-
-        self.meters.gr_db = 0.0;
-        if p.comp {
-            let (att, rel) = (coef(p.comp_attack_ms), coef(p.comp_release_ms));
-            let slope = comp_slope(p);
-            let mut peak = 1e-6f32;
-            for s in x.iter_mut() {
-                peak = peak.max(s.abs());
-                let target = comp_gr(20.0 * s.abs().max(1e-6).log10() - p.comp_threshold_db, slope);
-                let c = if target > self.gr_db { att } else { rel };
-                self.gr_db = target + c * (self.gr_db - target);
-                *s *= db2lin(p.comp_makeup_db - self.gr_db);
-            }
-            self.meters.gr_db = self.gr_db;
-            self.meters.comp_in_db = 20.0 * peak.log10();
-        }
-
-
         self.limit(x, p.output_gain_db);
+    }
+
+    /// Lines the effects' running state up with the rack: one that moved takes its state along,
+    /// a new one starts fresh. Swaps only, so the audio thread never allocates.
+    fn arrange(&mut self, rack: &[Option<Slot>; RACK]) {
+        for (i, s) in rack.iter().enumerate() {
+            // The kind too: a preset's rack can use an id for another kind of effect.
+            let key = (s.map_or(0, |s| s.id), s.map(|s| s.fx.kind()));
+            if self.fx[i].key == key {
+                continue;
+            }
+            match (i + 1..RACK).find(|&j| self.fx[j].key == key && key.0 != 0) {
+                Some(j) => self.fx.swap(i, j),
+                None => self.fx[i] = FxState { key, ..FxState::default() },
+            }
+        }
     }
 
     /// Output gain, then the safety limiter: instant attack, so output never exceeds the ceiling.
@@ -888,6 +1230,86 @@ impl Learner {
     }
 }
 
+/// One rack effect's running state. Every kind's is there (a few hundred bytes), so an effect
+/// changing kind in a slot needs nothing allocated.
+#[derive(Default)]
+struct FxState {
+    /// The effect it belongs to: Slot::id (0 = none) and kind.
+    key: (u32, Option<FxKind>),
+    eq: Eq,
+    deess: DeEsser,
+    warmth: Warmth,
+    air: Air,
+    gr_db: f32,
+}
+
+/// Air's high shelf at full Amount.
+pub const AIR_MAX_DB: f32 = 8.0;
+
+/// Air: a high shelf (9 kHz) for an open top end, plus a gentle exciter that makes harmonics
+/// from the 2.5..6 kHz range and adds only what lands above 6 kHz, so a dull mic gets a top end
+/// too. Both back off while S sounds dominate (the 5 kHz+ share of the sound is high), so it
+/// never makes them harsher.
+struct Air {
+    /// The S detector (5 kHz+) and the whole sound's level, both envelopes.
+    det: Biquad,
+    s_env: f32,
+    all_env: f32,
+    shelf: Biquad,
+    /// The exciter's source band and the high-pass its harmonics go through.
+    src_hp: Biquad,
+    src_lp: Biquad,
+    out_hp: Biquad,
+    /// The shelf's gain now, dB.
+    lift_db: f32,
+    n: u32,
+}
+
+impl Default for Air {
+    fn default() -> Self {
+        let set = |kind, f| {
+            let mut b = Biquad::default();
+            b.set(kind, f, 0.707, 0.0);
+            b
+        };
+        Self {
+            det: set(BandKind::LowCut, 5000.0),
+            s_env: 0.0,
+            all_env: 0.0,
+            shelf: set(BandKind::HighShelf, 9000.0),
+            src_hp: set(BandKind::LowCut, 2500.0),
+            src_lp: set(BandKind::HighCut, 6000.0),
+            out_hp: set(BandKind::LowCut, 6000.0),
+            lift_db: 0.0,
+            n: 0,
+        }
+    }
+}
+
+impl Air {
+    fn run(&mut self, x: f32, amount: f32) -> f32 {
+        let follow = |env: &mut f32, v: f32| *env = v + if v > *env { coef(1.0) } else { coef(80.0) } * (*env - v);
+        follow(&mut self.s_env, self.det.run(x).abs());
+        follow(&mut self.all_env, x.abs());
+        // S sounds put over a quarter of the level above 5 kHz (-12 dB); vowels well under a
+        // tenth. Full lift under -20 dB, none over -8.
+        let s_share = 20.0 * (self.s_env.max(1e-9) / self.all_env.max(1e-9)).log10();
+        let open = ((-8.0 - s_share) / 12.0).clamp(0.0, 1.0);
+        let lift = AIR_MAX_DB * amount * open;
+        // Coefficients every 32 samples (0.7 ms): smooth enough and cheap.
+        self.n = self.n.wrapping_add(1);
+        if self.n % 32 == 0 && (lift - self.lift_db).abs() > 0.05 {
+            self.lift_db = lift;
+            self.shelf.set(BandKind::HighShelf, 9000.0, 0.707, lift);
+        }
+        let src = self.src_lp.run(self.src_hp.run(x));
+        // Driven 24 dB (a voice's presence band sits around -35 dBFS here), the curve scaled
+        // back to slope 1: what's left is the harmonics.
+        let harm = (src * 16.0).tanh() / 16.0 - src;
+        self.shelf.run(x) - self.out_hp.run(harm) * 2.0 * amount * open
+    }
+}
+
 /// How hard Warmth drives at full Amount, and how lopsided its curve is (even harmonics, as
 /// tube gear makes, next to tape's odd ones).
 const WARMTH_DRIVE_DB: f32 = 18.0;
@@ -1081,6 +1503,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn air_lifts_the_top_end_but_not_s_sounds() {
+        let tau = std::f32::consts::TAU;
+        let tone = |f: f32, a: f32| move |i: usize| (tau * f * i as f32 / SR).sin() * a;
+        // Level (dB) of frequency `f` in the last half second of `y`.
+        let level = |y: &[f32], f: f32| {
+            let tail = &y[y.len() - 24_000..];
+            let (s, c) = tail.iter().enumerate().fold((0.0, 0.0), |(s, c), (i, v)| {
+                let ph = tau * f * (y.len() - 24_000 + i) as f32 / SR;
+                (s + v * ph.sin(), c + v * ph.cos())
+            });
+            20.0 * (2.0 * (s * s + c * c).sqrt() / 24_000.0).max(1e-9).log10()
+        };
+        let run = |x: &dyn Fn(usize) -> f32, amount: f32| {
+            let mut air = Air::default();
+            let y: Vec<f32> = (0..SR as usize).map(|i| air.run(x(i), amount)).collect();
+            (y, air.lift_db)
+        };
+        // A vowel: a loud 200 Hz with a faint 10 kHz overtone. Half Amount lifts the overtone
+        // about 4 dB (half of 8 at the shelf's top) and leaves the rest alone.
+        let (lo, hi) = (tone(200.0, 0.2), tone(10_000.0, 0.005));
+        let vowel = move |i| lo(i) + hi(i);
+        let (y, lift) = run(&vowel, 0.5);
+        let x: Vec<f32> = (0..SR as usize).map(vowel).collect();
+        assert!((3.0..5.0).contains(&lift), "lift {lift} dB");
+        assert!((2.0..5.0).contains(&(level(&y, 10_000.0) - level(&x, 10_000.0))), "overtone {} dB", level(&y, 10_000.0) - level(&x, 10_000.0));
+        assert!((level(&y, 200.0) - level(&x, 200.0)).abs() < 0.3);
+        // An S: most of the sound is at 7 kHz, so it backs right off.
+        let (s, under) = (tone(7_000.0, 0.2), tone(200.0, 0.02));
+        let (_, lift) = run(&move |i| s(i) + under(i), 1.0);
+        assert!(lift < 0.5, "lift on an S: {lift} dB");
+        // The exciter: a voice's 3.5 kHz presence gets its 3rd harmonic (10.5 kHz) added. (A
+        // 3.5 kHz tone alone would count as an S.)
+        let (lo, mid) = (tone(200.0, 0.2), tone(3_500.0, 0.05));
+        let (y, _) = run(&move |i| lo(i) + mid(i), 1.0);
+        assert!(level(&y, 10_500.0) - level(&y, 3_500.0) > -35.0, "harmonic {} dB under", level(&y, 3_500.0) - level(&y, 10_500.0));
+        // Amount 0 sends the sound as it was.
+        let (y, _) = run(&vowel, 0.0);
+        assert!(y.iter().zip(&x).all(|(a, b)| (a - b).abs() < 1e-4));
+    }
+    #[test]
+    fn moving_an_effect_takes_its_state_along() {
+        let mut p = only("comp");
+        let mut chain = Chain::default();
+        let loud: Vec<f32> = (0..FRAME).map(|i| (i as f32 * 0.07).sin() * 0.9).collect();
+        for _ in 0..20 {
+            chain.process(&p, &Profiles::default(), &mut loud.clone());
+        }
+        let at = |c: &Chain, id| c.fx.iter().position(|s| s.key.0 == id).unwrap();
+        let comp_id = p.first(FxKind::Comp).unwrap().id;
+        let gr = chain.fx[at(&chain, comp_id)].gr_db;
+        assert!(gr > 3.0, "the compressor is working: {gr} dB");
+        // To the front: it keeps working from where it was instead of starting over.
+        let i = p.rack.iter().position(|s| s.is_some_and(|s| s.id == comp_id)).unwrap();
+        for k in (1..=i).rev() {
+            p.move_fx(k, -1);
+        }
+        chain.process(&p, &Profiles::default(), &mut loud.clone());
+        assert_eq!(at(&chain, comp_id), 0);
+        assert!((chain.fx[0].gr_db - gr).abs() < 1.0, "{} dB, was {gr}", chain.fx[0].gr_db);
+        // Removed and added again (at least a frame apart, as clicks are), it's a new one.
+        p.remove_fx(0);
+        chain.process(&p, &Profiles::default(), &mut [0.0; FRAME]);
+        assert!(p.add_fx(FxKind::Comp.new()));
+        // Dragged: to the end, back to the front, onto itself; the others keep their order.
+        let order = |p: &Params| p.rack.iter().flatten().map(|s| s.fx.kind()).collect::<Vec<_>>();
+        let last = |p: &Params| p.rack.iter().rposition(Option::is_some).unwrap();
+        let start = order(&p);
+        p.move_fx_to(0, last(&p));
+        assert_eq!(order(&p), [&start[1..], &start[..1]].concat());
+        p.move_fx_to(last(&p), 0);
+        assert_eq!(order(&p), start);
+        p.move_fx_to(1, 1);
+        assert_eq!(order(&p), start);
+        chain.process(&p, &Profiles::default(), &mut [0.0; FRAME]);
+        assert_eq!(chain.fx[at(&chain, p.first(FxKind::Comp).unwrap().id)].gr_db, 0.0);
+    }
+    #[test]
     fn warmth_adds_harmonics_and_keeps_the_voice_level() {
         // A 200 Hz tone at -18 dBFS RMS, a voice's level after auto level and a little EQ.
         let tone = |i: usize| (std::f32::consts::TAU * 200.0 * i as f32 / SR).sin() * 0.178;
@@ -1138,16 +1637,13 @@ mod tests {
     /// Only the named stage on, gate open, so a test sees one effect at a time. Every frame
     /// counts as voice: test tones don't sound like it to RNNoise.
     fn only(stage: &str) -> Params {
-        Params {
-            denoise: false,
-            gate: false,
-            vad_threshold: 0.0,
-            agc: stage == "agc",
-            eq: stage == "eq",
-            deess: stage == "deess",
-            comp: stage == "comp",
-            ..Params::default()
-        }
+        let kinds: &[FxKind] = match stage {
+            "eq" => &[FxKind::Eq],
+            "deess" => &[FxKind::Deess],
+            "comp" => &[FxKind::Comp],
+            _ => &[],
+        };
+        Params { denoise: false, gate: false, vad_threshold: 0.0, agc: stage == "agc", ..Params::default() }.only_fx(kinds)
     }
 
     fn run(p: &Params, prof: &Profiles, x: &[f32]) -> (Vec<f32>, Chain) {
@@ -1216,7 +1712,7 @@ mod tests {
         x.iter_mut().zip(n).for_each(|(s, n)| *s += n);
 
         // Gate behaviour only: auto level would (rightly) pull the note toward its target.
-        let p = Params { comp: false, eq: false, agc: false, deess: false, ..Params::default() };
+        let p = Params { agc: false, ..Params::default() }.only_fx(&[]);
         let (y, _) = run(&p, &Profiles::default(), &x);
         let seg = |a: f32, b: f32| rms_db(&y[(SR * a) as usize..(SR * b) as usize]);
         let (note, tail) = (seg(1.0, 2.9), seg(3.8, 4.4));
@@ -1447,7 +1943,8 @@ mod tests {
 
     #[test]
     fn compressor_hits_ratio() {
-        let p = Params { comp_threshold_db: -20.0, comp_ratio: 4.0, comp_makeup_db: 0.0, ..only("comp") };
+        let mut p = only("comp");
+        *p.comp_mut().unwrap() = Comp { threshold_db: -20.0, ratio: 4.0, makeup_db: 0.0, ..*p.comp().unwrap() };
         let (y, _) = run(&p, &Profiles::default(), &sine(1000.0, FRAME * 100, 0.9));
         // -0.9 dB peak in, 19.1 dB over a -20 dB threshold at 4:1 -> about -15.2 dB out.
         let out = peak_db(&y[FRAME * 80..]);
@@ -1471,10 +1968,11 @@ mod tests {
     #[test]
     fn eq_curve_matches_settings() {
         let mut p = Params::default();
-        p.bands[0] = Some(Band { kind: BandKind::LowCut, freq: 100.0, gain_db: 0.0, q: 0.707, on: true });
-        p.bands[3] = Some(Band { kind: BandKind::Bell, freq: 2000.0, gain_db: 6.0, q: 1.0, on: true });
+        let bands = p.bands_mut().unwrap();
+        bands[0] = Some(Band { kind: BandKind::LowCut, freq: 100.0, gain_db: 0.0, q: 0.707, on: true });
+        bands[3] = Some(Band { kind: BandKind::Bell, freq: 2000.0, gain_db: 6.0, q: 1.0, on: true });
         // 450 Hz sits between the low cut and the Q=1 bell's skirt.
-        let c = eq_curve(&p, &[100.0, 450.0, 2000.0]);
+        let c = eq_curve(p.bands().unwrap(), &[100.0, 450.0, 2000.0]);
         assert!((c[0] + 3.0).abs() < 0.3, "low cut corner {}", c[0]);
         assert!(c[1].abs() < 0.5, "passband {}", c[1]);
         assert!((c[2] - 6.0).abs() < 0.2, "bell peak {}", c[2]);
@@ -1508,7 +2006,8 @@ mod tests {
 
     #[test]
     fn deesser_cuts_hiss_not_voice() {
-        let p = Params { deess_threshold_db: -30.0, ..only("deess") };
+        let mut p = only("deess");
+        *p.deess_threshold_mut().unwrap() = -30.0;
         let s = sine(8000.0, FRAME * 50, 0.5);
         let (y, _) = run(&p, &Profiles::default(), &s);
         let cut = rms_db(&s[FRAME * 20..]) - rms_db(&y[FRAME * 20..]);
@@ -1530,6 +2029,45 @@ mod tests {
     }
 
     #[test]
+    fn warmth_meter_reads_nothing_in_silence() {
+        let mut p = only("none");
+        assert!(p.add_fx(Fx::Warmth { amount: 0.3 }));
+        let w = p.rack.iter().position(|s| s.is_some_and(|s| s.on && s.fx.kind() == FxKind::Warmth)).unwrap();
+        let mut chain = Chain::default();
+        let level = |chain: &mut Chain, x: &[f32]| {
+            for c in x.chunks(FRAME) {
+                chain.process(&p, &Profiles::default(), &mut c.to_vec());
+            }
+            chain.meters.fx[w].level_db
+        };
+        let talking = level(&mut chain, &tone(150.0, FRAME * 30, 0.1));
+        assert!((-45.0..-5.0).contains(&talking), "harmonics {talking} dB while talking");
+        let quiet = level(&mut chain, &vec![0.0; FRAME * 5]);
+        assert!(quiet < -60.0, "harmonics {quiet} dB in silence");
+    }
+
+    #[test]
+    fn deepfilternet_takes_over_from_rnnoise_and_hands_back() {
+        let mut seed = 7;
+        let hiss = noise(FRAME * 60, 0.05, &mut seed);
+        let deep = Params { denoise: true, denoiser: Denoiser::DeepFilterNet, ..only("none") };
+        let mut chain = Chain { deep: Some(load_deep().unwrap()), ..Chain::default() };
+        for c in hiss.chunks(FRAME) {
+            chain.process(&deep, &Profiles::default(), &mut c.to_vec());
+        }
+        assert_eq!(chain.deep_mix, 1.0, "DeepFilterNet never came in");
+        assert!(chain.meters.denoise_db > 6.0, "denoise {} dB", chain.meters.denoise_db);
+        // Back to RNNoise: DeepFilterNet fades out over one frame, then stops running.
+        let light = Params { denoiser: Denoiser::RNNoise, ..deep.clone() };
+        for c in hiss.chunks(FRAME).take(3) {
+            let mut f = c.to_vec();
+            chain.process(&light, &Profiles::default(), &mut f);
+            assert!(f.iter().all(|s| s.is_finite()));
+        }
+        assert_eq!((chain.deep_mix, chain.deep_run), (0.0, 0));
+    }
+
+    #[test]
     fn visual_meters_track_their_stages() {
         let mut seed = 3;
         // Noise removal on plain hiss takes a lot out.
@@ -1545,9 +2083,10 @@ mod tests {
         assert!(y.iter().all(|s| s.abs() <= LIMIT_CEIL + 1e-4));
 
         // An "s" well over the de-esser threshold shows up on its detector.
-        let p = Params { deess_threshold_db: -30.0, ..only("deess") };
+        let mut p = only("deess");
+        *p.deess_threshold_mut().unwrap() = -30.0;
         let (_, chain) = run(&p, &Profiles::default(), &sine(8000.0, FRAME * 20, 0.5));
-        assert!(chain.meters.deess_level_db > -30.0, "detector {} dB", chain.meters.deess_level_db);
+        assert!(chain.meters.fx[1].level_db > -30.0, "detector {} dB", chain.meters.fx[1].level_db);
     }
 
     #[test]

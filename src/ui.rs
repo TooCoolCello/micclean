@@ -36,6 +36,8 @@ pub mod icon {
     pub const SETUP: &str = "\u{E90F}"; // wrench
     pub const CHECK: &str = "\u{E73E}";
     pub const CHEVRON_DOWN: &str = "\u{E70D}";
+    pub const CHEVRON_UP: &str = "\u{E70E}";
+    pub const ADD: &str = "\u{E710}";
     pub const CHEVRON_RIGHT: &str = "\u{E76C}";
 }
 
@@ -344,11 +346,16 @@ pub fn accent_button(ui: &mut Ui, enabled: bool, text: impl Into<String>) -> Res
 
 /// Icon + text button.
 pub fn icon_button(ui: &mut Ui, enabled: bool, icon: &str, text: &str) -> Response {
+    ui.add_enabled(enabled, egui::Button::new(icon_text(ui, icon, text)))
+}
+
+/// An icon and a label, for buttons and menus.
+pub fn icon_text(ui: &Ui, icon: &str, text: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let color = ui.visuals().text_color();
     job.append(icon, 0.0, egui::TextFormat::simple(icon_font(14.0), color));
     job.append(text, 8.0, egui::TextFormat::simple(FontId::proportional(14.0), color));
-    ui.add_enabled(enabled, egui::Button::new(job))
+    job
 }
 
 /// Thin rounded level meter, -60..0 dB.
