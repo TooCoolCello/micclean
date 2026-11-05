@@ -1,21 +1,33 @@
 //! Update check and one-click install from GitHub Releases. Only the installed copy takes part
-//! (a build-folder copy has nothing to replace). curl.exe ships with Windows 10 and 11, so no
-//! HTTP library is linked in.
+//! (a build-folder copy has nothing to replace). curl ships with Windows 10 and 11 and with
+//! macOS, so no HTTP library is linked in. On a Mac an update is the new .dmg, downloaded in
+//! the browser and dragged into Applications.
 
+#[cfg(windows)]
 use crate::install;
 use serde::Deserialize;
+#[cfg(windows)]
 use sha2::{Digest, Sha256};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 pub const REPO: &str = "TooCoolCello/micclean";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(windows)]
 const SETUP: &str = "MicClean-Setup.exe";
+#[cfg(not(windows))]
+const SETUP: &str = "MicClean.dmg";
+/// What updating does, after "You have 0.x.y."
+#[cfg(windows)]
+pub const HOW: &str = "Updating closes MicClean for a few seconds, so your voice drops out briefly.";
+#[cfg(not(windows))]
+pub const HOW: &str = "Download it, then drag it into Applications over this one.";
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Release {
     pub version: String,
     setup_url: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
     sha_url: String,
 }
 
@@ -26,6 +38,7 @@ pub enum State {
     Checking,
     UpToDate,
     Available(Release),
+    #[cfg_attr(not(windows), allow(dead_code))] // a Mac update is a browser download
     Installing,
     /// Setup is running and waiting for this copy to close, so it can be replaced.
     Restarting,
@@ -56,6 +69,7 @@ impl Updater {
         let me = self.clone();
         std::thread::spawn(move || {
             // Leftover from the last update; it may still be locked, then the next check gets it.
+            #[cfg(windows)]
             let _ = std::fs::remove_dir_all(install::update_dir());
             me.set(match latest() {
                 Ok(Some(r)) => State::Available(r),
@@ -68,6 +82,7 @@ impl Updater {
     /// Downloads and checks the setup file, then runs it. The state turns `Restarting` once it
     /// runs: this copy then closes itself (saving your settings), and setup installs and starts
     /// the new one, back in the tray if `minimized`.
+    #[cfg(windows)]
     pub fn install(&self, rel: Release, minimized: bool) {
         if matches!(self.state(), State::Installing | State::Restarting) {
             return;
@@ -81,9 +96,17 @@ impl Updater {
             });
         });
     }
+
+    /// On a Mac: the browser downloads the new .dmg, and you drag it in.
+    // ponytail: installing it from here (swap the .app, relaunch) comes with the next Mac round.
+    #[cfg(not(windows))]
+    pub fn install(&self, rel: Release, _minimized: bool) {
+        crate::os::open(&rel.setup_url);
+    }
 }
 
 /// Why setup couldn't install an update, once: setup started this copy again after it failed.
+#[cfg(windows)]
 pub fn take_failure() -> Option<String> {
     let note = install::failure_note();
     let why = std::fs::read_to_string(&note).ok()?;
@@ -93,11 +116,13 @@ pub fn take_failure() -> Option<String> {
 
 /// The version the last update tried to install. It stays until this copy is that version,
 /// so an update that didn't take is never retried on its own, launch after launch.
+#[cfg(windows)]
 fn attempt_file() -> std::path::PathBuf {
     crate::logfile::path().with_file_name("update-attempt.txt")
 }
 
 /// A version an update tried and failed to install (Settings can still try it by hand).
+#[cfg(windows)]
 pub fn failed_version() -> Option<String> {
     let v = std::fs::read_to_string(attempt_file()).ok()?.trim().to_string();
     if v == VERSION {
@@ -113,7 +138,15 @@ pub fn failed_version() -> Option<String> {
 // in older Windows 10 builds (7.55) doesn't know it and would fail every check.
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let opts = ["--silent", "--show-error", "--fail", "--location", "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "60"];
-    let out = install::hidden(Command::new(install::windows_exe(install::CURL)).args(opts).args(args))
+    #[cfg(windows)]
+    let mut cmd = Command::new(install::windows_exe(install::CURL));
+    #[cfg(windows)]
+    install::hidden(&mut cmd);
+    #[cfg(not(windows))]
+    let mut cmd = Command::new("/usr/bin/curl");
+    let out = cmd
+        .args(opts)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -182,11 +215,13 @@ fn version(s: &str) -> Result<[u32; 3], String> {
 }
 
 /// The hash from a `sha256sum`-style file ("<hash>  <name>") or a bare hash.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn first_hash(text: &str) -> Option<String> {
     let h = text.split_whitespace().next()?.to_ascii_lowercase();
     (h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).then_some(h)
 }
 
+#[cfg(windows)]
 fn download_and_run(rel: &Release, minimized: bool) -> Result<(), String> {
     let dir = install::update_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -250,7 +285,7 @@ mod tests {
     fn only_a_newer_release_is_offered() {
         let r = parse(release("v0.2.0", "github.com").as_bytes(), "0.1.0").unwrap().expect("newer");
         assert_eq!(r.version, "0.2.0");
-        assert!(r.setup_url.ends_with("/v0.2.0/MicClean-Setup.exe"));
+        assert!(r.setup_url.ends_with(&format!("/v0.2.0/{SETUP}")));
         assert_eq!(parse(release("v0.1.0", "github.com").as_bytes(), "0.1.0").unwrap(), None, "same version");
         assert_eq!(parse(release("v0.0.9", "github.com").as_bytes(), "0.1.0").unwrap(), None, "older version");
     }

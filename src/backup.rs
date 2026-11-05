@@ -1,4 +1,4 @@
-//! Copies of the settings file in %APPDATA%\MicClean\backups, made at each start when it changed
+//! Copies of the settings file in the app folder's backups, made at each start when it changed
 //! (so also the first start after an update, before the new version touches it), newest 10
 //! kept. A settings file that won't load (cut short by a crash mid-save) is swapped for the
 //! newest good copy before eframe reads it, instead of everything going back to defaults.
@@ -61,7 +61,7 @@ pub fn run(settings_dir: &Path) {
 /// A new backup of `text` (a whole settings file), keeping the newest KEEP.
 fn write(dir: &Path, text: &str) -> Result<(), String> {
     let t = crate::logfile::local_time();
-    let name = format!("settings-{:04}-{:02}-{:02}-{:02}{:02}{:02}.ron", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    let name = format!("settings-{:04}-{:02}-{:02}-{:02}{:02}{:02}.ron", t.year, t.month, t.day, t.hour, t.minute, t.second);
     fs::create_dir_all(dir).and_then(|()| fs::write(dir.join(name), text)).map_err(|e| e.to_string())?;
     for old in backups(dir).iter().rev().skip(KEEP) {
         let _ = fs::remove_file(old);
@@ -69,14 +69,14 @@ fn write(dir: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// %APPDATA%\MicClean\backups.
-pub fn dir() -> Option<PathBuf> {
-    eframe::storage_dir("MicClean").map(|d| backup_dir(&d))
+/// %APPDATA%\MicClean\backups (Application Support/MicClean/backups on a Mac).
+pub fn dir() -> PathBuf {
+    backup_dir(&crate::os::settings_dir())
 }
 
 /// Backups, newest first.
 pub fn list() -> Vec<PathBuf> {
-    dir().map(|d| backups(&d).into_iter().rev().collect()).unwrap_or_default()
+    backups(&dir()).into_iter().rev().collect()
 }
 
 /// These settings (eframe's "app" value) as a whole settings file.
@@ -86,12 +86,12 @@ fn as_file(settings: &str) -> Result<String, String> {
 
 /// Backs up these settings now.
 pub fn save(settings: &str) -> Result<(), String> {
-    write(&dir().ok_or("there's no settings folder")?, &as_file(settings)?)
+    write(&dir(), &as_file(settings)?)
 }
 
 /// The safe copy of each save, for when app.ron is broken.
 pub fn keep(settings: &str) -> Result<(), String> {
-    keep_in(&eframe::storage_dir("MicClean").ok_or("there's no settings folder")?, settings)
+    keep_in(&crate::os::settings_dir(), settings)
 }
 
 fn keep_in(settings_dir: &Path, settings: &str) -> Result<(), String> {

@@ -95,4 +95,40 @@ mod tests {
         }
         assert!(std::fs::read(path).is_ok_and(|have| have == want), "run with WRITE_ICO=1 to regenerate {path}");
     }
+
+    /// The Mac app icon: an .icns of PNGs, (type, size) per entry, 16 to 512 pt at 1x and 2x.
+    fn icns() -> Vec<u8> {
+        let png = |n: u32| {
+            let mut out = Vec::new();
+            let mut e = png::Encoder::new(&mut out, n, n);
+            e.set_color(png::ColorType::Rgba);
+            e.set_depth(png::BitDepth::Eight);
+            e.write_header().unwrap().write_image_data(&rgba(true, n)).unwrap();
+            out
+        };
+        let sizes = [(b"icp4", 16), (b"ic11", 32), (b"icp5", 32), (b"ic12", 64), (b"ic07", 128), (b"ic13", 256), (b"ic08", 256), (b"ic14", 512), (b"ic09", 512), (b"ic10", 1024)];
+        let mut body = Vec::new();
+        for (kind, n) in sizes {
+            let data = png(n);
+            body.extend(kind);
+            body.extend((data.len() as u32 + 8).to_be_bytes());
+            body.extend(data);
+        }
+        let mut out = b"icns".to_vec();
+        out.extend((body.len() as u32 + 8).to_be_bytes());
+        out.extend(body);
+        out
+    }
+
+    /// build-mac.sh puts assets/micclean.icns in the app. WRITE_ICNS=1 cargo test embedded_icns
+    /// regenerates it.
+    #[test]
+    fn embedded_icns_is_current() {
+        let want = icns();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/micclean.icns");
+        if std::env::var_os("WRITE_ICNS").is_some() {
+            std::fs::write(path, &want).unwrap();
+        }
+        assert!(std::fs::read(path).is_ok_and(|have| have == want), "run with WRITE_ICNS=1 to regenerate {path}");
+    }
 }

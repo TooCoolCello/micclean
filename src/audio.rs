@@ -2,8 +2,9 @@
 //! cancellation, the chain, plugins) runs on its own thread, so a slow frame never holds up
 //! the capture and the output rings' cushion rides it out. The mic, the speaker loopback (echo
 //! reference) and the output devices talk to that thread through lock-free rings. Most streams
-//! are cpal's; the two it can't open (exclusive output, every app but this one as the echo
-//! source) run on their own threads with the wasapi crate.
+//! are cpal's; on Windows the two it can't open (exclusive output, every app but this one as
+//! the echo source) run on their own threads with the wasapi crate. On a Mac cpal records what
+//! the default output plays with a Core Audio process tap (macOS 14.2 and later).
 
 use crate::dsp::{Chain, FRAME, Learner, Meters, Params, Profiles, SR, db2lin};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -104,26 +105,32 @@ impl Default for Devices {
 
 /// The echo source that hears every app except MicClean itself (Windows' per-app loopback,
 /// Windows 10 2004 and later), so your own voice from Hear myself never lands in it.
+#[cfg(windows)]
 pub const EVERYTHING: &str = "Everything you hear (except MicClean)";
+/// On a Mac: what the default output plays, MicClean's Hear myself included.
+// ponytail: cpal's tap records every app; leaving MicClean out needs an own tap (next Mac round).
+#[cfg(not(windows))]
+pub const EVERYTHING: &str = "Everything you hear";
 
 /// Only virtual cables are taken in exclusive mode: on speakers it would silence every other app.
+/// Windows only (WASAPI exclusive mode).
 // ponytail: VB-Cable's names (CABLE Input, CABLE-A Input, Hi-Fi CABLE Input); add others when asked.
 pub fn can_be_exclusive(name: &str) -> bool {
-    name.contains("CABLE")
+    cfg!(windows) && name.contains("CABLE")
 }
 
-/// Windows' default playback device: usually what you listen on.
+/// The system's default playback device: usually what you listen on.
 pub fn default_output_name() -> Option<String> {
     let d = cpal::default_host().default_output_device()?;
     d.description().ok().map(|d| d.name().to_string())
 }
 
-/// VB-Cable's ends, also when renamed in Windows: as a mic, MicClean would hear itself.
+/// The virtual cable (VB-Cable, BlackHole on a Mac): as a mic, MicClean would hear itself.
 pub fn is_cable(name: &str) -> bool {
-    name.contains("CABLE") || name.contains("VB-Audio")
+    crate::os::cable::is(name)
 }
 
-/// The mic to start with: Windows' default one, unless that's a cable or Stereo Mix (what the
+/// The mic to start with: the system's default one, unless that's a cable or Stereo Mix (what the
 /// PC plays), then the first real one.
 pub fn first_mic(inputs: &[String]) -> Option<String> {
     let real = |n: &String| !is_cable(n) && !n.contains("Stereo Mix");
@@ -138,7 +145,7 @@ pub fn device_names(input: bool) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The rate and channel count Windows runs a device at (its shared-mode mix format).
+/// The rate and channel count the system runs a device at (Windows' shared-mode mix format).
 pub fn device_format(input: bool, name: &str) -> Option<(u32, u16)> {
     let d = find(input, name).ok()?;
     let cfg = if input { d.default_input_config() } else { d.default_output_config() };
@@ -209,7 +216,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     let mic_cfg = mic_dev.default_input_config().map_err(es)?;
     let rate = mic_cfg.sample_rate();
     if rate % 100 != 0 {
-        return Err(format!("{} runs at {rate} Hz; set it to 48000 Hz in Windows sound settings", dev.input));
+        return Err(format!("{} runs at {rate} Hz; set it to 48000 Hz in {}", dev.input, crate::os::SOUND_SETTINGS));
     }
     let mut streams = Vec::new();
     let mut info = format!("mic {} Hz {} ch", rate, mic_cfg.channels());
@@ -218,6 +225,7 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     }
 
     let (mut missing, mut failed) = (Vec::new(), Vec::new());
+    #[cfg_attr(not(windows), allow(unused_mut))] // only Windows' exclusive output sets it
     let (mut workers, mut shared_output) = (Vec::new(), None);
     let mut outs = Vec::new(); // (ring, is_monitor)
     let latency = shared.lock().map_err(es)?.latency.clone();
@@ -225,11 +233,14 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
     if dev.output.is_empty() {
         info += ", nothing sent yet";
     } else {
+        #[cfg(windows)]
         let exclusive = if dev.exclusive_output && can_be_exclusive(&dev.output) {
             open_output_exclusive(&dev.output, shared.clone(), latency.clone()).map_err(|e| shared_output = Some(e)).ok()
         } else {
             None
         };
+        #[cfg(not(windows))]
+        let exclusive: Option<(Worker, ringbuf::HeapProd<f32>)> = None;
         let prod = match exclusive {
             Some((worker, prod)) => {
                 workers.push(worker);
@@ -257,11 +268,24 @@ pub fn start(dev: &Devices, shared: Arc<Mutex<Shared>>) -> Result<Engine, String
 
     let mut echo = None;
     if let Some(name) = &dev.echo_ref {
-        let opened = if name == EVERYTHING {
+        #[cfg(windows)]
+        let mut everything = || {
             open_echo_everything(shared.clone()).map(|(w, cons, rate)| {
                 workers.push(w);
                 (cons, rate)
             })
+        };
+        // An input stream on the default output: cpal taps it (Core Audio process tap).
+        #[cfg(not(windows))]
+        let mut everything = || {
+            let out = default_output_name().ok_or_else(|| "there's no output device".to_string())?;
+            open_echo_ref(&out, shared.clone()).map(|(s, cons, rate)| {
+                streams.push(s);
+                (cons, rate)
+            })
+        };
+        let opened = if name == EVERYTHING {
+            everything()
         } else {
             open_echo_ref(name, shared.clone()).map(|(s, cons, rate)| {
                 streams.push(s);
@@ -506,10 +530,10 @@ fn open_echo_ref(
     let cfg = spk.default_output_config().map_err(es)?;
     let ref_rate = cfg.sample_rate();
     if ref_rate % 100 != 0 {
-        return Err(format!("{name} runs at {ref_rate} Hz; set it to 48000 Hz in Windows sound settings"));
+        return Err(format!("{name} runs at {ref_rate} Hz; set it to 48000 Hz in {}", crate::os::SOUND_SETTINGS));
     }
     let (mut prod, cons) = HeapRb::<f32>::new(ref_rate as usize).split();
-    // Input stream on an output device = WASAPI loopback of what it plays.
+    // Input stream on an output device = loopback of what it plays (WASAPI, or a Core Audio tap).
     let stream = open_input(&spk, &cfg, None, shared, move |mono, _, _| {
         prod.push_slice(mono);
     })?;
@@ -935,6 +959,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn encode_writes_every_sample_width() {
         let mut out = [0u8; 2 * 2 * 2];
         encode(&[1.0, -0.5], 2, 2, false, &mut out);
@@ -953,6 +978,7 @@ mod tests {
     /// playing silence, for 2 s.
     #[test]
     #[ignore]
+    #[cfg(windows)]
     fn wasapi_streams() {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (_echo, cons, rate) = open_echo_everything(shared.clone()).expect("echo source");
@@ -1104,7 +1130,8 @@ impl DriftReader {
     }
 }
 
-/// A WASAPI stream on its own thread, for what cpal can't open. Dropping it stops the thread.
+/// A thread of MicClean's own (processing, or a WASAPI stream cpal can't open). Dropping it
+/// stops the thread.
 pub struct Worker {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -1120,11 +1147,13 @@ impl Drop for Worker {
     }
 }
 
+#[cfg(windows)]
 type Ready = std::sync::mpsc::SyncSender<Result<(), String>>;
 
 /// Runs `body` on its own thread; it sends Ok on `ready` once its stream runs, then loops until
 /// `stop`. An error before that is returned from here (so `start` can fall back); one after it
 /// asks the GUI to reconnect, like a cpal stream error.
+#[cfg(windows)]
 fn spawn_worker(
     name: &str,
     shared: Arc<Mutex<Shared>>,
@@ -1154,6 +1183,7 @@ fn spawn_worker(
 }
 
 /// wasapi errors, with the ones people can fix in words.
+#[cfg(windows)]
 fn wasapi_err(e: wasapi::WasapiError) -> String {
     let code = match &e {
         wasapi::WasapiError::Windows(w) => w.code().0 as u32,
@@ -1168,6 +1198,7 @@ fn wasapi_err(e: wasapi::WasapiError) -> String {
 }
 
 /// What cpal does for its own audio threads: MMCSS "Pro Audio", so other work can't starve it.
+#[cfg(windows)]
 pub(crate) fn pro_audio_priority() {
     let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
     let mut index = 0u32;
@@ -1176,8 +1207,18 @@ pub(crate) fn pro_audio_priority() {
     unsafe { windows_sys::Win32::System::Threading::AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index) };
 }
 
+/// The Mac's highest everyday priority (Core Audio's own threads are real-time already).
+// ponytail: QoS, not a real-time time-constraint thread; switch if the processing thread glitches
+// under load on a Mac.
+#[cfg(not(windows))]
+pub(crate) fn pro_audio_priority() {
+    // SAFETY: only sets this thread's QoS class.
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+}
+
 /// Mono f32 out as `ch` interleaved channels of `width`-byte samples: float, or integers
 /// left-justified, so 24 valid bits in a 32-bit slot come out right too.
+#[cfg(windows)]
 fn encode(mono: &[f32], ch: usize, width: usize, float: bool, out: &mut [u8]) {
     for (s, frame) in mono.iter().zip(out.chunks_exact_mut(ch * width)) {
         let le = if float { s.to_le_bytes() } else { ((s.clamp(-1.0, 1.0) as f64 * i32::MAX as f64) as i32).to_le_bytes() };
@@ -1191,6 +1232,7 @@ fn encode(mono: &[f32], ch: usize, width: usize, float: bool, out: &mut [u8]) {
 /// records that mixer minus Discord itself, can't send your voice a second time; it also skips
 /// the mixer's buffer. There's no Windows rate conversion in exclusive mode, so the device
 /// has to run at 48 kHz.
+#[cfg(windows)]
 fn open_output_exclusive(
     name: &str,
     shared: Arc<Mutex<Shared>>,
@@ -1263,6 +1305,7 @@ fn open_output_exclusive(
 
 /// The echo source for EVERYTHING: what every app plays except this one (Windows' per-app
 /// loopback with this process excluded), as 48 kHz mono.
+#[cfg(windows)]
 fn open_echo_everything(shared: Arc<Mutex<Shared>>) -> Result<(Worker, ringbuf::HeapCons<f32>, u32), String> {
     use wasapi::{AudioClient, Direction, SampleType, StreamMode, WaveFormat};
     let (mut prod, cons) = HeapRb::<f32>::new(SR as usize).split();

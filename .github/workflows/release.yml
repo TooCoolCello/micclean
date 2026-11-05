@@ -1,10 +1,13 @@
 name: Release
 
-# Push a tag like v0.2.0 to build the installer and publish it. The tag has to match the
-# version in Cargo.toml, because the in-app updater compares the two.
+# Push a tag like v0.2.0 to build both installers (Windows setup, Mac disk image) and publish
+# them. The tag has to match the version in Cargo.toml, because the in-app updater compares
+# the two. Run it by hand (Actions -> Release -> Run workflow) to only build them, as artifacts
+# to try out, without publishing anything.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 # The build runs every dependency's build script and test, so it can only read the repo.
 # Only the publish job, which runs nothing from the repo, can write a release.
@@ -21,6 +24,7 @@ jobs:
           persist-credentials: false
 
       - name: Tag matches Cargo.toml
+        if: github.ref_type == 'tag'
         shell: pwsh
         run: |
           # A tag like v0.9.0-rc1 would be published as the latest release, and every
@@ -49,18 +53,47 @@ jobs:
             dist/MicClean-Setup.exe
             dist/MicClean-Setup.exe.sha256
 
+  mac:
+    # Apple Silicon runner; build-mac.sh cross-builds the Intel half into the same app.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build disk image
+        run: bash build-mac.sh
+
+      - name: Checksum
+        working-directory: dist
+        run: shasum -a 256 MicClean.dmg > MicClean.dmg.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: |
+            dist/MicClean.dmg
+            dist/MicClean.dmg.sha256
+
   publish:
-    needs: build
+    needs: [build, mac]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: installer
           path: dist
+          merge-multiple: true
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/MicClean-Setup.exe dist/MicClean-Setup.exe.sha256 --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/MicClean-Setup.exe dist/MicClean-Setup.exe.sha256 dist/MicClean.dmg dist/MicClean.dmg.sha256 --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

@@ -5,8 +5,10 @@ mod audio;
 mod backup;
 mod dsp;
 mod graphs;
+#[cfg(windows)]
 mod install;
 mod logfile;
+mod os;
 mod plugins;
 mod smart;
 mod ui;
@@ -21,11 +23,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use os::autostart;
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use ui::icon;
 
 /// "Show your window" pings from a second launch go to this localhost port plus the Windows
-/// session number, so each signed-in user has their own.
+/// session number (the user id on a Mac), so each signed-in user has their own.
 const INSTANCE_PORT: u16 = 47391;
 const RECORD_SECS: usize = 10;
 /// A raw mic peak this close to full scale (-0.3 dBFS) is clipping before MicClean.
@@ -47,22 +50,23 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     // Settings -> Apps -> Uninstall runs this, before the single-instance check below.
+    #[cfg(windows)]
     if std::env::args().any(|a| a == "--uninstall") {
         install::uninstall(std::env::args().any(|a| a == "--silent"));
         return Ok(());
     }
-    let mut first = first_copy();
+    let mut first = os::first_copy();
     if !first && std::env::args().any(|a| a == "--updated") {
         // Started by setup after an update: the old copy may still be closing.
         for _ in 0..50 {
             std::thread::sleep(Duration::from_millis(200));
-            first = first_copy();
+            first = os::first_copy();
             if first {
                 break;
             }
         }
     }
-    let port = instance_port();
+    let port = INSTANCE_PORT + (os::session() % 100) as u16;
     if !first {
         // Already running: that copy shows its window, this one leaves. Two copies would
         // both grab the mic and double the audio going to Discord.
@@ -81,11 +85,11 @@ fn main() -> eframe::Result {
         });
     }
 
-    if let Some(dir) = eframe::storage_dir("MicClean") {
-        backup::run(&dir);
-    }
+    backup::run(&os::settings_dir());
     let hidden = std::env::args().any(|a| a == "--minimized");
     let options = eframe::NativeOptions {
+        // eframe's own default on Windows; on a Mac it would skip the data folder.
+        persistence_path: Some(os::settings_dir().join("app.ron")),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 720.0])
             // Below this, header rows (a picker or buttons beside the text) don't fit.
@@ -108,34 +112,7 @@ fn main() -> eframe::Result {
     )
 }
 
-/// One copy per Windows session: a named mutex in the session's own (Local\) namespace, so
-/// another Windows user (fast user switching, Remote Desktop) runs their own copy. The first
-/// copy keeps its handle until it exits; a later one closes its own at once, or it would keep
-/// the mutex alive after the first one has gone.
-fn first_copy() -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
-    use windows_sys::Win32::System::Threading::CreateMutexW;
-    let name: Vec<u16> = "Local\\MicClean\0".encode_utf16().collect();
-    // SAFETY: a NUL-terminated name that outlives the call; the handle is only closed here.
-    unsafe {
-        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        if !h.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
-            CloseHandle(h);
-            return false;
-        }
-    }
-    true
-}
-
-fn instance_port() -> u16 {
-    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-    let mut session = 0u32;
-    // SAFETY: writes one u32 into `session`.
-    unsafe { ProcessIdToSessionId(std::process::id(), &mut session) };
-    INSTANCE_PORT + (session % 100) as u16
-}
-
-/// Everything that survives a restart (eframe stores it in %APPDATA%\MicClean).
+/// Everything that survives a restart (eframe stores it in os::settings_dir).
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Saved {
@@ -447,21 +424,16 @@ struct Stats {
     lim_busy: f32,
 }
 
-/// What you listen on: Windows' default playback device, unless that's VB-Cable.
+/// What you listen on: the system's default playback device, unless that's the cable. (On
+/// Windows only VB-Cable's CABLE ends: Voicemeeter's "VB-Audio" outputs are real listening.)
 fn listen_device(outputs: &[String]) -> Option<String> {
-    audio::default_output_name()
-        .filter(|n| !n.contains("CABLE"))
-        .or_else(|| outputs.iter().find(|n| !n.contains("CABLE")).cloned())
+    let cable = |n: &String| if cfg!(windows) { n.contains("CABLE") } else { audio::is_cable(n) };
+    audio::default_output_name().filter(|n| !cable(n)).or_else(|| outputs.iter().find(|n| !cable(n)).cloned())
 }
 
 /// What echo cancellation can listen to: every app but MicClean (the default), or one device.
 fn echo_choices(outputs: &[String]) -> Vec<String> {
     std::iter::once(audio::EVERYTHING.to_string()).chain(outputs.iter().cloned()).collect()
-}
-
-/// Windows' classic Sound dialog, where Properties → Advanced sets a device's rate.
-fn open_sound_settings() {
-    let _ = std::process::Command::new(install::windows_exe(install::CONTROL)).arg("mmsys.cpl").spawn();
 }
 
 /// A box in the signal chain; clicking one opens its settings under the chain.
@@ -783,7 +755,7 @@ impl App {
             quitting: false,
             autostart: autostart::enabled(),
             updater: Default::default(),
-            installed: install::is_installed_copy(),
+            installed: os::installed_copy(),
             next_update_check: now + Duration::from_secs(3), // after the audio has started
             update_prompt: false,
             update_dismissed: None,
@@ -835,6 +807,7 @@ impl App {
             deep_error: None,
             rendering: None,
         };
+        #[cfg(windows)]
         if app.installed {
             if let Ok(old) = install::old_exe() {
                 let _ = std::fs::remove_file(old); // what the last update replaced
@@ -866,7 +839,7 @@ impl App {
         }
         if d.output.is_empty() {
             // VB-Cable's playback side is what Discord then picks up as "CABLE Output".
-            d.output = app.outputs.iter().find(|n| n.contains("CABLE Input")).cloned().unwrap_or_default();
+            d.output = app.outputs.iter().find(|n| n.contains(os::cable::SEND)).cloned().unwrap_or_default();
         }
         app.restart();
         app
@@ -1177,7 +1150,7 @@ impl App {
             return Some(("no_input", "Pick your mic".into(), "Setup walks you through it.".into(), Some(Fix::Setup)));
         }
         if d.output.is_empty() {
-            let desc = "Pick where the cleaned sound goes, like VB-Cable for Discord.".into();
+            let desc = format!("Pick where the cleaned sound goes, like {} for Discord.", os::cable::NAME);
             return Some(("no_output", "Nothing is being sent".into(), desc, Some(Fix::Setup)));
         }
         if self.engine.is_none() {
@@ -1201,10 +1174,10 @@ impl App {
         }
         if audio::is_cable(&d.input) && open("mic_cable") {
             let desc = "MicClean would hear its own output and loop it back. Pick your real mic in Setup.".into();
-            return Some(("mic_cable", "Your mic is set to VB-Cable".into(), desc, Some(Fix::Setup)));
+            return Some(("mic_cable", format!("Your mic is set to {}", os::cable::NAME), desc, Some(Fix::Setup)));
         }
         if self.clipping_until.is_some_and(|t| Instant::now() < t) && open("clipping") {
-            let desc = "It distorts before MicClean gets it, and nothing after can undo that. Turn down the gain knob on your mic or audio interface, or the mic level in Sound settings.".into();
+            let desc = format!("It distorts before MicClean gets it, and nothing after can undo that. Turn down the gain knob on your mic or audio interface, or the mic level in {}.", os::SOUND_SETTINGS);
             return Some(("clipping", "Your mic is clipping".into(), desc, Some(Fix::SoundSettings)));
         }
         if let Some((name, why)) = self.engine.as_ref().and_then(|e| e.failed.first())
@@ -1220,9 +1193,16 @@ impl App {
             let desc = format!("{name} isn't connected, so {what} is paused. It starts again when the device is back.");
             return Some(("missing", format!("{what} is paused"), desc, None));
         }
-        if d.monitor.is_some() && d.monitor == d.echo_ref && open("echo_monitor") {
+        // On a Mac "Everything you hear" can't leave MicClean out yet, so it hears Hear myself too.
+        let hears_monitor = d.monitor == d.echo_ref || (cfg!(not(windows)) && d.echo_ref.as_deref() == Some(audio::EVERYTHING));
+        if d.monitor.is_some() && hears_monitor && open("echo_monitor") {
+            let title = "Hear myself is cutting into your voice".into();
+            if cfg!(not(windows)) {
+                let desc = "Echo cancellation hears your own voice played back, and removes part of it. Turn off Hear myself (Output) while you talk.".into();
+                return Some(("echo_monitor", title, desc, None));
+            }
             let desc = "Echo cancellation hears your own voice played back on the same device, and removes part of it. \"Everything you hear\" leaves MicClean out.".into();
-            return Some(("echo_monitor", "Hear myself is cutting into your voice".into(), desc, Some(Fix::EchoEverything)));
+            return Some(("echo_monitor", title, desc, Some(Fix::EchoEverything)));
         }
         if let Some(why) = self.engine.as_ref().and_then(|e| e.shared_output.as_ref())
             && open("shared_output")
@@ -1234,7 +1214,7 @@ impl App {
         if let Some((name, r)) = names.iter().zip(self.rates).find_map(|(n, r)| Some((n.as_ref()?, r.filter(|&r| r != dsp::SR as u32)?)))
             && open("rate")
         {
-            let desc = format!("{name} runs at {r} Hz, which adds delay. In Sound settings, set it to 48000 Hz under Properties → Advanced.");
+            let desc = format!("{name} runs at {r} Hz, which adds delay. {}", os::SET_48K);
             return Some(("rate", "A device isn't at 48000 Hz".into(), desc, Some(Fix::SoundSettings)));
         }
         if s.voiced >= 300 && s.raw_peak < -42.0 && open("quiet") {
@@ -1264,7 +1244,7 @@ impl App {
                 Some(Fix::Setup) => "Open Setup",
                 Some(Fix::Restart) => "Restart",
                 Some(Fix::BypassOff) => "Turn it off",
-                Some(Fix::SoundSettings) => "Sound settings",
+                Some(Fix::SoundSettings) => os::SOUND_SETTINGS,
                 Some(Fix::Quieter) => "3 dB quieter",
                 Some(Fix::EchoEverything) => "Use Everything you hear",
                 None => "",
@@ -1280,7 +1260,7 @@ impl App {
             Some(Fix::Setup) => self.page = Page::Setup,
             Some(Fix::Restart) => self.restart(),
             Some(Fix::BypassOff) => self.saved.params.bypass = false,
-            Some(Fix::SoundSettings) => open_sound_settings(),
+            Some(Fix::SoundSettings) => os::sound_settings(),
             Some(Fix::Quieter) => {
                 let g = &mut self.saved.params.output_gain_db;
                 *g = (*g - 3.0).max(-20.0);
@@ -1380,7 +1360,8 @@ impl eframe::App for App {
         if let update::State::Available(r) = &st
             && self.update_dismissed.as_deref() != Some(&r.version)
         {
-            if self.saved.auto_update {
+            // On a Mac an update is a download you drag in, so it's never started for you.
+            if cfg!(windows) && self.saved.auto_update {
                 // Never in the middle of a sentence, nor while Smart setup, a recording, a learn
                 // or a playback is going.
                 let quiet = now - self.last_voice > Duration::from_secs(10);
@@ -1815,42 +1796,46 @@ impl App {
         });
 
         step(ui, 2, "Where it goes", !d.output.is_empty());
-        let cable = outputs.iter().find(|n| n.contains("CABLE Input")).cloned();
+        use os::cable;
+        let found = outputs.iter().find(|n| n.contains(cable::SEND)).cloned();
         ui::card(ui, |ui| {
-            ui::header(ui, icon::SPEAKERS, "Send to", "For Discord and other apps, VB-Cable's CABLE Input. They then use CABLE Output as their mic", |ui| {
+            let desc = if cable::SEND == cable::MIC {
+                format!("For Discord and other apps, {}. They then use it as their mic too", cable::MIC)
+            } else {
+                format!("For Discord and other apps, {}'s {}. They then use {} as their mic", cable::NAME, cable::SEND, cable::MIC)
+            };
+            ui::header(ui, icon::SPEAKERS, "Send to", &desc, |ui| {
                 pick(ui, "setup_out", &mut d.output, outputs);
             });
-            match &cable {
-                Some(c) if d.output != *c => ui::row(ui, "VB-Cable is installed", |ui| {
-                    if ui::accent_button(ui, true, "Use CABLE Input").clicked() {
+            match &found {
+                Some(c) if d.output != *c => ui::row(ui, cable::FOUND, |ui| {
+                    if ui::accent_button(ui, true, format!("Use {}", cable::SEND)).clicked() {
                         d.output.clone_from(c);
                     }
                 }),
-                None => ui::row(ui, "VB-Cable isn't installed (free)", |ui| {
+                None => ui::row(ui, cable::MISSING, |ui| {
                     refresh |= ui.button("Refresh list").clicked();
-                    if ui.button("Get VB-Cable").clicked() {
-                        let _ = std::process::Command::new(install::windows_exe("explorer.exe")).arg("https://vb-audio.com/Cable/").spawn();
+                    if ui.button(cable::GET).clicked() {
+                        cable::get();
                     }
                 }),
                 _ => {}
             }
+            if let Some(note) = cable::note() {
+                ui.label(RichText::new(note).small().color(p.text2));
+            }
+            refresh |= cable::just_installed();
             if let Some(r) = out_rate {
                 ui::row(ui, &format!("Runs at {r} Hz, set it to 48000"), |ui| {
-                    if ui.button("Sound settings").clicked() {
-                        open_sound_settings();
+                    if ui.button(os::SOUND_SETTINGS).clicked() {
+                        os::sound_settings();
                     }
                 });
             }
             // Open: without step 1 there, MicClean does nothing for Discord.
             egui::CollapsingHeader::new("Then in Discord").default_open(true).show(ui, |ui| {
-                for line in [
-                    "1. Voice & Video → Input Device: CABLE Output.",
-                    "2. Turn off Noise Suppression, Echo Cancellation and Automatic Gain Control. MicClean does these.",
-                    "3. Turn off Automatic Input Sensitivity and drag its slider all the way left. MicClean mutes between words.",
-                    "4. In Windows Sound settings, set CABLE Input and CABLE Output to 48000 Hz (Properties → Advanced).",
-                    "5. Windows Settings → System → Sound → your mic: Audio enhancements off.",
-                ] {
-                    ui.label(RichText::new(line).color(p.text2));
+                for line in cable::STEPS {
+                    ui.label(RichText::new(*line).color(p.text2));
                 }
             });
         });
@@ -2128,6 +2113,9 @@ impl App {
                             ui.close();
                         }
                     }
+                    if !plugins::SUPPORTED {
+                        return;
+                    }
                     if !missing.is_empty() {
                         ui.separator();
                     }
@@ -2170,6 +2158,9 @@ impl App {
 
     /// Settings' Plugins card: the search and its progress, and the folders it looks in.
     fn plugin_settings(&mut self, ui: &mut egui::Ui) {
+        if !plugins::SUPPORTED {
+            return;
+        }
         let p = ui::pal(ui);
         let progress = self.search_progress();
         let list = &self.saved.plugin_list;
@@ -2265,6 +2256,7 @@ impl App {
                         Some(Ok(_)) => (Change(fm.change_db), format!("{:+.1} dB", fm.change_db)),
                         Some(Err(_)) => (Empty, "didn't load".into()),
                         None if self.saved.plugins.iter().any(|e| e.key == key && e.crashed) => (Empty, "kept off".into()),
+                        None if !plugins::SUPPORTED => (Empty, "Windows only".into()),
                         None => (Empty, "loading".into()),
                     },
                     None => (Empty, String::new()),
@@ -2513,7 +2505,7 @@ impl App {
                     ui::setting(ui, icon::MIC, "Channel", desc, |ui| channel_pick(ui, &mut d.input_channel, in_channels));
                 }
                 if let Some(r) = off_rate(0) {
-                    let desc = "MicClean converts it to 48000 Hz. Setting the device to 48000 Hz in Windows skips that step";
+                    let desc = &format!("MicClean converts it to 48000 Hz. Setting the device to 48000 Hz in {} skips that step", os::SOUND_SETTINGS);
                     rate_note(ui, &d.input, r, desc);
                 }
                 ui::group(ui, icon::MIC, "Input gain", "Boost or cut the input before anything else", None, |ui| {
@@ -2714,6 +2706,9 @@ impl App {
                             (None, _) => {
                                 ui.label("This plugin isn't in your settings any more. Remove it, then add it again.");
                             }
+                            _ if !plugins::SUPPORTED => {
+                                ui.label("Plugins run on Windows only for now, so it stays off here.");
+                            }
                             _ => {
                                 ui.label("Loading…");
                             }
@@ -2762,11 +2757,13 @@ impl App {
                 ui.label(RichText::new("Working on every word sounds like clipping: turn Loudness down (Home or Output).").small().color(p.text2));
             }),
             Node::Output => {
-                ui::setting(ui, icon::SPEAKERS, "Send to", "Where the cleaned sound goes. For Discord or other apps, pick CABLE Input; they then use CABLE Output as their mic", |ui| {
+                let desc = format!("Where the cleaned sound goes. For Discord or other apps, pick {}; they then use {} as their mic", os::cable::SEND, os::cable::MIC);
+                ui::setting(ui, icon::SPEAKERS, "Send to", &desc, |ui| {
                     refresh |= refresh_button(ui);
                     pick(ui, "out", &mut d.output, outputs);
                 });
-                let convert = "Windows converts MicClean's 48000 Hz for it, which adds delay. Set it to 48000 Hz in Sound settings (Properties → Advanced)";
+                let system = if cfg!(windows) { "Windows" } else { "macOS" };
+                let convert = &format!("{system} converts MicClean's 48000 Hz for it, which adds delay. {}", os::SET_48K);
                 if let Some(r) = off_rate(1) {
                     rate_note(ui, &d.output, r, convert);
                 }
@@ -2909,9 +2906,10 @@ impl App {
                 Err(e) => format!("Couldn't back up: {e}"),
             };
         }
-        if open && let Some(dir) = backup::dir() {
+        if open {
+            let dir = backup::dir();
             let _ = std::fs::create_dir_all(&dir);
-            let _ = std::process::Command::new(install::windows_exe("explorer.exe")).arg(dir).spawn();
+            os::open(dir);
         }
         if let Some(b) = restore {
             self.load_settings_file(&b);
@@ -2952,13 +2950,17 @@ impl App {
     /// Shown in Setup and Settings.
     fn autostart_row(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
-        let desc = "Opens hidden in the tray when you sign in, so Discord never listens to a silent cable";
-        ui::setting(ui, icon::POWER, "Start with Windows", desc, |ui| {
+        let desc = format!("Opens hidden in the {} when you sign in, so Discord never listens to a silent cable", os::TRAY);
+        ui::setting(ui, icon::POWER, os::AUTOSTART, &desc, |ui| {
             changed = ui::toggle(ui, &mut self.autostart).changed();
         });
         if changed && !autostart::set(self.autostart) {
             self.autostart = autostart::enabled();
-            self.status = "Couldn't change the Windows startup entry.".into();
+            self.status = if cfg!(windows) || self.installed {
+                "Couldn't change the startup entry.".into()
+            } else {
+                "Move MicClean into Applications first, then turn this on.".into()
+            };
         }
     }
 
@@ -2992,21 +2994,16 @@ impl App {
         self.backups(ui);
         self.updates(ui);
         let mut show_log = false;
-        ui::setting(ui, icon::FOLDER, "Log file", "Device errors, glitches, restarts and updates, for troubleshooting. It stays on this PC", |ui| {
+        let desc = format!("Device errors, glitches, restarts and updates, for troubleshooting. It stays on {}", os::THIS_PC);
+        ui::setting(ui, icon::FOLDER, "Log file", &desc, |ui| {
             show_log = ui.button("Show in folder").clicked();
         });
         if show_log {
-            use std::os::windows::process::CommandExt;
-            // raw_arg: explorer wants /select,"path" exactly, which normal argument quoting breaks.
-            let _ = std::process::Command::new(install::windows_exe("explorer.exe")).raw_arg(format!("/select,\"{}\"", logfile::path().display())).spawn();
+            os::reveal(&logfile::path());
         }
-        ui::setting(
-            ui,
-            icon::INFO,
-            "About MicClean",
-            &format!("Version {}. Closing the window keeps it running in the tray. Right-click the tray icon to quit", update::VERSION),
-            |_| {},
-        );
+        let quit = if cfg!(windows) { "Right-click the tray icon to quit" } else { "Click its menu bar icon to quit" };
+        let desc = format!("Version {}. Closing the window keeps it running in the {}. {quit}", update::VERSION, os::TRAY);
+        ui::setting(ui, icon::INFO, "About MicClean", &desc, |_| {});
         ui::setting(ui, icon::INFO, "Open-source licenses", "MicClean is built with these libraries", |ui| {
             self.show_notices |= ui.button("View").clicked();
         });
@@ -3054,19 +3051,21 @@ impl App {
             ui.set_width(360.0);
             ui.label(RichText::new(format!("MicClean {} is available", r.version)).font(ui::semibold(18.0)));
             ui.add_space(4.0);
-            ui.label(RichText::new(format!("You have {}. Updating closes MicClean for a few seconds, so your voice drops out briefly.", update::VERSION)).color(p.text2));
+            ui.label(RichText::new(format!("You have {}. {}", update::VERSION, update::HOW)).color(p.text2));
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui::toggle(ui, &mut auto);
-                ui.label("Update automatically from now on");
-            });
+            if cfg!(windows) {
+                ui.horizontal(|ui| {
+                    ui::toggle(ui, &mut auto);
+                    ui.label("Update automatically from now on");
+                });
+            }
             ui.horizontal(|ui| {
                 ui::toggle(ui, &mut quiet);
                 ui.label("Don't show this popup again");
             });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                now = ui::accent_button(ui, true, "Update now").clicked();
+                now = ui::accent_button(ui, true, if cfg!(windows) { "Update now" } else { "Download" }).clicked();
                 later = ui.button("Later").clicked();
             });
         });
@@ -3094,7 +3093,7 @@ impl App {
             State::Idle => format!("You have {}", update::VERSION),
             State::Checking => "Checking GitHub...".into(),
             State::UpToDate => format!("You're up to date ({})", update::VERSION),
-            State::Available(r) => format!("Version {} is available. Installing closes MicClean for a few seconds, so your voice drops out briefly", r.version),
+            State::Available(r) => format!("Version {} is available. {}", r.version, update::HOW.trim_end_matches('.')),
             State::Installing => "Downloading and installing. MicClean restarts by itself".into(),
             State::Restarting => "Restarting into the new version".into(),
             State::Failed(e) => format!("Couldn't update: {e}"),
@@ -3103,7 +3102,8 @@ impl App {
         let installed = self.installed;
         ui::setting(ui, icon::REFRESH, "Updates", &desc, |ui| match &st {
             State::Available(r) if installed => {
-                if ui::accent_button(ui, true, &format!("Update to {}", r.version)).clicked() {
+                let verb = if cfg!(windows) { "Update to" } else { "Download" };
+                if ui::accent_button(ui, true, &format!("{verb} {}", r.version)).clicked() {
                     install_rel = Some(r.clone());
                 }
             }
@@ -3119,9 +3119,11 @@ impl App {
         ui::setting(ui, icon::INFO, "Show a popup when there's an update", "Off: the Updates card above still shows it", |ui| {
             ui::toggle(ui, &mut popup_on);
         });
-        ui::setting(ui, icon::REFRESH, "Install updates automatically", "Waits until you aren't talking, then closes MicClean for a few seconds", |ui| {
-            ui::toggle(ui, &mut self.saved.auto_update);
-        });
+        if cfg!(windows) {
+            ui::setting(ui, icon::REFRESH, "Install updates automatically", "Waits until you aren't talking, then closes MicClean for a few seconds", |ui| {
+                ui::toggle(ui, &mut self.saved.auto_update);
+            });
+        }
         (self.saved.update_check_off, self.saved.update_popup_off) = (!check_on, !popup_on);
         if let Some(r) = install_rel {
             self.start_update(r);
@@ -3237,55 +3239,6 @@ const ICON: u32 = appicon::SIZE;
 
 fn icon_rgba(open: bool) -> Vec<u8> {
     appicon::rgba(open, ICON)
-}
-
-/// "Start with Windows" = a value under the per-user Run key, written with reg.exe.
-mod autostart {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    fn reg(args: &[&str]) -> bool {
-        Command::new(crate::install::windows_exe(crate::install::REG))
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-
-    pub fn enabled() -> bool {
-        reg(&["query", KEY, "/v", "MicClean"])
-    }
-
-    pub fn set(on: bool) -> bool {
-        if !on {
-            return reg(&["delete", KEY, "/v", "MicClean", "/f"]);
-        }
-        let Ok(exe) = std::env::current_exe() else { return false };
-        let cmd = format!("\"{}\" --minimized", exe.display());
-        reg(&["add", KEY, "/v", "MicClean", "/t", "REG_SZ", "/d", &cmd, "/f"])
-    }
-
-    #[cfg(test)]
-    mod tests {
-        /// Touches the real Run key, so opt-in: `cargo test -- --ignored`. Restores what was there.
-        #[test]
-        #[ignore]
-        fn run_entry_is_quoted() {
-            let before = super::enabled();
-            assert!(super::set(true));
-            let out = super::Command::new(crate::install::windows_exe(crate::install::REG)).args(["query", super::KEY, "/v", "MicClean"]).output().unwrap();
-            let text = String::from_utf8_lossy(&out.stdout).to_string();
-            super::set(before);
-            let exe = std::env::current_exe().unwrap();
-            assert!(text.contains(&format!("\"{}\" --minimized", exe.display())), "{text}");
-            assert_eq!(super::enabled(), before);
-        }
-    }
 }
 
 #[cfg(test)]

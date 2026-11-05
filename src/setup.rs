@@ -7,16 +7,31 @@
 //! to close, install, then start whatever MicClean is in place, the new one or (if installing
 //! failed) the old one, so an update never leaves you without your mic. Every step goes to
 //! micclean.log, since nobody sees a silent setup.
+//!
+//! Windows only: a Mac gets MicClean.app in a .dmg instead (build-mac.sh), so there this is
+//! an empty program.
 
+#[cfg(windows)]
 mod install;
+#[cfg(windows)]
 mod logfile;
+#[cfg(windows)]
+#[allow(dead_code, unused_imports)] // setup only needs the app folder, for the log
+mod os;
 
+#[cfg(windows)]
 use std::io::{Read, Seek, SeekFrom};
 
+#[cfg(windows)]
 const MAGIC: &[u8; 8] = b"MCPAYLD1";
+#[cfg(windows)]
 const TITLE: &str = "MicClean Setup";
 
+#[cfg(not(windows))]
+fn main() {}
+
 /// The appended micclean.exe: [exe bytes][length: u64 LE][MAGIC].
+#[cfg(windows)]
 fn payload() -> Result<Vec<u8>, String> {
     let es = |e: std::io::Error| e.to_string();
     let mut f = std::fs::File::open(std::env::current_exe().map_err(es)?).map_err(es)?;
@@ -34,6 +49,7 @@ fn payload() -> Result<Vec<u8>, String> {
     Ok(exe)
 }
 
+#[cfg(windows)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let flag = |f: &str| args.iter().any(|a| a == f);

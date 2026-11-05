@@ -31,9 +31,20 @@ sonora = "0.2"
 sonora-aec3 = "0.2" # the echo canceller's tuning (sonora is patched to take it, see below)
 tray-icon = "0.26.1"
 vst3 = "0.3"
+
+[target.'cfg(windows)'.dependencies]
 wasapi = "0.26"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+windows ={ version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# egui's symbol fonts (0.7 MB): a Mac has no Segoe Fluent Icons, so the icons are symbols.
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+libc = "0.2" # local time, thread priority, user id
+
+[dev-dependencies]
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] } # the Mac icon test
+png = "0.18" # writes the Mac app icon (assets/micclean.icns), in a test like the .ico
 
 # sonora with one change: AudioProcessingBuilder::aec3_config, so MicClean can tune the echo
 # canceller's suppressor (sonora only exposes transparent mode). Each change is marked

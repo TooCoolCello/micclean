@@ -1,6 +1,7 @@
 # MicClean
 
-A small Windows app that cleans up your microphone before Discord (or anything else) hears it.
+A small Windows and Mac app that cleans up your microphone before Discord (or anything else) hears it.
+The Mac version is new and untested so far; it has everything except plugins and one-click updates.
 
 - Noise removal (RNNoise) and echo cancellation (WebRTC AEC3, for speakers or open-back headphones).
   Echo cancellation can listen to everything you hear except MicClean, so hearing yourself doesn't
@@ -31,11 +32,22 @@ newest copy.
 Windows will probably show "Windows protected your PC" because the installer isn't code-signed.
 Choose More info, then Run anyway. The checksum for each download is published next to it.
 
+On a Mac (macOS 14.2 or later), download `MicClean.dmg`, open it and drag MicClean into Applications.
+The app isn't signed with an Apple Developer ID, so the first time macOS refuses to open it: go to
+System Settings → Privacy & Security and choose Open Anyway. It then asks for the microphone, and for
+system audio recording if you turn on echo cancellation. Settings live in
+`~/Library/Application Support/MicClean`. New versions show up in Settings as a download.
+
 ## Use it with Discord
 
 MicClean sends its output to a virtual cable. Install the free [VB-Cable](https://vb-audio.com/Cable/)
 (not bundled, its license doesn't allow that), then click the Output box in the signal chain and
 follow its "Using it with Discord" steps.
+
+On a Mac, MicClean brings its own virtual device, "MicClean": Setup's Install button adds it (macOS asks
+for your password once, and all sound pauses for a moment while Core Audio restarts). Then pick
+MicClean as Discord's mic. To remove the device later:
+`sudo rm -rf /Library/Audio/Plug-Ins/HAL/MicClean.driver && sudo killall coreaudiod`.
 
 ## Build
 
@@ -46,10 +58,19 @@ cargo test
 ./build-installer.ps1      # dist\MicClean-Setup.exe
 ```
 
+On a Mac (Xcode command line tools, `rustup target add aarch64-apple-darwin x86_64-apple-darwin`):
+
+```
+cargo test
+bash build-mac.sh          # dist/MicClean.dmg, Apple Silicon and Intel
+```
+
 `licenses.ps1` rewrites `THIRD-PARTY-NOTICES.txt` (shown in Settings) from the license files of every
 library in the exe. `build-installer.ps1` runs it; run it yourself after changing dependencies.
 
-A release is built by pushing a tag that matches the version in `Cargo.toml`, e.g. `git tag v0.2.0 && git push --tags`.
+A release (both installers) is built by pushing a tag that matches the version in `Cargo.toml`, e.g.
+`git tag v0.2.0 && git push --tags`. Running the Release workflow by hand builds both as artifacts without
+publishing.
 
 ## About this code
 

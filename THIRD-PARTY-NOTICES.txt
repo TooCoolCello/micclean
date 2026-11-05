@@ -5,7 +5,7 @@ MicClean is built with the libraries below. Each license text appears once, afte
 libraries it covers.
 
 ------------------------------------------------------------------------
-adler2 2.0.1, anyhow 1.0.104, clap-sys 0.5.0, com-scrape-types 0.1.1, dyn-clone 1.0.20, enumn 0.1.14, glow 0.17.0, itoa 1.0.18, lazy_static 1.5.1, minimal-lexical 0.2.1, once_cell 1.21.4, paste 1.0.15, pin-project-lite 0.2.17, portable-atomic 1.15.0, portable-atomic-util 0.2.8, proc-macro2 1.0.107, quote 1.0.47, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, smol_str 0.2.2, syn 1.0.109, syn 2.0.119, syn 3.0.9, thiserror 1.0.69, thiserror 2.0.21, thiserror-impl 1.0.69, thiserror-impl 2.0.21, tract-core 0.19.16, tract-data 0.19.16, tract-hir 0.19.16, tract-linalg 0.19.16, tract-nnef 0.19.16, tract-onnx 0.19.16, tract-onnx-opl 0.19.16, tract-pulse 0.19.16, tract-pulse-opl 0.19.16, typeid 1.0.3, unicode-ident 1.0.27, vst3 0.3.0, zmij 1.0.23
+adler2 2.0.1, anyhow 1.0.104, clap-sys 0.5.0, com-scrape-types 0.1.1, dyn-clone 1.0.20, enumn 0.1.14, glow 0.17.0, itoa 1.0.18, lazy_static 1.5.1, minimal-lexical 0.2.1, once_cell 1.21.4, paste 1.0.15, pin-project-lite 0.2.17, portable-atomic 1.15.0, portable-atomic-util 0.2.8, proc-macro2 1.0.107, quote 1.0.47, rustix 1.1.6, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, smol_str 0.2.2, syn 1.0.109, syn 2.0.119, syn 3.0.9, thiserror 1.0.69, thiserror 2.0.21, thiserror-impl 1.0.69, thiserror-impl 2.0.21, tract-core 0.19.16, tract-data 0.19.16, tract-hir 0.19.16, tract-linalg 0.19.16, tract-nnef 0.19.16, tract-onnx 0.19.16, tract-onnx-opl 0.19.16, tract-pulse 0.19.16, tract-pulse-opl 0.19.16, typeid 1.0.3, unicode-ident 1.0.27, vst3 0.3.0, zmij 1.0.23
 ------------------------------------------------------------------------
 
 Permission is hereby granted, free of charge, to any
@@ -420,6 +420,36 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
+cgl 0.3.2, core-foundation 0.9.4, core-foundation-sys 0.8.7, core-graphics 0.23.2, core-graphics-types 0.1.3, euclid 0.22.14
+------------------------------------------------------------------------
+
+Copyright (c) 2012-2013 Mozilla Foundation
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
 clap 3.2.25, clap_lex 0.2.4
 ------------------------------------------------------------------------
 
@@ -468,6 +498,36 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+------------------------------------------------------------------------
+coreaudio-rs 0.14.2, either 1.19.0, itertools 0.10.5, itertools 0.15.0, maplit 1.0.2, rawpointer 0.2.1
+------------------------------------------------------------------------
+
+Copyright (c) 2015
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
 cpal 0.18.2, hound 3.5.1, self_cell 1.3.0
@@ -1372,36 +1432,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ------------------------------------------------------------------------
-either 1.19.0, itertools 0.10.5, itertools 0.15.0, maplit 1.0.2, rawpointer 0.2.1
-------------------------------------------------------------------------
-
-Copyright (c) 2015
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-------------------------------------------------------------------------
 epaint_default_fonts 0.37.0
 ------------------------------------------------------------------------
 
@@ -1678,10 +1708,10 @@ FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER
 DEALINGS IN THE FONT SOFTWARE.
 
 ------------------------------------------------------------------------
-euclid 0.22.14
+errno 0.3.14
 ------------------------------------------------------------------------
 
-Copyright (c) 2012-2013 Mozilla Foundation
+Copyright (c) 2014 Chris Wong
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -1850,6 +1880,30 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
+foreign-types 0.5.0, foreign-types-macros 0.2.4, foreign-types-shared 0.3.1
+------------------------------------------------------------------------
+
+Copyright (c) 2017 The foreign-types Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ------------------------------------------------------------------------
 generic-array 0.14.7
@@ -2306,6 +2360,36 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ------------------------------------------------------------------------
+libc 0.2.191
+------------------------------------------------------------------------
+
+Copyright (c) The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
 libloading 0.8.9
 ------------------------------------------------------------------------
 
@@ -2590,6 +2674,36 @@ litrs 1.0.1
 ------------------------------------------------------------------------
 
 Copyright (c) 2020 Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
+mach2 0.6.0
+------------------------------------------------------------------------
+
+Copyright (c) 2019 Nick Fitzgerald, 2021 Yuki Okushi
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -4682,6 +4796,36 @@ MIT License
     SOFTWARE
 
 ------------------------------------------------------------------------
+xattr 1.7.0
+------------------------------------------------------------------------
+
+Copyright (c) 2015 Steven Allen
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
 zerocopy 0.8.63, zerocopy-derive 0.8.63
 ------------------------------------------------------------------------
 
@@ -4742,8 +4886,11 @@ where MIT isn't offered, the Apache License 2.0 text above).
 
 accesskit 0.25.2 (MIT OR Apache-2.0): Copyright (c) The AccessKit contributors
 accesskit_consumer 0.39.2 (MIT OR Apache-2.0): Copyright (c) The AccessKit contributors
+accesskit_macos 0.27.2 (MIT OR Apache-2.0): Copyright (c) The AccessKit contributors
 accesskit_windows 0.35.2 (MIT OR Apache-2.0): Copyright (c) The AccessKit contributors
 accesskit_winit 0.34.2 (Apache-2.0): Copyright (c) The AccessKit contributors
+block2 0.5.1 (MIT): Copyright (c) Steven Sheldon, Mads Marquart <mads@marquart.dk>
+block2 0.6.2 (MIT): Copyright (c) Mads Marquart <mads@marquart.dk>
 dasp 0.11.0 (MIT OR Apache-2.0): Copyright (c) mitchmindtree <mitchell.nordine@gmail.com>
 dasp_envelope 0.11.0 (MIT OR Apache-2.0): Copyright (c) mitchmindtree <mitchell.nordine@gmail.com>
 dasp_frame 0.11.0 (MIT OR Apache-2.0): Copyright (c) mitchmindtree <mitchell.nordine@gmail.com>
@@ -4755,6 +4902,8 @@ dasp_sample 0.11.0 (MIT OR Apache-2.0): Copyright (c) mitchmindtree <mitchell.no
 dasp_signal 0.11.0 (MIT OR Apache-2.0): Copyright (c) mitchmindtree <mitchell.nordine@gmail.com>
 dasp_slice 0.11.0 (MIT OR Apache-2.0): Copyright (c) mitchmindtree <mitchell.nordine@gmail.com>
 dasp_window 0.11.1 (MIT OR Apache-2.0): Copyright (c) mitchmindtree <mitchell.nordine@gmail.com>
+dispatch 0.2.0 (MIT): Copyright (c) Steven Sheldon
+dispatch2 0.3.1 (Zlib OR Apache-2.0 OR MIT): Copyright (c) Mads Marquart <mads@marquart.dk>, Mary <mary@mary.zone>
 ecolor 0.37.0 (MIT OR Apache-2.0): Copyright (c) Emil Ernerfeldt <emil.ernerfeldt@gmail.com>, Andreas Reich <reichandreas@gmx.de>
 eframe 0.37.0 (MIT OR Apache-2.0): Copyright (c) Emil Ernerfeldt <emil.ernerfeldt@gmail.com>
 egui 0.37.0 (MIT OR Apache-2.0): Copyright (c) Emil Ernerfeldt <emil.ernerfeldt@gmail.com>
@@ -4763,6 +4912,23 @@ egui-winit 0.37.0 (MIT OR Apache-2.0): Copyright (c) Emil Ernerfeldt <emil.erner
 emath 0.37.0 (MIT OR Apache-2.0): Copyright (c) Emil Ernerfeldt <emil.ernerfeldt@gmail.com>
 epaint 0.37.0 (MIT OR Apache-2.0): Copyright (c) Emil Ernerfeldt <emil.ernerfeldt@gmail.com>
 epaint_default_fonts 0.37.0 ((MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0): Copyright (c) Emil Ernerfeldt <emil.ernerfeldt@gmail.com>
+objc-sys 0.3.5 (MIT): Copyright (c) Mads Marquart <mads@marquart.dk>
+objc2 0.5.3 (MIT): Copyright (c) Steven Sheldon, Mads Marquart <mads@marquart.dk>
+objc2 0.6.5 (MIT): Copyright (c) Mads Marquart <mads@marquart.dk>
+objc2-app-kit 0.2.2 (MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-app-kit 0.3.2 (Zlib OR Apache-2.0 OR MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-audio-toolbox 0.3.2 (Zlib OR Apache-2.0 OR MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-core-audio 0.3.2 (Zlib OR Apache-2.0 OR MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-core-audio-types 0.3.2 (Zlib OR Apache-2.0 OR MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-core-data 0.2.2 (MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-core-foundation 0.3.2 (Zlib OR Apache-2.0 OR MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-core-graphics 0.3.2 (Zlib OR Apache-2.0 OR MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-core-image 0.2.2 (MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-encode 4.1.0 (MIT): Copyright (c) Mads Marquart <mads@marquart.dk>
+objc2-foundation 0.2.2 (MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-foundation 0.3.2 (MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-metal 0.2.2 (MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
+objc2-quartz-core 0.2.2 (MIT): Copyright (c) its authors (https://github.com/madsmtm/objc2)
 profiling 1.0.18 (MIT OR Apache-2.0): Copyright (c) Philip Degarmo <aclysma@gmail.com>
 
 MIT License

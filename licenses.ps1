@@ -4,24 +4,30 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-# As hashtables: some crates have features whose names differ only in case (educe's Default
-# and default), which plain ConvertFrom-Json refuses. Each package becomes an object again.
-$meta = cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json -AsHashtable
-if ($LASTEXITCODE) { throw "cargo metadata failed" }
-$pkgs = @{}; foreach ($p in $meta.packages) { $pkgs[$p.id] = [pscustomobject]$p }
-$deps = @{}; foreach ($n in $meta.resolve.nodes) { $deps[$n.id] = $n.deps }
+# The Windows exe and the Mac app (both of its halves) share this one file, so it lists what
+# any of them ships.
+$pkgs = @{}; $shipped = @{}
+foreach ($platform in 'x86_64-pc-windows-msvc', 'aarch64-apple-darwin', 'x86_64-apple-darwin') {
+    # As hashtables: some crates have features whose names differ only in case (educe's Default
+    # and default), which plain ConvertFrom-Json refuses. Each package becomes an object again.
+    $meta = cargo metadata --format-version 1 --locked --filter-platform $platform | ConvertFrom-Json -AsHashtable
+    if ($LASTEXITCODE) { throw "cargo metadata failed" }
+    foreach ($p in $meta.packages) { $pkgs[$p.id] = [pscustomobject]$p }
+    $deps = @{}; foreach ($n in $meta.resolve.nodes) { $deps[$n.id] = $n.deps }
 
-# Normal dependencies only: build scripts and tests don't end up in the exe.
-$root = ($pkgs.Values | Where-Object name -eq 'micclean').id
-$shipped = @{}
-$todo = [Collections.Generic.Queue[string]]::new()
-$todo.Enqueue($root)
-while ($todo.Count) {
-    $id = $todo.Dequeue()
-    if ($shipped.ContainsKey($id)) { continue }
-    $shipped[$id] = $true
-    foreach ($d in $deps[$id]) {
-        if ($d.dep_kinds | Where-Object { -not $_.kind }) { $todo.Enqueue($d.pkg) }
+    # Normal dependencies only: build scripts and tests don't end up in the exe.
+    $root = ($pkgs.Values | Where-Object name -eq 'micclean').id
+    $seen = @{}
+    $todo = [Collections.Generic.Queue[string]]::new()
+    $todo.Enqueue($root)
+    while ($todo.Count) {
+        $id = $todo.Dequeue()
+        if ($seen.ContainsKey($id)) { continue }
+        $seen[$id] = $true
+        $shipped[$id] = $true
+        foreach ($d in $deps[$id]) {
+            if ($d.dep_kinds | Where-Object { -not $_.kind }) { $todo.Enqueue($d.pkg) }
+        }
     }
 }
 $shipped.Remove($root)

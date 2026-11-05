@@ -9,8 +9,56 @@ use std::sync::{Arc, OnceLock};
 
 static ACCENT: OnceLock<Color32> = OnceLock::new();
 
+#[cfg(windows)]
+pub use segoe as icon;
+#[cfg(not(windows))]
+pub use symbols as icon;
+
+/// The same icons as Unicode symbols, for a Mac (no Segoe there). egui's built-in fonts have
+/// every one (a test checks).
+#[cfg_attr(windows, allow(dead_code))]
+pub mod symbols {
+    pub const HOME: &str = "🏠";
+    pub const MIC: &str = "🎤";
+    pub const SPEAKERS: &str = "🔊";
+    pub const HEADPHONE: &str = "🎧";
+    pub const VOLUME: &str = "🔉";
+    pub const MUTE: &str = "🔇";
+    pub const LEARN: &str = "🎓";
+    pub const EQ: &str = "📊";
+    pub const RECORD: &str = "⏺";
+    pub const PLAY: &str = "▶";
+    pub const STOP: &str = "⏹";
+    pub const SETTINGS: &str = "⚙";
+    pub const DELETE: &str = "🗑";
+    pub const REFRESH: &str = "🔄";
+    pub const INFO: &str = "ℹ";
+    pub const MUSIC: &str = "🎵";
+    pub const POWER: &str = "🔌";
+    pub const MENU: &str = "☰";
+    pub const CLOSE: &str = "✖";
+    pub const WARNING: &str = "⚠";
+    pub const FOLDER: &str = "📁";
+    pub const SMART: &str = "💡";
+    pub const SETUP: &str = "🔧";
+    pub const CHECK: &str = "✔";
+    pub const CHEVRON_DOWN: &str = "⏷";
+    pub const CHEVRON_UP: &str = "⏶";
+    pub const ADD: &str = "➕";
+    pub const CHEVRON_RIGHT: &str = "⏵";
+
+    #[cfg(test)]
+    pub fn all() -> [&'static str; 28] {
+        [
+            HOME, MIC, SPEAKERS, HEADPHONE, VOLUME, MUTE, LEARN, EQ, RECORD, PLAY, STOP, SETTINGS, DELETE, REFRESH, INFO, MUSIC, POWER, MENU, CLOSE,
+            WARNING, FOLDER, SMART, SETUP, CHECK, CHEVRON_DOWN, CHEVRON_UP, ADD, CHEVRON_RIGHT,
+        ]
+    }
+}
+
 /// Segoe Fluent Icons code points.
-pub mod icon {
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod segoe {
     pub const HOME: &str = "\u{E80F}";
     pub const MIC: &str = "\u{E720}";
     pub const SPEAKERS: &str = "\u{E7F5}";
@@ -116,14 +164,16 @@ pub fn pal_ctx(ctx: &egui::Context) -> Palette {
     Palette::of(ctx.theme() == egui::Theme::Dark)
 }
 
-/// Fonts, accent and both palettes. Fonts come from C:\Windows\Fonts, so nothing is bundled.
+/// Fonts, accent and both palettes. Fonts come from the system (C:\Windows\Fonts, or the Mac's
+/// /System/Library/Fonts), so nothing is bundled; a missing one falls back to egui's own.
 pub fn install(ctx: &egui::Context) {
     let _ = ACCENT.set(system_accent().unwrap_or(Color32::from_rgb(0, 120, 212)));
 
     let mut fonts = FontDefinitions::default();
     let fallback = fonts.families[&FontFamily::Proportional].clone();
+    let dir = if cfg!(windows) { r"C:\Windows\Fonts" } else { "/System/Library/Fonts" };
     let mut add = |key: &str, files: &[&str]| -> Vec<String> {
-        let found = files.iter().find_map(|f| std::fs::read(format!(r"C:\Windows\Fonts\{f}")).ok());
+        let found = files.iter().find_map(|f| std::fs::read(std::path::Path::new(dir).join(f)).ok());
         let mut list = fallback.clone();
         if let Some(bytes) = found {
             fonts.font_data.insert(key.into(), Arc::new(FontData::from_owned(bytes)));
@@ -131,9 +181,12 @@ pub fn install(ctx: &egui::Context) {
         }
         list
     };
-    // Windows 10 lacks the Win11 files; the older Segoe ones look nearly the same.
-    let body = add("ui", &["SegUIVar.ttf", "segoeui.ttf"]);
-    let semibold = add("semibold", &["seguisb.ttf"]);
+    // Windows 10 lacks the Win11 files; the older Segoe ones look nearly the same. On a Mac the
+    // icons are plain Unicode symbols (see `icon`), which egui's built-in fonts draw.
+    // ponytail: SF Pro is one variable file and egui draws its default (regular) weight, so Mac
+    // headings aren't semibold.
+    let body = add("ui", &["SegUIVar.ttf", "segoeui.ttf", "SFNS.ttf"]);
+    let semibold = add("semibold", &["seguisb.ttf", "SFNS.ttf"]);
     let icons = add("icons", &["SegoeIcons.ttf", "segmdl2.ttf"]);
     fonts.families.insert(FontFamily::Proportional, body);
     fonts.families.insert(FontFamily::Name("semibold".into()), semibold);
@@ -192,7 +245,20 @@ pub fn install(ctx: &egui::Context) {
     }
 }
 
+/// The Mac's default blue.
+// ponytail: ignores a picked accent colour (System Settings → Appearance); read AppleAccentColor
+// if someone asks.
+#[cfg(not(windows))]
+fn system_accent() -> Option<Color32> {
+    Some(Color32::from_rgb(0, 122, 255))
+}
+
+/// macOS draws its own title bar, in the system's light or dark look.
+#[cfg(not(windows))]
+pub fn title_bar(_hwnd: isize, _dark: bool) {}
+
 /// Windows' accent colour (HKCU\...\DWM\AccentColor is 0xAABBGGRR).
+#[cfg(windows)]
 fn system_accent() -> Option<Color32> {
     use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
     let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
@@ -213,6 +279,7 @@ fn system_accent() -> Option<Color32> {
 }
 
 /// Dark/light title bar, painted the same colour as the window so it reads as one surface.
+#[cfg(windows)]
 pub fn title_bar(hwnd: isize, dark: bool) {
     use windows_sys::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
     let bg = Palette::of(dark).bg;
@@ -399,4 +466,18 @@ pub fn nav_item(ui: &mut Ui, icon: &str, label: &str, selected: bool, compact: b
         painter.text(Pos2::new(rect.left() + 48.0, y), egui::Align2::LEFT_CENTER, label, FontId::proportional(14.0), p.text);
     }
     if compact { resp.on_hover_text(label) } else { resp }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Mac has no Segoe: every icon there must come from egui's built-in fonts.
+    #[test]
+    fn mac_icons_are_in_eguis_own_fonts() {
+        let mut fonts = egui::epaint::text::Fonts::new(Default::default(), FontDefinitions::default());
+        assert!(fonts.has_glyphs(&FontId::proportional(14.0), "a"), "fonts not loaded");
+        let missing: Vec<&str> = symbols::all().into_iter().filter(|i| !fonts.has_glyphs(&FontId::proportional(14.0), i)).collect();
+        assert!(missing.is_empty(), "no glyph for {missing:?}");
+    }
 }
