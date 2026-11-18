@@ -5,6 +5,13 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// A test build, made with MICCLEAN_TEST_FEED=<folder> set while compiling, updates from that
+/// folder (a `vpk pack` output) instead of GitHub. It is a separate app beside the real one:
+/// its own NAME (so its own settings, one-copy lock, Velopack install and Start menu entry),
+/// it never opens an audio device and never starts at sign-in. Release builds have no feed.
+pub const TEST_FEED: Option<&str> = option_env!("MICCLEAN_TEST_FEED");
+pub const NAME: &str = if TEST_FEED.is_some() { "MicCleanTest" } else { "MicClean" };
+
 /// %APPDATA%\MicClean on Windows, ~/Library/Application Support/MicClean on a Mac: the log,
 /// backups and update notes. The settings live in its data folder.
 pub fn app_dir() -> PathBuf {
@@ -12,7 +19,7 @@ pub fn app_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default();
     #[cfg(not(windows))]
     let base = std::env::home_dir().unwrap_or_default().join("Library").join("Application Support");
-    base.join("MicClean")
+    base.join(NAME)
 }
 
 /// Where eframe keeps app.ron. eframe's own choice is this on Windows but the bare app folder
@@ -39,7 +46,7 @@ mod imp {
     pub fn first_copy() -> bool {
         use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
         use windows_sys::Win32::System::Threading::CreateMutexW;
-        let name: Vec<u16> = "Local\\MicClean\0".encode_utf16().collect();
+        let name: Vec<u16> = format!("Local\\{NAME}\0").encode_utf16().collect();
         // SAFETY: a NUL-terminated name that outlives the call; the handle is only closed here.
         unsafe {
             let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
@@ -49,11 +56,6 @@ mod imp {
             }
         }
         true
-    }
-
-    /// The copy setup put in place (not a build folder's), the one that updates itself.
-    pub fn installed_copy() -> bool {
-        crate::install::is_installed_copy()
     }
 
     /// The Windows session number, so each signed-in user gets their own window-ping port.
@@ -100,16 +102,19 @@ mod imp {
         }
 
         pub fn enabled() -> bool {
-            reg(&["query", KEY, "/v", "MicClean"])
+            reg(&["query", KEY, "/v", super::NAME])
         }
 
         pub fn set(on: bool) -> bool {
             if !on {
-                return reg(&["delete", KEY, "/v", "MicClean", "/f"]);
+                return reg(&["delete", KEY, "/v", super::NAME, "/f"]);
+            }
+            if super::TEST_FEED.is_some() {
+                return false;
             }
             let Ok(exe) = std::env::current_exe() else { return false };
             let cmd = format!("\"{}\" --minimized", exe.display());
-            reg(&["add", KEY, "/v", "MicClean", "/t", "REG_SZ", "/d", &cmd, "/f"])
+            reg(&["add", KEY, "/v", super::NAME, "/t", "REG_SZ", "/d", &cmd, "/f"])
         }
 
         #[cfg(test)]
@@ -120,7 +125,7 @@ mod imp {
             fn run_entry_is_quoted() {
                 let before = super::enabled();
                 assert!(super::set(true));
-                let out = super::Command::new(crate::install::windows_exe(crate::install::REG)).args(["query", super::KEY, "/v", "MicClean"]).output().unwrap();
+                let out = super::Command::new(crate::install::windows_exe(crate::install::REG)).args(["query", super::KEY, "/v", super::super::NAME]).output().unwrap();
                 let text = String::from_utf8_lossy(&out.stdout).to_string();
                 super::set(before);
                 let exe = std::env::current_exe().unwrap();
@@ -264,7 +269,7 @@ mod imp {
             }
             // A copy on the disk image (or one macOS runs from a hidden temporary place) is gone
             // by the next login.
-            if !super::installed_copy() {
+            if !super::installed_copy() || crate::os::TEST_FEED.is_some() {
                 return false;
             }
             let Ok(exe) = std::env::current_exe() else { return false };

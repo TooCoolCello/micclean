@@ -1,7 +1,9 @@
 #![allow(dead_code)] // micclean.exe uses uninstall, the setup exe uses install
-//! Per-user install and uninstall, no admin needed: the exe in %LOCALAPPDATA%\Programs\MicClean,
-//! a Start menu shortcut, and an entry under Settings -> Apps. Shared by the setup exe and by
-//! `micclean.exe --uninstall`.
+//! The per-user install from before Velopack (0.11 and older; build-installer-old.ps1 still
+//! makes one), no admin needed: the exe in %LOCALAPPDATA%\Programs\MicClean, a Start menu
+//! shortcut, and an entry under Settings -> Apps. Shared by the setup exe and by
+//! `micclean.exe --uninstall`. A Velopack copy clears it out (`remove_legacy`); the bridge setup
+//! (MicClean-Setup.exe in 0.12.0) moves an old copy over to Velopack.
 
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -10,12 +12,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONINFORMATION, MB_
 
 pub const EXE: &str = "micclean.exe";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const UNINSTALL_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\MicClean";
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 pub const REG: &str = r"System32\reg.exe";
 pub const POWERSHELL: &str = r"System32\WindowsPowerShell\v1.0\powershell.exe";
-pub const CURL: &str = r"System32\curl.exe";
 pub const CONTROL: &str = r"System32\control.exe";
 
 /// A Windows program by its full path under %SystemRoot%. Run by bare name, Windows looks in
@@ -30,17 +30,21 @@ fn env_path(var: &str) -> Result<PathBuf, String> {
 }
 
 pub fn install_dir() -> Result<PathBuf, String> {
-    Ok(env_path("LOCALAPPDATA")?.join("Programs").join("MicClean"))
-}
-
-/// True when this is the copy the installer put in place (the only one that updates itself).
-pub fn is_installed_copy() -> bool {
-    let installed = install_dir().map(|d| d.join(EXE));
-    std::env::current_exe().ok() == installed.ok()
+    Ok(env_path("LOCALAPPDATA")?.join("Programs").join(crate::os::NAME))
 }
 
 fn start_link() -> Result<PathBuf, String> {
-    Ok(env_path("APPDATA")?.join(r"Microsoft\Windows\Start Menu\Programs\MicClean.lnk"))
+    Ok(env_path("APPDATA")?.join(r"Microsoft\Windows\Start Menu\Programs").join(format!("{}.lnk", crate::os::NAME)))
+}
+
+/// Where Velopack's setup puts MicClean: %LOCALAPPDATA%\<pack id>\current.
+pub fn velopack_exe() -> Result<PathBuf, String> {
+    Ok(env_path("LOCALAPPDATA")?.join(crate::os::NAME).join("current").join(EXE))
+}
+
+/// The Settings -> Apps entry. Velopack's own has the same name (its pack id).
+fn uninstall_key() -> String {
+    format!(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{}", crate::os::NAME)
 }
 
 pub fn hidden(cmd: &mut Command) -> &mut Command {
@@ -98,7 +102,7 @@ fn message(title: &str, text: &str, question: bool) -> bool {
 
 /// Where the updater downloads setup to, and where setup leaves word of a failed update.
 pub fn update_dir() -> PathBuf {
-    std::env::temp_dir().join("MicClean-update")
+    std::env::temp_dir().join(format!("{}-update", crate::os::NAME))
 }
 
 /// Why an update didn't install, for the copy setup starts again.
@@ -129,12 +133,6 @@ fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()),
     }
-}
-
-/// The copy an update replaced. It can't be deleted while it's still closing, so the next
-/// start (or the next update) clears it.
-pub fn old_exe() -> Result<PathBuf, String> {
-    Ok(install_dir()?.join("micclean.old.exe"))
 }
 
 /// Waits up to 10 s for the copy that started this update to close itself (it saves your
@@ -192,7 +190,7 @@ pub fn install(exe_bytes: &[u8]) -> Result<(PathBuf, Vec<String>), String> {
 
     let exe_s = exe.to_string_lossy().to_string();
     let values = [
-        ("DisplayName", "REG_SZ", "MicClean".to_string()),
+        ("DisplayName", "REG_SZ", crate::os::NAME.to_string()),
         ("DisplayVersion", "REG_SZ", env!("CARGO_PKG_VERSION").to_string()),
         ("InstallLocation", "REG_SZ", dir.to_string_lossy().to_string()),
         ("DisplayIcon", "REG_SZ", format!("{exe_s},0")),
@@ -201,12 +199,12 @@ pub fn install(exe_bytes: &[u8]) -> Result<(PathBuf, Vec<String>), String> {
         ("NoRepair", "REG_DWORD", "1".to_string()),
         ("EstimatedSize", "REG_DWORD", (exe_bytes.len() / 1024).to_string()),
     ];
-    if !values.iter().all(|(name, kind, data)| reg(&["add", UNINSTALL_KEY, "/v", name, "/t", kind, "/d", data, "/f"])) {
+    if !values.iter().all(|(name, kind, data)| reg(&["add", &uninstall_key(), "/v", name, "/t", kind, "/d", data, "/f"])) {
         notes.push("couldn't add MicClean to Settings -> Apps".to_string());
     }
     // "Start with Windows" was on for an older copy: point it at this one.
-    if reg(&["query", RUN_KEY, "/v", "MicClean"]) {
-        reg(&["add", RUN_KEY, "/v", "MicClean", "/t", "REG_SZ", "/d", &format!("\"{exe_s}\" --minimized"), "/f"]);
+    if reg(&["query", RUN_KEY, "/v", crate::os::NAME]) {
+        reg(&["add", RUN_KEY, "/v", crate::os::NAME, "/t", "REG_SZ", "/d", &format!("\"{exe_s}\" --minimized"), "/f"]);
     }
     Ok((exe, notes))
 }
@@ -256,16 +254,14 @@ pub fn uninstall(silent: bool) {
     if let Ok(link) = start_link() {
         let _ = std::fs::remove_file(link);
     }
-    reg(&["delete", UNINSTALL_KEY, "/f"]);
+    reg(&["delete", &uninstall_key(), "/f"]);
     // Start with Windows, unless it points at another copy (a build folder someone runs).
-    let run = hidden(Command::new(windows_exe(REG)).args(["query", RUN_KEY, "/v", "MicClean"])).stdout(Stdio::piped()).output();
-    let ours = run.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains(&exe.to_string_lossy().to_lowercase()));
-    if ours {
-        reg(&["delete", RUN_KEY, "/v", "MicClean", "/f"]);
+    if reg_value(RUN_KEY, crate::os::NAME).is_some_and(|v| mentions(&v, &exe)) {
+        reg(&["delete", RUN_KEY, "/v", crate::os::NAME, "/f"]);
     }
 
     let settings = match (wipe, env_path("APPDATA")) {
-        (true, Ok(a)) => format!("Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue;", q(a.join("MicClean"))),
+        (true, Ok(a)) => format!("Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue;", q(a.join(crate::os::NAME))),
         _ => String::new(),
     };
     // Only our own exes go (and an update's leftovers); the folder only if nothing else is in it.
@@ -292,6 +288,70 @@ pub fn uninstall(silent: bool) {
     if !silent {
         info(TITLE, "MicClean was removed.");
     }
+}
+
+/// A registry value's data as `reg query` prints it, or None if it isn't there.
+fn reg_value(key: &str, name: &str) -> Option<String> {
+    let out = hidden(Command::new(windows_exe(REG)).args(["query", key, "/v", name])).stdout(Stdio::piped()).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether registry data names this path (any letter case, as Windows paths are).
+fn mentions(data: &str, path: &Path) -> bool {
+    data.to_lowercase().contains(&path.to_string_lossy().to_lowercase())
+}
+
+/// Velopack's uninstall hook. A copy still running (in the tray) is closed, or its exe stays
+/// behind, and "Start with Windows" goes too if it starts this install (any exe under its
+/// folder, which holds current\micclean.exe). Velopack removes the rest.
+pub fn before_uninstall() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    stop_running(&exe, std::process::id());
+    let root = exe.parent().and_then(Path::parent).unwrap_or(&exe);
+    if reg_value(RUN_KEY, crate::os::NAME).is_some_and(|v| mentions(&v, root)) {
+        reg(&["delete", RUN_KEY, "/v", crate::os::NAME, "/f"]);
+    }
+}
+
+/// Clears out the install from before Velopack, run by a Velopack copy (`new_exe`) at each
+/// start while there is one. Its Start menu shortcut, Settings -> Apps entry and Start with
+/// Windows value go only while they still point at the old exe: Velopack's own shortcut and
+/// Apps entry have the same names, and may already have replaced them. "Start with Windows"
+/// moves to `new_exe`. Settings live in %APPDATA% and are kept. What's left (a file still in
+/// use) goes at the next start. Returns what it did, for the log.
+pub fn remove_legacy(new_exe: &Path) -> Vec<String> {
+    let Ok(dir) = install_dir() else { return Vec::new() };
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let old = dir.join(EXE);
+    let mut notes = Vec::new();
+    if reg_value(RUN_KEY, crate::os::NAME).is_some_and(|v| mentions(&v, &old)) {
+        let cmd = format!("\"{}\" --minimized", new_exe.display());
+        if reg(&["add", RUN_KEY, "/v", crate::os::NAME, "/t", "REG_SZ", "/d", &cmd, "/f"]) {
+            notes.push("Start with Windows now starts the Velopack install".to_string());
+        }
+    }
+    if reg_value(&uninstall_key(), "UninstallString").is_some_and(|v| mentions(&v, &old)) && reg(&["delete", &uninstall_key(), "/f"]) {
+        notes.push("Removed the old Settings -> Apps entry".to_string());
+    }
+    if let Ok(link) = start_link() {
+        let script = format!(
+            "if ((Test-Path -LiteralPath {0}) -and (New-Object -ComObject WScript.Shell).CreateShortcut({0}).TargetPath -eq {1})              {{ Remove-Item -LiteralPath {0} -Force }}",
+            q(&link),
+            q(&old)
+        );
+        powershell(&script);
+    }
+    for name in [EXE, "micclean.old.exe", "micclean.new.exe"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    let _ = std::fs::remove_dir_all(update_dir());
+    match std::fs::remove_dir(&dir) {
+        Ok(()) => notes.push(format!("Removed the old install in {}", dir.display())),
+        Err(e) => notes.push(format!("The old install in {} isn't fully gone yet: {e}", dir.display())),
+    }
+    notes
 }
 
 #[cfg(test)]

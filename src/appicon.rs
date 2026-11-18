@@ -129,6 +129,21 @@ mod tests {
         if std::env::var_os("WRITE_ICNS").is_some() {
             std::fs::write(path, &want).unwrap();
         }
-        assert!(std::fs::read(path).is_ok_and(|have| have == want), "run with WRITE_ICNS=1 to regenerate {path}");
+        // Compared as entries of decoded pixels: the PNG encoder's bytes change with the
+        // features other crates turn on in its compressor, the picture doesn't.
+        let pixels = |icns: &[u8]| {
+            let mut out = Vec::new();
+            let mut i = 8;
+            while i + 8 <= icns.len() {
+                let n = u32::from_be_bytes(icns[i + 4..i + 8].try_into().unwrap()) as usize;
+                let mut reader = png::Decoder::new(std::io::Cursor::new(&icns[i + 8..i + n])).read_info().unwrap();
+                let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+                reader.next_frame(&mut buf).unwrap();
+                out.push((icns[i..i + 4].to_vec(), buf));
+                i += n;
+            }
+            out
+        };
+        assert!(std::fs::read(path).is_ok_and(|have| pixels(&have) == pixels(&want)), "run with WRITE_ICNS=1 to regenerate {path}");
     }
 }

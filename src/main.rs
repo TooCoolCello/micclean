@@ -38,6 +38,8 @@ static SHOW: AtomicBool = AtomicBool::new(false);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 fn main() -> eframe::Result {
+    // Velopack's installer and updater run this exe for their hooks: answered, then it exits.
+    update::startup();
     // A plugin search runs each plugin file in a copy of this exe, which only lists it.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|a| a == "--scan-plugin") {
@@ -66,7 +68,8 @@ fn main() -> eframe::Result {
             }
         }
     }
-    let port = INSTANCE_PORT + (os::session() % 100) as u16;
+    let test_build = if os::TEST_FEED.is_some() { 100 } else { 0 };
+    let port = INSTANCE_PORT + test_build + (os::session() % 100) as u16;
     if !first {
         // Already running: that copy shows its window, this one leaves. Two copies would
         // both grab the mic and double the audio going to Discord.
@@ -94,7 +97,7 @@ fn main() -> eframe::Result {
             .with_inner_size([960.0, 720.0])
             // Below this, header rows (a picker or buttons beside the text) don't fit.
             .with_min_inner_size([640.0, 480.0])
-            .with_title("MicClean")
+            .with_title(os::NAME)
             .with_icon(Arc::new(egui::IconData { rgba: icon_rgba(true), width: ICON, height: ICON }))
             .with_visible(!hidden),
         ..Default::default()
@@ -719,7 +722,7 @@ impl App {
         let tray = tray_icon::Icon::from_rgba(icon_rgba(false), ICON, ICON).ok().and_then(|icon| {
             TrayIconBuilder::new()
                 .with_icon(icon)
-                .with_tooltip("MicClean")
+                .with_tooltip(os::NAME)
                 .with_menu(Box::new(menu))
                 .with_menu_on_left_click(false)
                 .build()
@@ -727,6 +730,8 @@ impl App {
         });
 
         let now = Instant::now();
+        let updater = update::Updater::new();
+        let installed = updater.installed();
         let mut app = Self {
             saved,
             shared: Arc::new(Mutex::new(shared)),
@@ -754,8 +759,8 @@ impl App {
             quit_id: quit.id().clone(),
             quitting: false,
             autostart: autostart::enabled(),
-            updater: Default::default(),
-            installed: os::installed_copy(),
+            updater,
+            installed,
             next_update_check: now + Duration::from_secs(3), // after the audio has started
             update_prompt: false,
             update_dismissed: None,
@@ -807,21 +812,26 @@ impl App {
             deep_error: None,
             rendering: None,
         };
-        #[cfg(windows)]
         if app.installed {
-            if let Ok(old) = install::old_exe() {
-                let _ = std::fs::remove_file(old); // what the last update replaced
+            // The install from before Velopack (0.11 and older), if it's still there.
+            #[cfg(windows)]
+            if let Ok(exe) = std::env::current_exe() {
+                install::remove_legacy(&exe).iter().for_each(|n| logfile::line(n));
             }
             // An update to this version didn't take: it isn't installed on its own again or
             // offered in a popup (Settings can still try).
-            if let Some(version) = update::failed_version() {
-                if let Some(why) = update::take_failure() {
-                    // Setup started this copy again just now: say why.
-                    logfile::line(&format!("Update to {version} failed: {why}"));
-                    app.updater.set(update::State::Failed(why));
-                    app.next_update_check = now + Duration::from_secs(24 * 3600);
+            match update::failed_version() {
+                Some(version) => {
+                    if update::restarted() {
+                        // Velopack's updater started this copy again just now: say so (and log_changes logs it).
+                        let why = format!("version {version} didn't install, so you still have {}", update::VERSION);
+                        app.updater.set(update::State::Failed(why));
+                        app.next_update_check = now + Duration::from_secs(24 * 3600);
+                    }
+                    app.update_dismissed = Some(version);
                 }
-                app.update_dismissed = Some(version);
+                None if update::restarted() => logfile::line(&format!("Updated to {}", update::VERSION)),
+                None => {}
             }
         }
         app.refresh_devices();
@@ -857,6 +867,11 @@ impl App {
         self.stats = Stats::default();
         self.last_beat = Instant::now();
         self.needs_restart = false;
+        if os::TEST_FEED.is_some() {
+            // Beside the real MicClean, a test build would take the mic and the cable from it.
+            self.status = "Test build: no audio.".into();
+            return;
+        }
         let d = &self.saved.devices;
         let format = |input, name: &str| if name.is_empty() { None } else { audio::device_format(input, name) };
         let mic = format(true, &d.input);
@@ -1108,7 +1123,7 @@ impl App {
             match update {
                 update::State::Available(r) => logfile::line(&format!("Update {} available", r.version)),
                 update::State::Installing => logfile::line("Installing the update"),
-                update::State::Restarting => logfile::line("Closing so setup can install the update"),
+                update::State::Restarting => logfile::line("Closing so Velopack can install the update"),
                 update::State::Failed(e) => logfile::line(&format!("Update failed: {e}")),
                 _ => {}
             }
@@ -1360,8 +1375,7 @@ impl eframe::App for App {
         if let update::State::Available(r) = &st
             && self.update_dismissed.as_deref() != Some(&r.version)
         {
-            // On a Mac an update is a download you drag in, so it's never started for you.
-            if cfg!(windows) && self.saved.auto_update {
+            if self.saved.auto_update {
                 // Never in the middle of a sentence, nor while Smart setup, a recording, a learn
                 // or a playback is going.
                 let quiet = now - self.last_voice > Duration::from_secs(10);
@@ -1374,7 +1388,7 @@ impl eframe::App for App {
             }
         }
         if st == update::State::Restarting && !self.quitting {
-            // Setup waits for this copy to close; closing normally saves your settings first.
+            // The updater waits for this copy to close; closing normally saves your settings first.
             self.quitting = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
@@ -3053,19 +3067,17 @@ impl App {
             ui.add_space(4.0);
             ui.label(RichText::new(format!("You have {}. {}", update::VERSION, update::HOW)).color(p.text2));
             ui.add_space(10.0);
-            if cfg!(windows) {
-                ui.horizontal(|ui| {
-                    ui::toggle(ui, &mut auto);
-                    ui.label("Update automatically from now on");
-                });
-            }
+            ui.horizontal(|ui| {
+                ui::toggle(ui, &mut auto);
+                ui.label("Update automatically from now on");
+            });
             ui.horizontal(|ui| {
                 ui::toggle(ui, &mut quiet);
                 ui.label("Don't show this popup again");
             });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                now = ui::accent_button(ui, true, if cfg!(windows) { "Update now" } else { "Download" }).clicked();
+                now = ui::accent_button(ui, true, "Update now").clicked();
                 later = ui.button("Later").clicked();
             });
         });
@@ -3102,8 +3114,7 @@ impl App {
         let installed = self.installed;
         ui::setting(ui, icon::REFRESH, "Updates", &desc, |ui| match &st {
             State::Available(r) if installed => {
-                let verb = if cfg!(windows) { "Update to" } else { "Download" };
-                if ui::accent_button(ui, true, &format!("{verb} {}", r.version)).clicked() {
+                if ui::accent_button(ui, true, &format!("Update to {}", r.version)).clicked() {
                     install_rel = Some(r.clone());
                 }
             }
@@ -3119,11 +3130,9 @@ impl App {
         ui::setting(ui, icon::INFO, "Show a popup when there's an update", "Off: the Updates card above still shows it", |ui| {
             ui::toggle(ui, &mut popup_on);
         });
-        if cfg!(windows) {
-            ui::setting(ui, icon::REFRESH, "Install updates automatically", "Waits until you aren't talking, then closes MicClean for a few seconds", |ui| {
-                ui::toggle(ui, &mut self.saved.auto_update);
-            });
-        }
+        ui::setting(ui, icon::REFRESH, "Install updates automatically", "Waits until you aren't talking, then closes MicClean for a few seconds", |ui| {
+            ui::toggle(ui, &mut self.saved.auto_update);
+        });
         (self.saved.update_check_off, self.saved.update_popup_off) = (!check_on, !popup_on);
         if let Some(r) = install_rel {
             self.start_update(r);

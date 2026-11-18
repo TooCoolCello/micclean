@@ -1,9 +1,11 @@
 name: Release
 
-# Push a tag like v0.2.0 to build both installers (Windows setup, Mac disk image) and publish
-# them. The tag has to match the version in Cargo.toml, because the in-app updater compares
-# the two. Run it by hand (Actions -> Release -> Run workflow) to only build them, as artifacts
-# to try out, without publishing anything.
+# Push a tag like v0.2.0 to build both installers and update feeds (Velopack: Windows setup, Mac
+# .pkg, releases.win.json / releases.osx.json and their packages) and publish them. The tag has to
+# match the version in Cargo.toml, because the packages carry that version. Run it by hand
+# (Actions -> Release -> Run workflow) to only build them, as artifacts to try out, without
+# publishing anything. v0.12.0 also publishes the bridge from 0.11 and older (MicClean-Setup.exe,
+# MicClean.dmg); no other version does.
 on:
   push:
     tags: ["v*"]
@@ -28,10 +30,15 @@ jobs:
         shell: pwsh
         run: |
           # A tag like v0.9.0-rc1 would be published as the latest release, and every
-          # installed copy's updater would fail on its version number.
+          # installed copy would be offered it.
           if ($env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+$') { throw "tag $env:GITHUB_REF_NAME isn't vX.Y.Z" }
           $want = "v" + ((Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value)
           if ($env:GITHUB_REF_NAME -ne $want) { throw "tag $env:GITHUB_REF_NAME doesn't match Cargo.toml ($want)" }
+
+      # vpk, pinned in dotnet-tools.json.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
 
       - name: Test
         run: cargo test --locked
@@ -40,18 +47,20 @@ jobs:
         shell: pwsh
         run: ./build-installer.ps1
 
+      # One SHA-256 file per download. The bridge's is what 0.11 and older check before running it.
       - name: Checksum
         shell: pwsh
         run: |
-          $h = (Get-FileHash dist\MicClean-Setup.exe -Algorithm SHA256).Hash.ToLower()
-          "$h  MicClean-Setup.exe" | Out-File -Encoding ascii dist\MicClean-Setup.exe.sha256
+          Move-Item dist\MicClean-Setup.exe dist\releases\
+          foreach ($f in 'MicClean-win-Setup.exe', 'MicClean-Setup.exe') {
+            $h = (Get-FileHash dist\releases\$f -Algorithm SHA256).Hash.ToLower()
+            "$h  $f" | Out-File -Encoding ascii dist\releases\$f.sha256
+          }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: installer
-          path: |
-            dist/MicClean-Setup.exe
-            dist/MicClean-Setup.exe.sha256
+          name: windows
+          path: dist/releases/
 
   mac:
     # Apple Silicon runner; build-mac.sh cross-builds the Intel half into the same app.
@@ -64,22 +73,26 @@ jobs:
       - name: Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
       - name: Test
         run: cargo test --locked
 
-      - name: Build disk image
+      - name: Build installer
         run: bash build-mac.sh
 
       - name: Checksum
-        working-directory: dist
-        run: shasum -a 256 MicClean.dmg > MicClean.dmg.sha256
+        run: |
+          mv dist/MicClean.dmg dist/releases/
+          cd dist/releases
+          for f in MicClean-osx-Setup.pkg MicClean.dmg; do shasum -a 256 "$f" > "$f.sha256"; done
 
       - uses: actions/upload-artifact@v4
         with:
           name: mac
-          path: |
-            dist/MicClean.dmg
-            dist/MicClean.dmg.sha256
+          path: dist/releases/
 
   publish:
     needs: [build, mac]
@@ -91,9 +104,23 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          merge-multiple: true
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/MicClean-Setup.exe dist/MicClean-Setup.exe.sha256 dist/MicClean.dmg dist/MicClean.dmg.sha256 --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          set -euo pipefail
+          # The two builds share one release, so no file may have the same name in both.
+          clash=$(comm -12 <(ls dist/windows | sort) <(ls dist/mac | sort) | grep -v -e '^RELEASES' -e '^assets\.' || true)
+          if [ -n "$clash" ]; then echo "Windows and Mac both made: $clash"; exit 1; fi
+          files=()
+          for d in dist/windows dist/mac; do
+            for f in "$d"/*; do
+              case "$(basename "$f")" in
+                RELEASES*|assets.*.json) ;; # vpk's own bookkeeping, not read by the app
+                MicClean-Setup.exe*|MicClean.dmg*) if [ "$GITHUB_REF_NAME" = v0.12.0 ]; then files+=("$f"); fi ;;
+                *) files+=("$f") ;;
+              esac
+            done
+          done
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

@@ -73,6 +73,8 @@ $rule = '-' * 72
 $out = [Text.StringBuilder]::new()
 [void]$out.Append("Open-source licenses`n====================`n`n")
 [void]$out.Append("MicClean is built with the libraries below. Each license text appears once, after the`nlibraries it covers.`n")
+# vpk adds Velopack's own installer and updater programs; they come under the velopack crate's license.
+[void]$out.Append("`nThe installer and updater (Setup, Update.exe, UpdateMac) are Velopack's (velopack.io),`nunder the same license as the velopack library below.`n")
 foreach ($e in $texts.GetEnumerator()) {
     [void]$out.Append("`n$rule`n$($e.Value -join ', ')`n$rule`n`n$($e.Key)`n")
 }
