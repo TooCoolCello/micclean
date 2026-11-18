@@ -8,6 +8,11 @@ default-run = "micclean"
 name = "micclean-setup"
 path = "src/setup.rs"
 
+[features]
+# One-click updates on a Mac (Velopack), off until they've been tried on a Mac. Windows always
+# has them. build-mac.sh turns this on with MICCLEAN_MAC_UPDATES=1.
+mac-updates = []
+
 [build-dependencies]
 winresource = "0.1"
 

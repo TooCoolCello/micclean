@@ -1,11 +1,17 @@
 name: Release
 
-# Push a tag like v0.2.0 to build both installers and update feeds (Velopack: Windows setup, Mac
-# .pkg, releases.win.json / releases.osx.json and their packages) and publish them. The tag has to
-# match the version in Cargo.toml, because the packages carry that version. Run it by hand
-# (Actions -> Release -> Run workflow) to only build them, as artifacts to try out, without
-# publishing anything. v0.12.0 also publishes the bridge from 0.11 and older (MicClean-Setup.exe,
-# MicClean.dmg); no other version does.
+# Push a tag like v0.2.0 to build and publish a release: the Windows setup and update feed
+# (Velopack: MicClean-win-Setup.exe, releases.win.json and its packages) and the Mac disk image
+# (MicClean.dmg). The tag has to match the version in Cargo.toml, because the packages carry that
+# version. v0.12.0 also publishes the bridge from 0.11 and older on Windows (MicClean-Setup.exe);
+# no other version does.
+#
+# Dry run: start it by hand (Actions -> Release -> Run workflow, or `gh workflow run release.yml
+# --ref <branch>`). It builds and tests everything and uploads it only as workflow artifacts:
+# the publish job runs for a pushed tag only, never for a run started by hand.
+#
+# No Mac update feed until one-click updates have been tried on a Mac: the Mac build leaves
+# MICCLEAN_MAC_UPDATES unset (see build-mac.sh), so it makes only MicClean.dmg.
 on:
   push:
     tags: ["v*"]
@@ -73,21 +79,18 @@ jobs:
       - name: Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 8.0.x
-
       - name: Test
         run: cargo test --locked
 
-      - name: Build installer
+      - name: Build disk image
         run: bash build-mac.sh
 
       - name: Checksum
         run: |
+          mkdir -p dist/releases
           mv dist/MicClean.dmg dist/releases/
           cd dist/releases
-          for f in MicClean-osx-Setup.pkg MicClean.dmg; do shasum -a 256 "$f" > "$f.sha256"; done
+          shasum -a 256 MicClean.dmg > MicClean.dmg.sha256
 
       - uses: actions/upload-artifact@v4
         with:
@@ -96,7 +99,7 @@ jobs:
 
   publish:
     needs: [build, mac]
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -118,7 +121,7 @@ jobs:
             for f in "$d"/*; do
               case "$(basename "$f")" in
                 RELEASES*|assets.*.json) ;; # vpk's own bookkeeping, not read by the app
-                MicClean-Setup.exe*|MicClean.dmg*) if [ "$GITHUB_REF_NAME" = v0.12.0 ]; then files+=("$f"); fi ;;
+                MicClean-Setup.exe*) if [ "$GITHUB_REF_NAME" = v0.12.0 ]; then files+=("$f"); fi ;;
                 *) files+=("$f") ;;
               esac
             done

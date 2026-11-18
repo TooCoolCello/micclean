@@ -1375,7 +1375,9 @@ impl eframe::App for App {
         if let update::State::Available(r) = &st
             && self.update_dismissed.as_deref() != Some(&r.version)
         {
-            if self.saved.auto_update {
+            // On a Mac without one-click updates, an update is a download you drag in, so it's
+            // never started for you.
+            if update::ONE_CLICK && self.saved.auto_update {
                 // Never in the middle of a sentence, nor while Smart setup, a recording, a learn
                 // or a playback is going.
                 let quiet = now - self.last_voice > Duration::from_secs(10);
@@ -3067,17 +3069,19 @@ impl App {
             ui.add_space(4.0);
             ui.label(RichText::new(format!("You have {}. {}", update::VERSION, update::HOW)).color(p.text2));
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui::toggle(ui, &mut auto);
-                ui.label("Update automatically from now on");
-            });
+            if update::ONE_CLICK {
+                ui.horizontal(|ui| {
+                    ui::toggle(ui, &mut auto);
+                    ui.label("Update automatically from now on");
+                });
+            }
             ui.horizontal(|ui| {
                 ui::toggle(ui, &mut quiet);
                 ui.label("Don't show this popup again");
             });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                now = ui::accent_button(ui, true, "Update now").clicked();
+                now = ui::accent_button(ui, true, if update::ONE_CLICK { "Update now" } else { "Download" }).clicked();
                 later = ui.button("Later").clicked();
             });
         });
@@ -3114,7 +3118,8 @@ impl App {
         let installed = self.installed;
         ui::setting(ui, icon::REFRESH, "Updates", &desc, |ui| match &st {
             State::Available(r) if installed => {
-                if ui::accent_button(ui, true, &format!("Update to {}", r.version)).clicked() {
+                let verb = if update::ONE_CLICK { "Update to" } else { "Download" };
+                if ui::accent_button(ui, true, &format!("{verb} {}", r.version)).clicked() {
                     install_rel = Some(r.clone());
                 }
             }
@@ -3130,9 +3135,11 @@ impl App {
         ui::setting(ui, icon::INFO, "Show a popup when there's an update", "Off: the Updates card above still shows it", |ui| {
             ui::toggle(ui, &mut popup_on);
         });
-        ui::setting(ui, icon::REFRESH, "Install updates automatically", "Waits until you aren't talking, then closes MicClean for a few seconds", |ui| {
-            ui::toggle(ui, &mut self.saved.auto_update);
-        });
+        if update::ONE_CLICK {
+            ui::setting(ui, icon::REFRESH, "Install updates automatically", "Waits until you aren't talking, then closes MicClean for a few seconds", |ui| {
+                ui::toggle(ui, &mut self.saved.auto_update);
+            });
+        }
         (self.saved.update_check_off, self.saved.update_popup_off) = (!check_on, !popup_on);
         if let Some(r) = install_rel {
             self.start_update(r);

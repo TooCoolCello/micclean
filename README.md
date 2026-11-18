@@ -29,25 +29,25 @@ code-signed. Choose More info, then Run anyway. The checksum for each download i
 to it. To remove MicClean, use Settings → Apps; your settings stay in `%APPDATA%\MicClean` (delete
 that folder too to remove them).
 
-On a Mac (macOS 14.2 or later), download `MicClean-osx-Setup.pkg` and open it. Neither the installer
-nor the app is signed with an Apple Developer ID, so macOS refuses them the first time: go to
-System Settings → Privacy & Security and choose Open Anyway. MicClean then asks for the microphone,
+On a Mac (macOS 14.2 or later), download `MicClean.dmg`, open it and drag MicClean into
+Applications. The app isn't signed with an Apple Developer ID, so macOS refuses it the first time:
+go to System Settings → Privacy & Security and choose Open Anyway. MicClean then asks for the microphone,
 and for system audio recording if you turn on echo cancellation. Settings live in
 `~/Library/Application Support/MicClean`.
 
-Installing and updating are done by [Velopack](https://velopack.io). The installed copy checks
-GitHub once a day for new versions and updates with one click, or by itself once you aren't
+On Windows, installing and updating are done by [Velopack](https://velopack.io). The installed copy
+checks GitHub once a day for new versions and updates with one click, or by itself once you aren't
 talking; both can be turned off in Settings. If an update can't be installed, the version you had
-keeps running. Velopack's own log is `%LOCALAPPDATA%\velopack\velopack_MicClean.log` on Windows and
-`~/Library/Logs/velopack_MicClean.log` on a Mac. Your settings are copied to the `backups` folder in
+keeps running. Velopack's own log is `%LOCALAPPDATA%\velopack\velopack_MicClean.log`. On a Mac, the
+copy in Applications checks GitHub too, and Download in Settings gets the new `MicClean.dmg`, to drag
+in over the old one. Your settings are copied to the `backups` folder in
 the settings folder above (the last 10 versions), and a damaged settings file is replaced by the
 newest copy.
 
 Coming from 0.11 or older: its update to 0.12.0 moves MicClean over to Velopack by itself. On
 Windows the old copy in `%LOCALAPPDATA%\Programs\MicClean` is removed, with its Start menu and
-Settings → Apps entries, and "Start with Windows" moves to the new copy. On a Mac, Download in
-Settings gets `MicClean.dmg` (0.12.0): drag it into Applications over the old one, once. Your
-settings are kept either way.
+Settings → Apps entries, and "Start with Windows" moves to the new copy. Your settings are kept.
+Nothing changes on a Mac.
 
 ## Use it with Discord
 
@@ -64,8 +64,8 @@ MicClean as Discord's mic. To remove the device later:
 
 Needs Rust (MSVC toolchain) and the Windows SDK.
 
-Packaging uses Velopack's `vpk`, pinned in `dotnet-tools.json` to the same version as the `velopack`
-crate (`dotnet tool restore` fetches it), so it also needs the .NET SDK, 8 or newer.
+Packaging for Windows uses Velopack's `vpk`, pinned in `dotnet-tools.json` to the same version as
+the `velopack` crate (`dotnet tool restore` fetches it), so it also needs the .NET SDK, 8 or newer.
 
 ```
 cargo test
@@ -76,25 +76,31 @@ On a Mac (Xcode command line tools, `rustup target add aarch64-apple-darwin x86_
 
 ```
 cargo test
-bash build-mac.sh          # dist/releases: MicClean-osx-Setup.pkg and the update feed, Apple Silicon and Intel
+bash build-mac.sh          # dist/MicClean.dmg, Apple Silicon and Intel
 ```
 
-Both also make the one-time bridge from 0.11 and older (`dist\MicClean-Setup.exe`,
-`dist/MicClean.dmg`), published with 0.12.0 only. `build-installer-old.ps1` and `build-mac-old.sh`
-are the scripts from before Velopack, kept for now; what they build doesn't update itself.
+One-click updates on a Mac aren't switched on yet: `MICCLEAN_MAC_UPDATES=1 bash build-mac.sh` builds
+the app with them (the `mac-updates` feature) and packs it with `vpk` into dist/releases
+(`MicClean-osx-Setup.pkg` and the update feed). It hasn't been tried on a Mac, and releases don't
+publish it.
+
+`build-installer.ps1` also makes the one-time bridge from 0.11 and older (`dist\MicClean-Setup.exe`),
+published with 0.12.0 only. `build-installer-old.ps1` and `build-mac-old.sh` are the scripts from
+before Velopack, kept for now; what they build doesn't update itself.
 
 To try an update without publishing anything, set `MICCLEAN_TEST_FEED` to an empty folder and run
 the build script. It builds "MicCleanTest", a separate app beside the real MicClean (its own
 settings and install, no audio) that updates from that folder. Install it with
-`MicCleanTest-win-Setup.exe` (or `MicCleanTest-osx-Setup.pkg`) from that folder, raise the version
+`MicCleanTest-win-Setup.exe` (or, for one-click updates on a Mac, `MicCleanTest-osx-Setup.pkg`) from that folder, raise the version
 in `Cargo.toml` and build again: that publishes the update to the folder.
 
 `licenses.ps1` rewrites `THIRD-PARTY-NOTICES.txt` (shown in Settings) from the license files of every
 library in the exe. `build-installer.ps1` runs it; run it yourself after changing dependencies.
 
-A release (both installers and both update feeds) is built by pushing a tag that matches the version in `Cargo.toml`, e.g.
-`git tag v0.2.0 && git push --tags`. Running the Release workflow by hand builds both as artifacts without
-publishing.
+A release (the Windows installer and update feed, and the Mac disk image) is built by pushing a tag that
+matches the version in `Cargo.toml`, e.g. `git tag v0.2.0 && git push --tags`. Running the Release workflow
+by hand (Actions → Release → Run workflow, or `gh workflow run release.yml --ref <branch>`) is a dry run:
+it builds and tests everything and keeps it as workflow artifacts, without publishing anything.
 
 ## About this code
 
