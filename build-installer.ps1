@@ -37,7 +37,7 @@ Copy-Item target\release\micclean.exe $pack
 dotnet tool restore | Out-Null
 if ($LASTEXITCODE) { throw "dotnet tool restore failed" }
 dotnet vpk pack --packId $id --packVersion $version --packDir $pack --mainExe micclean.exe `
-    --packTitle $title --runtime win-x64 --packAuthors TooCoolCello --icon assets\micclean.ico --shortcuts StartMenuRoot --outputDir $out
+    --packTitle $title --runtime win-x64 --packAuthors TooCoolCello --icon assets\micclean.ico --shortcuts StartMenuRoot --noPortable --outputDir $out
 if ($LASTEXITCODE) { throw "vpk pack failed" }
 
 $setup = "$out\$id-win-Setup.exe"
