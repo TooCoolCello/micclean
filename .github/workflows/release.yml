@@ -6,6 +6,13 @@ name: Release
 # version. v0.12.0 also publishes the bridge from 0.11 and older on Windows (MicClean-Setup.exe);
 # no other version does.
 #
+# Releases go to a separate public repo, TooCoolCello/tacet-releases (this repo is private):
+# the downloads, the update feed and the notes, no source. Installed copies read updates there
+# (src/update.rs, REPO_URL; a Mac's dmg link too). The publish job writes there with
+# RELEASES_TOKEN, a fine-grained token with Contents: read and write on that one repo only, kept
+# as this repo's Actions secret. That repo needs one commit (a README) for the tag to start from.
+# The notes are the tagged commit's message body (the "Release x.y.z" commit's bullet list).
+#
 # Dry run: start it by hand (Actions -> Release -> Run workflow, or `gh workflow run release.yml
 # --ref <branch>`). It builds and tests everything and uploads it only as workflow artifacts:
 # the publish job runs for a pushed tag only, never for a run started by hand.
@@ -63,10 +70,25 @@ jobs:
             "$h  $f" | Out-File -Encoding ascii dist\releases\$f.sha256
           }
 
+      # The release's notes: the tagged commit's message without its title line ("Release x.y.z")
+      # and its trailers (Co-Authored-By).
+      - name: Release notes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\notes | Out-Null
+          $body = (git log -1 --format=%b | Where-Object { $_ -notmatch '^[A-Za-z-]+-by: ' }) -join "`n"
+          if (-not $body.Trim()) { $body = "MicClean $env:GITHUB_REF_NAME" }
+          $body.Trim() | Out-File -Encoding utf8 dist\notes\notes.md
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: dist/releases/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: dist/notes/
 
   mac:
     # Apple Silicon runner; build-mac.sh cross-builds the Intel half into the same app.
@@ -101,8 +123,9 @@ jobs:
     needs: [build, mac]
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    # Nothing here writes to this repo: the release goes to the releases repo with RELEASES_TOKEN.
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -110,14 +133,15 @@ jobs:
 
       - name: Publish release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          RELEASES_REPO: TooCoolCello/tacet-releases
         run: |
           set -euo pipefail
           # The two builds share one release, so no file may have the same name in both.
           clash=$(comm -12 <(ls dist/windows | sort) <(ls dist/mac | sort) | grep -v -e '^RELEASES' -e '^assets\.' || true)
           if [ -n "$clash" ]; then echo "Windows and Mac both made: $clash"; exit 1; fi
           files=()
-          for d in dist/windows dist/mac; do
+          for d in dist/windows dist/mac; do  # not dist/notes
             for f in "$d"/*; do
               case "$(basename "$f")" in
                 RELEASES*|assets.*.json) ;; # vpk's own bookkeeping, not read by the app
@@ -126,4 +150,6 @@ jobs:
               esac
             done
           done
-          gh release create "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+          if [ -z "$GH_TOKEN" ]; then echo "no RELEASES_TOKEN secret" >&2; exit 1; fi
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" --repo "$RELEASES_REPO" \
+            --title "MicClean ${GITHUB_REF_NAME#v}" --notes-file dist/notes/notes.md

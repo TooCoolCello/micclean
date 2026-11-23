@@ -22,14 +22,15 @@ The Mac version is new and untested so far; it has everything except plugins.
 
 ## Install
 
-Download `MicClean-win-Setup.exe` from the [latest release](../../releases/latest) and run it. It
+Download `MicClean-win-Setup.exe` from the
+[latest release](https://github.com/TooCoolCello/tacet-releases/releases/latest) and run it. It
 installs for your account only (no admin needed) in `%LOCALAPPDATA%\MicClean` and adds a Start menu
 entry. Windows will probably show "Windows protected your PC" because the installer isn't
 code-signed. Choose More info, then Run anyway. The checksum for each download is published next
 to it. To remove MicClean, use Settings → Apps; your settings stay in `%APPDATA%\MicClean` (delete
 that folder too to remove them).
 
-On a Mac (macOS 14.2 or later), download `MicClean.dmg`, open it and drag MicClean into
+On a Mac (macOS 14.2 or later), download `MicClean.dmg` from the same release, open it and drag MicClean into
 Applications. The app isn't signed with an Apple Developer ID, so macOS refuses it the first time:
 go to System Settings → Privacy & Security and choose Open Anyway. MicClean then asks for the microphone,
 and for system audio recording if you turn on echo cancellation. Settings live in
@@ -98,7 +99,12 @@ in `Cargo.toml` and build again: that publishes the update to the folder.
 library in the exe. `build-installer.ps1` runs it; run it yourself after changing dependencies.
 
 A release (the Windows installer and update feed, and the Mac disk image) is built by pushing a tag that
-matches the version in `Cargo.toml`, e.g. `git tag v0.2.0 && git push --tags`. Running the Release workflow
+matches the version in `Cargo.toml`, e.g. `git tag v0.2.0 && git push --tags`. It is published to
+[tacet-releases](https://github.com/TooCoolCello/tacet-releases), a public repo that holds only the
+releases (downloads, update feed and notes, no source); installed copies check there for updates. The
+workflow writes there with `RELEASES_TOKEN`, a fine-grained token limited to that repo (Contents: read
+and write), kept as an Actions secret here. The release's notes are the tagged commit's message
+without its first line. Running the Release workflow
 by hand (Actions → Release → Run workflow, or `gh workflow run release.yml --ref <branch>`) is a dry run:
 it builds and tests everything and keeps it as workflow artifacts, without publishing anything.
 

@@ -1,6 +1,7 @@
 //! Update check and one-click install, through Velopack (velopack.io). Only a copy Velopack
 //! installed takes part (a build-folder copy, or a Mac copy still on the disk image, has nothing
-//! to replace). Updates come from this repo's GitHub releases: releases.win.json (or
+//! to replace). Updates come from the GitHub releases of TooCoolCello/tacet-releases, a public
+//! repo that holds only the releases (the source repo is private): releases.win.json (or
 //! releases.osx.json) and the .nupkg packages beside them, whose checksums Velopack checks. A
 //! test build reads a local folder instead (os::TEST_FEED).
 //!
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use velopack::{UpdateCheck, UpdateInfo, UpdateManager, VelopackApp, sources};
 
-pub const REPO_URL: &str = "https://github.com/TooCoolCello/micclean";
+pub const REPO_URL: &str = "https://github.com/TooCoolCello/tacet-releases";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Velopack installs updates. Off on a Mac without the `mac-updates` feature: then an update is
 /// a download you drag in, so it's never started for you.
@@ -204,7 +205,8 @@ mod dmg {
     use super::{Get, Release, VERSION};
     use serde::Deserialize;
 
-    const REPO: &str = "TooCoolCello/micclean";
+    /// The releases repo (`REPO_URL`), not the private source repo.
+    const REPO: &str = "TooCoolCello/tacet-releases";
     const DMG: &str = "MicClean.dmg";
 
     pub fn latest() -> Result<Option<Release>, String> {
@@ -235,7 +237,7 @@ mod dmg {
     }
 
     /// The newest release if it is newer than `current`. The download link is only accepted when
-    /// it points into this repo's own releases, whatever the reply says.
+    /// it points into the releases repo's own releases, whatever the reply says.
     pub fn parse(json: &[u8], current: &str) -> Result<Option<Release>, String> {
         let gh: Gh = serde_json::from_slice(json).map_err(|e| format!("unexpected reply from GitHub: {e}"))?;
         if version(&gh.tag_name)? <= version(current)? {
